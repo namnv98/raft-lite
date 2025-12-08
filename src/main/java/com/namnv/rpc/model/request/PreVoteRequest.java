@@ -1,6 +1,11 @@
-package com.namnv.rpc.model;
+package com.namnv.rpc.model.request;
 
-public class PreVoteRequest {
+import java.io.Serial;
+import java.io.Serializable;
+
+public class PreVoteRequest implements Serializable {
+    @Serial
+    private static final long serialVersionUID = 1L;
     public final long term;
     public final String candidateId;
     public final long lastLogIndex;

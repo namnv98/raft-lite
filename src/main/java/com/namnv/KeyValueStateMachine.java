@@ -1,10 +1,12 @@
-package com.namnv.statemachine;
+package com.namnv;
 
 import com.namnv.core.Closure;
 import com.namnv.entity.LogEntry;
-import com.namnv.storage.snapshot.SnapshotReader;
-import com.namnv.storage.snapshot.SnapshotWriter;
+import com.namnv.statemachine.StateMachine;
+import com.namnv.statemachine.snapshot.SnapshotReader;
+import com.namnv.statemachine.snapshot.SnapshotWriter;
 import com.namnv.core.Status;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -14,6 +16,7 @@ import java.util.List;
 
 import static java.util.Objects.isNull;
 
+@Slf4j
 public class KeyValueStateMachine implements StateMachine {
 
     // State của ứng dụng
@@ -27,7 +30,7 @@ public class KeyValueStateMachine implements StateMachine {
         if (entry.getCommand() != null) {
             store.add(new String(entry.getCommand(), StandardCharsets.UTF_8));
         }
-        System.out.println(node + " applied: " + entry);
+        log.info(node + " applied: " + entry);
     }
 
     @Override
@@ -46,7 +49,7 @@ public class KeyValueStateMachine implements StateMachine {
             // đăng ký file snapshot vào writer
             writer.addFile("snapshot.data");
 
-            System.out.println("Snapshot saved, entries=" + store.size());
+            log.info("Snapshot saved, entries=" + store.size());
 
             done.run(Status.OK());
         } catch (Exception e) {
@@ -70,7 +73,7 @@ public class KeyValueStateMachine implements StateMachine {
             List<String> lines = Files.readAllLines(snapshotFile.toPath(), StandardCharsets.UTF_8);
             store.addAll(lines);
 
-            System.out.println("Snapshot loaded, entries=" + store.size());
+            log.info("Snapshot loaded, entries=" + store.size());
             return true;
 
         } catch (Exception e) {

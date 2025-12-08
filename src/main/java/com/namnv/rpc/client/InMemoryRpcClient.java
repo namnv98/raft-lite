@@ -1,7 +1,15 @@
-package com.namnv.rpc;
+package com.namnv.rpc.client;
 
 
-import com.namnv.rpc.model.*;
+import com.namnv.rpc.RaftServerService;
+import com.namnv.rpc.model.request.AppendEntriesRequest;
+import com.namnv.rpc.model.request.InstallSnapshotRequest;
+import com.namnv.rpc.model.request.PreVoteRequest;
+import com.namnv.rpc.model.request.RequestVoteRequest;
+import com.namnv.rpc.model.response.AppendEntriesResponse;
+import com.namnv.rpc.model.response.InstallSnapshotResponse;
+import com.namnv.rpc.model.response.PreVoteResponse;
+import com.namnv.rpc.model.response.RequestVoteResponse;
 import lombok.Getter;
 import lombok.Setter;
 
@@ -13,12 +21,12 @@ import java.util.concurrent.ConcurrentHashMap;
 
 @Setter
 @Getter
-public class InProcessRPC implements RaftRPC {
-    private final Map<String, RaftNodeRPCHandler> registry = new ConcurrentHashMap<>();
+public class InMemoryRpcClient implements RpcProcessor {
+    private final Map<String, RaftServerService> registry = new ConcurrentHashMap<>();
     private volatile Map<String, Set<String>> reachable = new ConcurrentHashMap<>(); // nodeId -> set of nodeIds reachable
 
 
-    public void register(String nodeId, RaftNodeRPCHandler handler) {
+    public void register(String nodeId, RaftServerService handler) {
         registry.put(nodeId, handler);
     }
 
@@ -31,13 +39,13 @@ public class InProcessRPC implements RaftRPC {
     }
 
     @Override
-    public CompletableFuture<RequestVoteResponse> requestVote(String target, RequestVoteRequest req) {
-        if (!reachable.getOrDefault(req.candidateId, Set.of()).contains(target)) {
-            return CompletableFuture.completedFuture(new RequestVoteResponse(req.term, false));
+    public CompletableFuture<RequestVoteResponse> requestVote(String target, RequestVoteRequest request) {
+        if (!reachable.getOrDefault(request.candidateId, Set.of()).contains(target)) {
+            return CompletableFuture.completedFuture(new RequestVoteResponse(request.term, false));
         }
-        RaftNodeRPCHandler h = registry.get(target);
-        if (h == null) return CompletableFuture.completedFuture(new RequestVoteResponse(req.term, false));
-        return CompletableFuture.supplyAsync(() -> h.handleRequestVoteRequest(req));
+        RaftServerService h = registry.get(target);
+        if (h == null) return CompletableFuture.completedFuture(new RequestVoteResponse(request.term, false));
+        return CompletableFuture.supplyAsync(() -> h.handleRequestVoteRequest(request));
     }
 
 
@@ -46,19 +54,18 @@ public class InProcessRPC implements RaftRPC {
         if (!reachable.getOrDefault(req.leaderId, Set.of()).contains(target)) {
             return CompletableFuture.completedFuture(null);
         }
-        RaftNodeRPCHandler h = registry.get(target);
+        RaftServerService h = registry.get(target);
         if (h == null) return CompletableFuture.completedFuture(new AppendEntriesResponse(req.term, false, 0));
         return CompletableFuture.supplyAsync(() -> h.handleAppendEntriesRequest(req));
     }
 
     @Override
     public CompletableFuture<PreVoteResponse> preVote(String target, PreVoteRequest req) {
-//        // Kiểm tra node target có reachable không
         if (!reachable.getOrDefault(req.candidateId, Set.of()).contains(target)) {
             return CompletableFuture.completedFuture(new PreVoteResponse(req.term, false));
         }
 
-        RaftNodeRPCHandler h = registry.get(target);
+        RaftServerService h = registry.get(target);
         if (h == null) {
             return CompletableFuture.completedFuture(new PreVoteResponse(req.term, false));
         }
@@ -68,7 +75,7 @@ public class InProcessRPC implements RaftRPC {
 
     @Override
     public CompletableFuture<InstallSnapshotResponse> installSnapshot(String target, InstallSnapshotRequest req) {
-        RaftNodeRPCHandler h = registry.get(target);
+        RaftServerService h = registry.get(target);
         if (h == null) {
             return CompletableFuture.completedFuture(new InstallSnapshotResponse());
         }

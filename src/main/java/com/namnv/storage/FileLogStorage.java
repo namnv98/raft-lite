@@ -2,6 +2,7 @@ package com.namnv.storage;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.namnv.config.NodeOptions;
 import com.namnv.entity.LogEntry;
 import lombok.Data;
 
@@ -12,7 +13,7 @@ import java.util.Arrays;
 import java.util.List;
 
 @Data
-public class FileLogStore implements LogStore {
+public class FileLogStorage implements LogStorage {
 
     private long baseIndex;
     private long baseTerm;
@@ -21,8 +22,8 @@ public class FileLogStore implements LogStore {
     private final List<LogEntry> entries = new ArrayList<>();
     private final ObjectMapper objectMapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
 
-    public FileLogStore(String folderPath, long baseIndex, long baseTerm) throws IOException {
-        File folder = new File(folderPath);
+    public FileLogStorage(NodeOptions nodeOptions, long baseIndex, long baseTerm) throws IOException {
+        File folder = new File(nodeOptions.getLogUri());
         if (!folder.exists()) {
             folder.mkdirs();
         }
@@ -72,7 +73,7 @@ public class FileLogStore implements LogStore {
     }
 
     @Override
-    public synchronized void append(LogEntry entry) {
+    public synchronized void appendEntry(LogEntry entry) {
         entries.add(entry);
         saveToFile();
     }
@@ -86,12 +87,12 @@ public class FileLogStore implements LogStore {
     }
 
     @Override
-    public synchronized void truncateSuffix(long fromIndexInclusive) {
-        if (fromIndexInclusive <= baseIndex) {
+    public synchronized void truncateSuffix(long lastIndexKept) {
+        if (lastIndexKept <= baseIndex) {
             // truncate EVERYTHING after snapshot
             entries.clear();
         } else {
-            long pos = fromIndexInclusive - baseIndex - 1;
+            long pos = lastIndexKept - baseIndex - 1;
             if (pos < 0 || pos >= entries.size()) return;
             entries.subList((int) pos, entries.size()).clear();
         }
@@ -99,11 +100,11 @@ public class FileLogStore implements LogStore {
     }
 
     @Override
-    public synchronized void truncatePrefix(long index) {
+    public synchronized void truncatePrefix(long firstIndexKept) {
         // index = lastIncludedIndex + 1
-        if (index <= baseIndex) return;
+        if (firstIndexKept <= baseIndex) return;
 
-        long pos = index - baseIndex - 1;
+        long pos = firstIndexKept - baseIndex - 1;
         if (pos <= 0) return;
         if (pos > entries.size()) pos = entries.size();
 

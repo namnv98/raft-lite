@@ -2,14 +2,14 @@ package com.namnv.state;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
-import com.namnv.entity.LogEntry;
-import com.namnv.storage.LogStore;
+import com.namnv.config.NodeOptions;
+import com.namnv.storage.FileLogStorage;
+import com.namnv.storage.LogStorage;
 import lombok.Data;
 import lombok.SneakyThrows;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.List;
 
 @Data
 public class PersistentState {
@@ -18,19 +18,17 @@ public class PersistentState {
     private String votedFor = null;
     private long lastCommitIndex = 0;
 
-    // Thêm thông tin snapshot metadata
     private long lastSnapshotIndex = 0;
     private long lastSnapshotTerm = 0;
 
-    private final LogStore logStore;
+    private final LogStorage logStore;
     private final File stateFile;
 
     private final ObjectMapper objectMapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
 
     @SneakyThrows
-    public PersistentState(LogStore logStore, String nodeFolderPath) {
-        this.logStore = logStore;
-        File folder = new File(nodeFolderPath);
+    public PersistentState(NodeOptions nodeOptions) {
+        var folder = new File(nodeOptions.getRaftMetaUri());
         if (!folder.exists()) {
             folder.mkdirs();
         }
@@ -39,15 +37,14 @@ public class PersistentState {
             stateFile.createNewFile();
         }
         load();
-        logStore.setBaseIndex(lastSnapshotIndex);
-        logStore.setBaseTerm(lastSnapshotTerm);
+        this.logStore = new FileLogStorage(nodeOptions, lastSnapshotIndex, lastSnapshotTerm);
     }
 
     private synchronized void load() throws IOException {
         if (stateFile.length() == 0) {
             return;
         }
-        StateData data = objectMapper.readValue(stateFile, StateData.class);
+        var data = objectMapper.readValue(stateFile, StateData.class);
         this.currentTerm = data.currentTerm;
         this.votedFor = data.votedFor;
         this.lastCommitIndex = data.lastCommitIndex;

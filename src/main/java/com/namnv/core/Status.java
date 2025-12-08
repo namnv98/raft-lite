@@ -1,5 +1,8 @@
 package com.namnv.core;
 
+import lombok.Getter;
+
+@Getter
 public class Status {
     private final boolean ok;
     private final String msg;
@@ -15,13 +18,5 @@ public class Status {
 
     public static Status ERROR(String msg) {
         return new Status(false, msg);
-    }
-
-    public boolean isOk() {
-        return ok;
-    }
-
-    public String getMsg() {
-        return msg;
     }
 }

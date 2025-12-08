@@ -1,9 +1,9 @@
 package com.namnv.statemachine;
 
 import com.namnv.core.Closure;
-import com.namnv.storage.snapshot.SnapshotReader;
+import com.namnv.statemachine.snapshot.SnapshotReader;
 import com.namnv.entity.LogEntry;
-import com.namnv.storage.snapshot.SnapshotWriter;
+import com.namnv.statemachine.snapshot.SnapshotWriter;
 
 public interface StateMachine {
     void onApply(String node, LogEntry entry);

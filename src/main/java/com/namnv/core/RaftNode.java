@@ -1,18 +1,26 @@
 package com.namnv.core;
 
+import com.namnv.config.NodeOptions;
 import com.namnv.config.RaftConfig;
 import com.namnv.entity.LogEntry;
-import com.namnv.rpc.InProcessRPC;
-import com.namnv.rpc.RaftNodeRPCHandler;
-import com.namnv.rpc.RaftRPC;
-import com.namnv.rpc.model.*;
+import com.namnv.rpc.*;
+import com.namnv.rpc.client.InMemoryRpcClient;
+import com.namnv.rpc.client.RpcProcessor;
+import com.namnv.rpc.model.request.AppendEntriesRequest;
+import com.namnv.rpc.model.request.InstallSnapshotRequest;
+import com.namnv.rpc.model.request.PreVoteRequest;
+import com.namnv.rpc.model.request.RequestVoteRequest;
+import com.namnv.rpc.model.response.AppendEntriesResponse;
+import com.namnv.rpc.model.response.InstallSnapshotResponse;
+import com.namnv.rpc.model.response.PreVoteResponse;
+import com.namnv.rpc.model.response.RequestVoteResponse;
+import com.namnv.rpc.server.SocketRpcServer;
 import com.namnv.state.LeaderState;
 import com.namnv.state.PersistentState;
 import com.namnv.state.VolatileState;
 import com.namnv.statemachine.StateMachine;
-import com.namnv.storage.ConfigurationEntry;
-import com.namnv.storage.LogStore;
-import com.namnv.storage.snapshot.SnapshotWriter;
+import com.namnv.entity.ConfigurationEntry;
+import com.namnv.statemachine.snapshot.SnapshotWriter;
 import com.namnv.timer.ElectionTimer;
 import com.namnv.timer.HeartbeatTimer;
 import lombok.Getter;
@@ -34,16 +42,19 @@ import static java.util.Objects.isNull;
 
 @Slf4j
 @Getter
-public class RaftNode implements RaftNodeRPCHandler {
+public class RaftNode implements RaftServerService {
 
     public enum NodeState {
-        LEADER,// It's a leader
-        CANDIDATE,// It's a candidate
-        FOLLOWER,// It's a follower
+        LEADER,
+        CANDIDATE,
+        FOLLOWER,
+        LEARNER,
     }
 
     private final RaftConfig config;
-    private final RaftRPC rpc;
+
+    private final RpcProcessor rpcProcessor;
+    private final SocketRpcServer rpcServer;
 
     private final PersistentState persistent;
     private final VolatileState volatileState = new VolatileState();
@@ -67,24 +78,27 @@ public class RaftNode implements RaftNodeRPCHandler {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private final long CLIENT_TIMEOUT_MS = 5000;
 
-    private final String nodeFolder;
+    private final NodeOptions nodeOptions;
 
-    public RaftNode(String nodeId, List<String> cluster, RaftConfig config, RaftRPC rpc, LogStore logStore, String nodeFolder, StateMachine sm) {
-        this.nodeId = nodeId;
-        this.config = config;
-        this.rpc = rpc;
-        this.nodeFolder = nodeFolder;
-        this.persistent = new PersistentState(logStore, nodeFolder);
-        this.stateMachine = sm;
-        this.electionTimer = new ElectionTimer(config.getElectionTimeoutMinMs(), config.getElectionTimeoutMaxMs(), this::onElectionTimeout);
-        this.heartbeatTimer = new HeartbeatTimer(config.getHeartbeatIntervalMs(), this::sendHeartbeats);
-        this.conf = new ConfigurationEntry(new ArrayList<>(cluster), new ArrayList<>(), false);
+    public RaftNode(NodeOptions nodeOptions, RpcProcessor rpcProcessor) {
+        this.rpcServer = new SocketRpcServer(Integer.parseInt(nodeOptions.getRaftConfig().getSelf().split(":")[1]), this);
+        this.rpcProcessor = rpcProcessor;
+
+        this.nodeId = nodeOptions.getRaftConfig().getSelf();
+        this.nodeOptions = nodeOptions;
+        this.config = nodeOptions.getRaftConfig();
+        this.persistent = new PersistentState(nodeOptions);
+        this.stateMachine = nodeOptions.getStateMachine();
+        this.electionTimer = new ElectionTimer(nodeOptions.getElectionTimeoutMinMs(), nodeOptions.getElectionTimeoutMaxMs(), this::onElectionTimeout);
+        this.heartbeatTimer = new HeartbeatTimer(nodeOptions.getHeartbeatIntervalMs(), this::sendHeartbeats);
+        this.conf = new ConfigurationEntry(nodeOptions.getRaftConfig().getPeers(), new ArrayList<>(), false);
     }
 
     public void start() {
-        if (rpc instanceof InProcessRPC) {
-            ((InProcessRPC) rpc).register(nodeId, this);
+        if (rpcProcessor instanceof InMemoryRpcClient) {
+            ((InMemoryRpcClient) rpcProcessor).register(nodeId, this);
         }
+        rpcServer.start();
         restoreStateMachineFromSnapshot();
         this.state = NodeState.FOLLOWER;
         electionTimer.start();
@@ -97,15 +111,15 @@ public class RaftNode implements RaftNodeRPCHandler {
                 return;
             }
             // Phase 1: joint configuration (old + new nodes)
-            List<String> newNodes = new ArrayList<>(conf.getOldNodes());
+            var newNodes = new ArrayList<>(conf.getOldNodes());
             newNodes.add(newNodeId);
             this.conf.setNewNodes(newNodes);
 
-            ConfigurationEntry jointConfig = new ConfigurationEntry(conf.getOldNodes(), conf.getNewNodes(), true);
+            var jointConfig = new ConfigurationEntry(conf.getOldNodes(), conf.getNewNodes(), true);
 
-            long nextIndex = persistent.getLogStore().lastIndex() + 1;
-            LogEntry jointEntry = LogEntry.newConfigurationEntry(nextIndex, persistent.getCurrentTerm(), jointConfig);
-            persistent.getLogStore().append(jointEntry);
+            var nextIndex = persistent.getLogStore().lastIndex() + 1;
+            var jointEntry = LogEntry.newConfigurationEntry(nextIndex, persistent.getCurrentTerm(), jointConfig);
+            persistent.getLogStore().appendEntry(jointEntry);
 
             if (!leaderState.getNextIndex().containsKey(newNodeId)) {
                 leaderState.getNextIndex().put(newNodeId, nextIndex);
@@ -123,20 +137,20 @@ public class RaftNode implements RaftNodeRPCHandler {
             if (state != NodeState.LEADER) {
                 return;
             }
-            long nextIdx = leaderState.getNextIndex().get(nodeId);
-            List<LogEntry> entries = persistent.getLogStore().readFrom(nextIdx);
-            long prevIndex = nextIdx - 1;
+            var nextIdx = leaderState.getNextIndex().get(nodeId);
+            var entries = persistent.getLogStore().readFrom(nextIdx);
+            var prevIndex = nextIdx - 1;
             if (isNull(persistent.getLogStore().get(prevIndex))) {
                 sendSnapshotToNode(nodeId);
                 return;
             }
-            long prevTerm = prevIndex == 0 ? 0 : persistent.getLogStore().get(prevIndex).getTerm();
+            var prevTerm = prevIndex == 0 ? 0 : persistent.getLogStore().get(prevIndex).getTerm();
 
-            AppendEntriesRequest req = new AppendEntriesRequest(
+            var req = new AppendEntriesRequest(
                     persistent.getCurrentTerm(), this.nodeId, prevIndex, prevTerm, entries, volatileState.getCommitIndex()
             );
 
-            rpc.appendEntries(nodeId, req).thenAccept(resp -> {
+            rpcProcessor.appendEntries(nodeId, req).thenAccept(resp -> {
                 lock.lock();
                 try {
                     if (resp.term > persistent.getCurrentTerm()) {
@@ -155,15 +169,47 @@ public class RaftNode implements RaftNodeRPCHandler {
                         }
                         replicateLogsForJoiningNode(nodeId); // retry
                     }
-                } catch (Exception e) {
-                    e.printStackTrace();
                 } finally {
                     lock.unlock();
                 }
             });
-        } catch (
-                Exception e) {
+        } catch (Exception e) {
             e.printStackTrace();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void sendSnapshotToNode(String nodeId) {
+        lock.lock();
+        try {
+            var req = new InstallSnapshotRequest(
+                    persistent.getCurrentTerm(),
+                    this.nodeId,
+                    persistent.getLogStore().getBaseIndex(),
+                    persistent.getLogStore().getBaseTerm(),
+                    nodeOptions.getSnapshotUri() + "/snapshot.data"
+            );
+
+            rpcProcessor.installSnapshot(nodeId, req).thenAccept(resp -> {
+                lock.lock();
+                try {
+                    if (resp.getTerm() > persistent.getCurrentTerm()) {
+                        becomeFollower(resp.getTerm());
+                        return;
+                    }
+                    // Sau khi snapshot áp dụng xong → cập nhật nextIndex và matchIndex
+                    leaderState.getNextIndex().put(nodeId, persistent.getLogStore().getBaseIndex() + 1);
+                    leaderState.getMatchIndex().put(nodeId, persistent.getLogStore().getBaseIndex());
+
+                    finalizeJoiningNodeIfCaughtUp(nodeId);
+
+                    sendLogs(nodeId, persistent.getLogStore().getBaseIndex() + 1, persistent.getLogStore().getBaseIndex(), persistent.getLogStore().getBaseTerm());
+
+                } finally {
+                    lock.unlock();
+                }
+            });
         } finally {
             lock.unlock();
         }
@@ -172,9 +218,9 @@ public class RaftNode implements RaftNodeRPCHandler {
     private void sendLogs(String nodeId, long nextIdx, long prevIndex, long prevTerm) {
         lock.lock();
         try {
-            List<LogEntry> entries = persistent.getLogStore().readFrom(nextIdx);
-            AppendEntriesRequest req = new AppendEntriesRequest(persistent.getCurrentTerm(), this.nodeId, prevIndex, prevTerm, entries, volatileState.getCommitIndex());
-            rpc.appendEntries(nodeId, req).thenAccept(resp -> {
+            var entries = persistent.getLogStore().readFrom(nextIdx);
+            var req = new AppendEntriesRequest(persistent.getCurrentTerm(), this.nodeId, prevIndex, prevTerm, entries, volatileState.getCommitIndex());
+            rpcProcessor.appendEntries(nodeId, req).thenAccept(resp -> {
                 lock.lock();
                 try {
                     if (resp.term > persistent.getCurrentTerm()) {
@@ -200,57 +246,22 @@ public class RaftNode implements RaftNodeRPCHandler {
         }
     }
 
-    private void sendSnapshotToNode(String nodeId) {
-        lock.lock();
-        try {
-            InstallSnapshotRequest req = new InstallSnapshotRequest(
-                    persistent.getCurrentTerm(),
-                    this.nodeId,
-                    persistent.getLogStore().getBaseIndex(),
-                    persistent.getLogStore().getBaseTerm(),
-                    nodeFolder + "/snapshot.data"
-            );
-
-            rpc.installSnapshot(nodeId, req).thenAccept(resp -> {
-                lock.lock();
-                try {
-                    if (resp.getTerm() > persistent.getCurrentTerm()) {
-                        becomeFollower(resp.getTerm());
-                        return;
-                    }
-                    // Sau khi snapshot áp dụng xong → cập nhật nextIndex và matchIndex
-                    leaderState.getNextIndex().put(nodeId, persistent.getLogStore().getBaseIndex() + 1);
-                    leaderState.getMatchIndex().put(nodeId, persistent.getLogStore().getBaseIndex());
-
-                    finalizeJoiningNodeIfCaughtUp(nodeId);
-
-                    sendLogs(nodeId, persistent.getLogStore().getBaseIndex() + 1, persistent.getLogStore().getBaseIndex(), persistent.getLogStore().getBaseTerm());
-
-                } finally {
-                    lock.unlock();
-                }
-            });
-        } finally {
-            lock.unlock();
-        }
-    }
-
     private void finalizeJoiningNodeIfCaughtUp(String newNodeId) {
         lock.lock();
         try {
-            long matchIndex = leaderState.getMatchIndex().getOrDefault(newNodeId, 0L);
-            long lastIndex = persistent.getLogStore().lastIndex();
+            var matchIndex = leaderState.getMatchIndex().getOrDefault(newNodeId, 0L);
+            var lastIndex = persistent.getLogStore().lastIndex();
 
             if (matchIndex >= lastIndex) {
                 // Phase 2: final configuration (joint=false)
                 this.conf.setOldNodes(conf.getNewNodes());
                 this.conf.setNewNodes(new ArrayList<>());
 
-                ConfigurationEntry finalConf = new ConfigurationEntry(this.conf.getOldNodes(), this.conf.getNewNodes(), false);
-                long idx = lastIndex + 1;
-                LogEntry finalEntry = LogEntry.newConfigurationEntry(idx, persistent.getCurrentTerm(), finalConf);
+                var finalConf = new ConfigurationEntry(this.conf.getOldNodes(), this.conf.getNewNodes(), false);
+                var idx = lastIndex + 1;
+                var finalEntry = LogEntry.newConfigurationEntry(idx, persistent.getCurrentTerm(), finalConf);
 
-                persistent.getLogStore().append(finalEntry);
+                persistent.getLogStore().appendEntry(finalEntry);
             }
         } finally {
             lock.unlock();
@@ -270,11 +281,11 @@ public class RaftNode implements RaftNodeRPCHandler {
             }
 
             // Apply các log sau snapshot
-            long lastApplied = volatileState.getLastApplied();
-            long commitIndex = persistent.getLastCommitIndex();
-            LogStore log = persistent.getLogStore();
+            var lastApplied = volatileState.getLastApplied();
+            var commitIndex = persistent.getLastCommitIndex();
+            var log = persistent.getLogStore();
 
-            for (long i = lastApplied + 1; i <= commitIndex; i++) {
+            for (var i = lastApplied + 1; i <= commitIndex; i++) {
                 LogEntry logEntry = log.get(i);
                 if (logEntry != null) {
                     stateMachine.onApply(nodeId, logEntry);
@@ -290,21 +301,18 @@ public class RaftNode implements RaftNodeRPCHandler {
     public void createSnapshot() {
         lock.lock();
         try {
-            long commitIndex = volatileState.getCommitIndex();
-            LogStore log = persistent.getLogStore();
-
-            stateMachine.onSnapshotSave(new SnapshotWriter(nodeFolder, new ArrayList<>()), new Closure() {
-                @Override
-                public void run(Status status) {
-                    
+            var commitIndex = volatileState.getCommitIndex();
+            var logStore = persistent.getLogStore();
+            stateMachine.onSnapshotSave(new SnapshotWriter(nodeOptions.getSnapshotUri(), new ArrayList<>()), status -> {
+                if (!status.isOk()) {
+                    log.error("Snapshot failed: {}", status);
+                    return;
                 }
+                persistent.setLastSnapshotTerm(persistent.getCurrentTerm());
+                persistent.setLastSnapshotIndex(commitIndex);
+                persistent.persist();
+                logStore.truncatePrefix(commitIndex + 1);
             });
-
-            persistent.setLastSnapshotTerm(persistent.getCurrentTerm());
-            persistent.setLastSnapshotIndex(commitIndex);
-            persistent.persist();
-
-            log.truncatePrefix(commitIndex + 1);
         } finally {
             lock.unlock();
         }
@@ -322,10 +330,10 @@ public class RaftNode implements RaftNodeRPCHandler {
                 return new PreVoteResponse(persistent.getCurrentTerm(), false);
             }
 
-            long lastLogIndex = persistent.getLogStore().lastIndex();
-            long lastLogTerm = persistent.getLogStore().lastTerm();
+            var lastLogIndex = persistent.getLogStore().lastIndex();
+            var lastLogTerm = persistent.getLogStore().lastTerm();
 
-            boolean upToDate = (request.lastLogTerm > lastLogTerm) ||
+            var upToDate = (request.lastLogTerm > lastLogTerm) ||
                     (request.lastLogTerm == lastLogTerm && request.lastLogIndex >= lastLogIndex);
 
             return new PreVoteResponse(persistent.getCurrentTerm(), upToDate);
@@ -366,12 +374,12 @@ public class RaftNode implements RaftNodeRPCHandler {
                 becomeFollower(req.term);
             }
 
-            boolean voteGranted = false;
-            String votedFor = persistent.getVotedFor();
-            long lastLogIndex = persistent.getLogStore().lastIndex();
-            long lastLogTerm = persistent.getLogStore().lastTerm();
+            var voteGranted = false;
+            var votedFor = persistent.getVotedFor();
+            var lastLogIndex = persistent.getLogStore().lastIndex();
+            var lastLogTerm = persistent.getLogStore().lastTerm();
 
-            boolean upToDate = (req.lastLogTerm > lastLogTerm) || (req.lastLogTerm == lastLogTerm && req.lastLogIndex >= lastLogIndex);
+            var upToDate = (req.lastLogTerm > lastLogTerm) || (req.lastLogTerm == lastLogTerm && req.lastLogIndex >= lastLogIndex);
 
             if ((votedFor == null || votedFor.equals(req.candidateId)) && upToDate) {
                 persistent.setVotedFor(req.candidateId);
@@ -394,7 +402,7 @@ public class RaftNode implements RaftNodeRPCHandler {
 
             handleHeartbeat(req.term, req.leaderId);
 
-            LogStore log = persistent.getLogStore();
+            var log = persistent.getLogStore();
             if (req.prevLogIndex > 0) {
                 LogEntry prev = log.get(req.prevLogIndex);
                 if (prev != null) {
@@ -423,7 +431,7 @@ public class RaftNode implements RaftNodeRPCHandler {
                 long start = req.entries.get(0).getIndex();
                 log.truncateSuffix(start);
                 for (LogEntry e : req.entries) {
-                    log.append(e);
+                    log.appendEntry(e);
                     if (e.isConfigurationEntry()) {
                         ConfigurationEntry newConf = e.getConfiguration();
                         if (newConf.isJoint()) {
@@ -465,7 +473,7 @@ public class RaftNode implements RaftNodeRPCHandler {
             }
             if (term > persistent.getCurrentTerm()) {
                 if (state == NodeState.LEADER) {
-                    System.out.println("Leader " + nodeId + " step down");
+                    log.info("Leader " + nodeId + " step down");
                 }
                 becomeFollower(term);
             }
@@ -482,17 +490,17 @@ public class RaftNode implements RaftNodeRPCHandler {
             if (state == NodeState.LEADER) {
                 return;
             }
-            AtomicInteger granted = new AtomicInteger(1); // vote cho chính mình
-            int majority = (conf.getOldNodes().size() / 2) + 1;
-            long lastIndex = persistent.getLogStore().lastIndex();
-            long lastTerm = persistent.getLogStore().lastTerm();
+            var granted = new AtomicInteger(1); // vote cho chính mình
+            var majority = (conf.getOldNodes().size() / 2) + 1;
+            var lastIndex = persistent.getLogStore().lastIndex();
+            var lastTerm = persistent.getLogStore().lastTerm();
 
-            for (String peer : conf.getOldNodes()) {
+            for (var peer : conf.getOldNodes()) {
                 if (peer.equals(nodeId)) {
                     continue;
                 }
-                PreVoteRequest req = new PreVoteRequest(persistent.getCurrentTerm(), nodeId, lastIndex, lastTerm);
-                rpc.preVote(peer, req).thenAccept(response -> {
+                var req = new PreVoteRequest(persistent.getCurrentTerm(), nodeId, lastIndex, lastTerm);
+                rpcProcessor.preVote(peer, req).thenAccept(response -> {
                     lock.lock();
                     try {
                         if (state != NodeState.FOLLOWER && state != NodeState.CANDIDATE) {
@@ -523,7 +531,7 @@ public class RaftNode implements RaftNodeRPCHandler {
     }
 
     private void becomeFollower(long term) {
-        boolean changedTerm = false;
+        var changedTerm = false;
         // Cập nhật term nếu term mới lớn hơn
         if (term > persistent.getCurrentTerm()) {
             persistent.setCurrentTerm(term);
@@ -531,7 +539,7 @@ public class RaftNode implements RaftNodeRPCHandler {
             persistent.persist();
             changedTerm = true;
         }
-        System.out.println(nodeId + " current state " + state + " becomes FOLLOWER at term " + persistent.getCurrentTerm());
+        log.info(nodeId + " current state " + state + " becomes FOLLOWER at term " + persistent.getCurrentTerm());
         // Dù term bằng currentTerm, nếu node không phải follower thì vẫn step-down
         if (state != NodeState.FOLLOWER || changedTerm) {
             state = NodeState.FOLLOWER;
@@ -557,19 +565,19 @@ public class RaftNode implements RaftNodeRPCHandler {
         persistent.setVotedFor(nodeId);
         electionTimer.reset();
 
-        final long termStarted = persistent.getCurrentTerm();
-        AtomicInteger granted = new AtomicInteger(1);
-        int majority = (conf.getOldNodes().size() / 2) + 1;
+        var termStarted = persistent.getCurrentTerm();
+        var granted = new AtomicInteger(1);
+        var majority = (conf.getOldNodes().size() / 2) + 1;
 
-        long lastIndex = persistent.getLogStore().lastIndex();
-        long lastTerm = persistent.getLogStore().lastTerm();
+        var lastIndex = persistent.getLogStore().lastIndex();
+        var lastTerm = persistent.getLogStore().lastTerm();
 
         for (String peer : conf.getOldNodes()) {
             if (peer.equals(nodeId)) {
                 continue;
             }
             RequestVoteRequest req = new RequestVoteRequest(termStarted, nodeId, lastIndex, lastTerm);
-            rpc.requestVote(peer, req).thenAccept(resp -> {
+            rpcProcessor.requestVote(peer, req).thenAccept(resp -> {
                 lock.lock();
                 try {
                     if (state != NodeState.CANDIDATE) return;
@@ -599,7 +607,7 @@ public class RaftNode implements RaftNodeRPCHandler {
         leaderId = nodeId;
         heartbeatTimer.start();
         sendHeartbeats();
-        System.out.println("Leader " + nodeId + " elected at term " + persistent.getCurrentTerm());
+        log.info("Leader " + nodeId + " elected at term " + persistent.getCurrentTerm());
     }
 
     private void sendHeartbeats() {
@@ -608,8 +616,8 @@ public class RaftNode implements RaftNodeRPCHandler {
             if (state != NodeState.LEADER) {
                 return;
             }
-            long term = persistent.getCurrentTerm();
-            long leaderCommit = volatileState.getCommitIndex();
+            var term = persistent.getCurrentTerm();
+            var leaderCommit = volatileState.getCommitIndex();
 
             for (String peer : conf.getOldNodes()) {
                 if (peer.equals(nodeId)) {
@@ -628,19 +636,19 @@ public class RaftNode implements RaftNodeRPCHandler {
             if (state != NodeState.LEADER) {
                 return;
             }
-            LogStore log = persistent.getLogStore();
-            long nextIdx = leaderState.getNextIndex().getOrDefault(followerId, 1L);
-            long lastIndex = persistent.getLogStore().lastIndex();
+            var log = persistent.getLogStore();
+            var nextIdx = leaderState.getNextIndex().getOrDefault(followerId, 1L);
+            var lastIndex = persistent.getLogStore().lastIndex();
             if (nextIdx > lastIndex + 1) nextIdx = lastIndex + 1;
 
-            long prevIndex = nextIdx - 1;
-            long prevTerm = prevIndex == 0 ? 0 : (log.get(prevIndex) != null ? log.get(prevIndex).getTerm() : 0);
+            var prevIndex = nextIdx - 1;
+            var prevTerm = prevIndex == 0 ? 0 : (log.get(prevIndex) != null ? log.get(prevIndex).getTerm() : 0);
 
             // Chỉ replicate batch logs, hoặc heartbeat rỗng nếu không có log mới
             List<LogEntry> entries = nextIdx <= lastIndex ? log.readFrom(nextIdx) : List.of();
 
-            AppendEntriesRequest req = new AppendEntriesRequest(term, nodeId, prevIndex, prevTerm, entries, leaderCommit);
-            rpc.appendEntries(followerId, req).thenAccept(resp -> {
+            var req = new AppendEntriesRequest(term, nodeId, prevIndex, prevTerm, entries, leaderCommit);
+            rpcProcessor.appendEntries(followerId, req).thenAccept(resp -> {
                 lock.lock();
                 try {
                     if (resp.term > persistent.getCurrentTerm()) {
@@ -649,16 +657,16 @@ public class RaftNode implements RaftNodeRPCHandler {
                     }
                     if (resp.success) {
                         if (!entries.isEmpty()) {
-                            long match = resp.matchIndex;
-                            long prevMatch = leaderState.getMatchIndex().getOrDefault(followerId, 0L);
+                            var match = resp.matchIndex;
+                            var prevMatch = leaderState.getMatchIndex().getOrDefault(followerId, 0L);
                             leaderState.getMatchIndex().put(followerId, Math.max(prevMatch, match));
                             leaderState.getNextIndex().put(followerId, match + 1);
                             maybeAdvanceCommitIndex();
                         }
                     } else {
                         // Giảm nextIndex an toàn, tránh giảm quá mức
-                        long ni = leaderState.getNextIndex().getOrDefault(followerId, 1L);
-                        long decrement = Math.max(1, (ni - 1) / 2);
+                        var ni = leaderState.getNextIndex().getOrDefault(followerId, 1L);
+                        var decrement = Math.max(1, (ni - 1) / 2);
                         leaderState.getNextIndex().put(followerId, Math.max(1, ni - decrement));
                         if (state == NodeState.LEADER) {
                             replicateLogsToFollower(followerId, term, leaderCommit);
@@ -674,21 +682,20 @@ public class RaftNode implements RaftNodeRPCHandler {
     }
 
     private void maybeAdvanceCommitIndex() {
-        long N = persistent.getLogStore().lastIndex();
-        long currentCommit = volatileState.getCommitIndex();
-        for (long k = currentCommit + 1; k <= N; k++) {
-            final long candidate = k;
-            int count = 1;
-            for (String peer : conf.getOldNodes()) {
+        var N = persistent.getLogStore().lastIndex();
+        var currentCommit = volatileState.getCommitIndex();
+        for (var candidate = currentCommit + 1; candidate <= N; candidate++) {
+            var count = 1;
+            for (var peer : conf.getOldNodes()) {
                 if (peer.equals(nodeId)) {
                     continue;
                 }
-                Long m = leaderState.getMatchIndex().get(peer);
+                var m = leaderState.getMatchIndex().get(peer);
                 if (m != null && m >= candidate) {
                     count++;
                 }
             }
-            int majority = (conf.getOldNodes().size() / 2) + 1;
+            var majority = (conf.getOldNodes().size() / 2) + 1;
             if (count >= majority) {
                 LogEntry e = persistent.getLogStore().get(candidate);
                 if (e != null && e.getTerm() == persistent.getCurrentTerm()) {
@@ -700,9 +707,9 @@ public class RaftNode implements RaftNodeRPCHandler {
     }
 
     private void applyCommitted() {
-        long lastApplied = volatileState.getLastApplied();
-        long commitIndex = volatileState.getCommitIndex();
-        LogStore log = persistent.getLogStore();
+        var lastApplied = volatileState.getLastApplied();
+        var commitIndex = volatileState.getCommitIndex();
+        var log = persistent.getLogStore();
         for (long idx = lastApplied + 1; idx <= commitIndex; idx++) {
             LogEntry logEntry = log.get(idx);
             if (logEntry != null) {
@@ -726,7 +733,7 @@ public class RaftNode implements RaftNodeRPCHandler {
             }
             long nextIndex = persistent.getLogStore().lastIndex() + 1;
             LogEntry e = new LogEntry(nextIndex, persistent.getCurrentTerm(), command);
-            persistent.getLogStore().append(e);
+            persistent.getLogStore().appendEntry(e);
 
             CompletableFuture<Boolean> future = new CompletableFuture<>();
             pendingFutures.put(nextIndex, future);

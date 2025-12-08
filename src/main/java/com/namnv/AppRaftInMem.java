@@ -1,11 +1,10 @@
 package com.namnv;
 
-
+import com.namnv.config.NodeOptions;
 import com.namnv.config.RaftConfig;
 import com.namnv.core.RaftNode;
-import com.namnv.rpc.InProcessRPC;
-import com.namnv.statemachine.KeyValueStateMachine;
-import com.namnv.storage.FileLogStore;
+import com.namnv.rpc.client.InMemoryRpcClient;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.FileUtils;
 
 import java.io.File;
@@ -13,13 +12,13 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
-public class App {
+@Slf4j
+public class AppRaftInMem {
     public static void main(String[] args) throws Exception {
-//        FileUtils.deleteDirectory(new File("data"));
+        FileUtils.deleteDirectory(new File("data"));
 
         List<String> nodes = Arrays.asList("A", "B", "C");
-        InProcessRPC rpc = new InProcessRPC();
-        RaftConfig cfg = new RaftConfig(200, 300, 100);
+        InMemoryRpcClient rpc = new InMemoryRpcClient();
 
         Map<String, Set<String>> reachable = new HashMap<>();
         reachable.put("A", new HashSet<>(Arrays.asList("A", "B", "C")));
@@ -30,9 +29,19 @@ public class App {
         List<RaftNode> clusters = new ArrayList<RaftNode>();
         for (int i = 0; i < nodes.size(); i++) {
             String nodeFolder = "data/" + nodes.get(i);
-            FileLogStore logStore = new FileLogStore(nodeFolder, 0, 1);
 
-            clusters.add(new RaftNode(nodes.get(i), nodes, cfg, rpc, logStore, nodeFolder, new KeyValueStateMachine()));
+            NodeOptions nodeOptions = NodeOptions.builder()
+                    .raftMetaUri(nodeFolder)
+                    .logUri(nodeFolder)
+                    .snapshotUri(nodeFolder)
+                    .electionTimeoutMinMs(300)
+                    .electionTimeoutMaxMs(500)
+                    .heartbeatIntervalMs(100)
+                    .stateMachine(new KeyValueStateMachine())
+                    .raftConfig(RaftConfig.builder().self(nodes.get(i)).peers(nodes).build())
+                    .build();
+
+            clusters.add(new RaftNode(nodeOptions, rpc));
         }
 
         for (RaftNode n : clusters) {
@@ -41,33 +50,46 @@ public class App {
         }
 
         TimeUnit.SECONDS.sleep(3);
-
         var leader = getLeader(clusters);
 
         leader.appendClientCommand("data_1".getBytes(StandardCharsets.UTF_8));
-//        leader.clientAppend("data_1".getBytes(StandardCharsets.UTF_8));
-//        leader.clientAppend("data_1".getBytes(StandardCharsets.UTF_8));
-
         TimeUnit.SECONDS.sleep(3);
 
+        log.info(leader.getNodeId() + " bị network partition");
+        partitionNode(leader.getNodeId(), rpc.getReachable());
+        clusters.remove(leader);
+        TimeUnit.SECONDS.sleep(3);
+
+        log.info(leader.getNodeId() + " node rejoin");
+        restoreNode(leader.getNodeId(), rpc.getReachable());
+        clusters.add(leader);
+        TimeUnit.SECONDS.sleep(3);
+
+
         restoreNode("D", rpc.getReachable());
-        FileLogStore logStore = new FileLogStore("data/D", 0, 1);
-//        var raftNode = new RaftNode("D", new ArrayList<>(nodes), cfg, rpc, logStore, "data/D", new KeyValueStateMachine());
-        var raftNode = new RaftNode("D", new ArrayList<>(), cfg, rpc, logStore, "data/D", new KeyValueStateMachine());
+        NodeOptions nodeOptions = NodeOptions.builder()
+                .raftMetaUri("data/D")
+                .logUri("data/D")
+                .snapshotUri("data/D")
+                .electionTimeoutMinMs(300)
+                .electionTimeoutMaxMs(500)
+                .heartbeatIntervalMs(100)
+                .stateMachine(new KeyValueStateMachine())
+                .raftConfig(RaftConfig.builder().self("D").build())
+                .build();
+
+        var raftNode = new RaftNode(nodeOptions, rpc);
         raftNode.start();
         clusters.add(raftNode);
 
         rpc.register("D", raftNode);
-
-        TimeUnit.SECONDS.sleep(5);
-
         getLeader(clusters).onJoinPeerCluster("D");
 
         TimeUnit.SECONDS.sleep(3);
 
         getLeader(clusters).appendClientCommand("data_3".getBytes(StandardCharsets.UTF_8)).get();
 
-        TimeUnit.SECONDS.sleep(10);
+        TimeUnit.SECONDS.sleep(3);
 
         for (RaftNode n : clusters) {
             n.createSnapshot();
@@ -91,7 +113,6 @@ public class App {
         for (var entry : network.entrySet()) {
             entry.getValue().remove(node);
         }
-
         // Node bị partition chỉ nhìn thấy chính nó
         var nodeSet = new HashSet<String>();
         nodeSet.add(node);

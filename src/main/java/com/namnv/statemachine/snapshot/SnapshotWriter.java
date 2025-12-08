@@ -1,4 +1,4 @@
-package com.namnv.storage.snapshot;
+package com.namnv.statemachine.snapshot;
 
 import lombok.Data;
 

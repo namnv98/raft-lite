@@ -12,7 +12,6 @@ public class LeaderState {
     private final Map<String, Long> nextIndex = new HashMap<>();
     private final Map<String, Long> matchIndex = new HashMap<>();
 
-
     public LeaderState(List<String> peers, long lastLogIndex) {
         for (String p : peers) {
             nextIndex.put(p, lastLogIndex);
