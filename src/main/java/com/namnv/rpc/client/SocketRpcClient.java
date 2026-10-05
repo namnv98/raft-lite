@@ -89,6 +89,13 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
     }
 
     private <T> CompletableFuture<T> sendRPC(String address, Object request, Class<T> responseType) {
+        return send(address, request, responseType);
+    }
+
+    /**
+     * Gửi một message bất kỳ mà {@link RpcCodec} biết tới node ở {@code address} và chờ response kiểu {@code responseType}.
+     */
+    public <T> CompletableFuture<T> send(String address, Object request, Class<T> responseType) {
         var result = new CompletableFuture<Object>();
         // kết nối và ghi ra socket ở thread riêng: người gọi (đang giữ lock của node) không bao giờ bị chặn bởi mạng
         rpcExecutor.execute(() -> connections.computeIfAbsent(address, Connection::new).send(request, result, true));

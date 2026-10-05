@@ -19,7 +19,15 @@ public interface LogStorage {
 
     long durableIndex();
 
-    List<LogEntry> readFrom(long startIndexInclusive);
+    default List<LogEntry> readFrom(long startIndexInclusive) {
+        return readFrom(startIndexInclusive, Integer.MAX_VALUE);
+    }
+
+    // nhiều nhất maxEntries entry liên tiếp kể từ startIndexInclusive
+    List<LogEntry> readFrom(long startIndexInclusive, int maxEntries);
+
+    // index của config entry mới nhất còn trong log và không lớn hơn upTo; 0 nếu không có
+    long lastConfigurationIndex(long upTo);
 
     LogEntry get(long index);
 

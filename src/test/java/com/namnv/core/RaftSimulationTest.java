@@ -362,6 +362,8 @@ class RaftSimulationTest {
                     .catchUpTimeoutMs(3000)
                     // snapshot đi qua nhiều mẩu, đủ để mất mẩu và đổi leader giữa chừng xảy ra
                     .snapshotChunkBytes(256)
+                    // bộ nhớ đệm log nhỏ, để follower tụt lại và node khởi động lại phải đọc entry cũ từ đĩa
+                    .logCacheEntries(32)
                     .snapshotIntervalEntries(150)
                     .maxEntriesPerRequest(16)
                     .stateMachine(machine)

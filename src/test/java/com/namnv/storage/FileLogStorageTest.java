@@ -270,4 +270,69 @@ class FileLogStorageTest {
         Files.write(file, lines);
         assertThrows(IOException.class, () -> open(0, 0));
     }
+
+    @Test
+    void entriesOlderThanTheCacheAreReadBackFromDisk() throws IOException {
+        // bộ nhớ chỉ giữ 4 entry mới nhất: mọi truy cập cũ hơn phải đi qua đĩa và cho đúng kết quả
+        var options = NodeOptions.builder().logUri(dir.toString()).logCacheEntries(4).build();
+        var joint = new com.namnv.entity.ConfigurationEntry(List.of("A"), List.of("A", "B"), true);
+        var log = new FileLogStorage(options, 0, 0);
+        for (long index = 1; index <= 30; index++) {
+            log.appendEntry(index == 7 || index == 19 ? LogEntry.newConfigurationEntry(index, 1, joint) : entries(index, index, 1).get(0));
+        }
+        for (long index = 30; index >= 1; index--) {
+            assertEquals(index, log.get(index).getIndex());
+        }
+        assertEquals(30, log.readFrom(1).size());
+        var middle = log.readFrom(5, 10);
+        assertEquals(10, middle.size());
+        assertEquals(5, middle.get(0).getIndex());
+        assertEquals(14, middle.get(9).getIndex());
+        assertEquals("cmd14", new String(middle.get(9).getCommand(), StandardCharsets.UTF_8));
+        assertEquals(0, log.lastConfigurationIndex(6));
+        assertEquals(7, log.lastConfigurationIndex(18));
+        assertEquals(19, log.lastConfigurationIndex(30));
+
+        // snapshot tới index 10 giữa một segment, rồi ghi tiếp sang segment mới
+        log.truncatePrefix(11);
+        assertNull(log.get(10));
+        assertEquals(11, log.get(11).getIndex());
+        assertEquals(20, log.readFrom(1).size());
+        assertEquals(0, log.lastConfigurationIndex(15));
+        assertEquals(19, log.lastConfigurationIndex(30));
+        log.appendEntries(entries(31, 40, 2));
+        for (long index = 11; index <= 40; index++) {
+            assertEquals(index, log.get(index).getIndex());
+        }
+
+        // cắt đuôi rồi ghi đè: entry cũ ở các index đó không được hiện ra từ bộ nhớ đệm
+        log.truncateSuffix(35);
+        assertEquals(34, log.lastIndex());
+        assertNull(log.get(35));
+        log.appendEntries(entries(35, 36, 9));
+        assertEquals(9, log.get(35).getTerm());
+        assertEquals(2, log.get(34).getTerm());
+        log.sync();
+        log.close();
+
+        var reopened = new FileLogStorage(options, 10, 1);
+        assertEquals(36, reopened.lastIndex());
+        assertEquals(9, reopened.lastTerm());
+        var all = reopened.readFrom(1);
+        assertEquals(26, all.size());
+        for (int i = 0; i < all.size(); i++) {
+            assertEquals(11 + i, all.get(i).getIndex());
+        }
+        assertEquals(19, reopened.lastConfigurationIndex(36));
+
+        // cắt qua ranh giới segment, rồi cắt qua cả config entry
+        reopened.truncateSuffix(25);
+        assertEquals(24, reopened.lastIndex());
+        assertEquals(List.of("log_1.jsonl"), segmentFiles());
+        assertEquals(1, reopened.get(24).getTerm());
+        reopened.truncateSuffix(15);
+        assertEquals(0, reopened.lastConfigurationIndex(36));
+        assertEquals(4, reopened.readFrom(1).size());
+        reopened.close();
+    }
 }

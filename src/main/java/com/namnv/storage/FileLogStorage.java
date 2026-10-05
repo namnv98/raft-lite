@@ -30,6 +30,51 @@ public class FileLogStorage implements LogStorage {
     private record Segment(Path file, long firstIndex) {
     }
 
+    // danh sách long không đóng hộp: mỗi entry của log có một phần tử, nên List<Long> sẽ tạo thêm một object cho mỗi entry
+    private static final class LongList {
+        private long[] values = new long[1024];
+        private int size;
+
+        void add(long value) {
+            if (size == values.length) {
+                values = java.util.Arrays.copyOf(values, size * 2);
+            }
+            values[size++] = value;
+        }
+
+        long get(int index) {
+            if (index < 0 || index >= size) {
+                throw new IndexOutOfBoundsException(index);
+            }
+            return values[index];
+        }
+
+        // giữ lại newSize phần tử đầu
+        void truncate(int newSize) {
+            size = newSize;
+        }
+
+        void dropFirst(int count) {
+            System.arraycopy(values, count, values, 0, size - count);
+            size -= count;
+        }
+
+        void clear() {
+            size = 0;
+        }
+
+        int size() {
+            return size;
+        }
+
+        void removeLast() {
+            size--;
+        }
+    }
+
+    // số entry đọc một lượt khi phải lấy entry cũ từ đĩa, để đọc tuần tự không mở file cho từng entry
+    private static final int READ_AHEAD = 256;
+
     private long baseIndex;
     private long baseTerm;
 
@@ -37,9 +82,18 @@ public class FileLogStorage implements LogStorage {
     private final DiskFaultInjector faults;
     // một lần ghi hỏng mà không dọn được phần ghi dở: file không còn khớp với bộ nhớ, từ chối ghi tiếp
     private boolean broken;
-    private final List<LogEntry> entries = new ArrayList<>();
-    // endOffsets.get(i): vị trí byte kết thúc của entries.get(i) trong segment chứa nó
-    private final List<Long> endOffsets = new ArrayList<>();
+    // Chỉ các entry mới nhất nằm trong bộ nhớ (vòng đệm theo index); entry cũ hơn được đọc lại từ segment khi cần.
+    // Giữ mọi entry làm object cho tới lần snapshot kế tiếp khiến chúng sống qua nhiều lượt GC, và ở tải cao chính việc
+    // GC phải chép đi chép lại chúng làm ứng dụng dừng hàng chục mili giây.
+    private final LogEntry[] cache;
+    // khối entry cũ vừa đọc từ đĩa, liền nhau theo index
+    private List<LogEntry> readAhead = List.of();
+    // endOffsets.get(i): vị trí byte kết thúc của entry baseIndex + 1 + i trong segment chứa nó
+    private final LongList endOffsets = new LongList();
+    // vị trí byte bắt đầu của entry baseIndex + 1 trong segment chứa nó
+    private long firstEntryStartOffset;
+    // index của các config entry còn trong log, tăng dần
+    private final LongList configurationIndexes = new LongList();
     private final List<Segment> segments = new ArrayList<>();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -62,6 +116,7 @@ public class FileLogStorage implements LogStorage {
     public FileLogStorage(NodeOptions nodeOptions, long baseIndex, long baseTerm) throws IOException {
         this.folder = Path.of(nodeOptions.getLogUri());
         this.faults = nodeOptions.getDiskFaults();
+        this.cache = new LogEntry[Math.max(1, nodeOptions.getLogCacheEntries())];
         Files.createDirectories(folder);
         this.baseIndex = baseIndex;
         this.baseTerm = baseTerm;
@@ -124,11 +179,13 @@ public class FileLogStorage implements LogStorage {
                 }
                 // entry <= baseIndex đã nằm trong snapshot, chỉ bỏ qua
                 if (entry.getIndex() > baseIndex) {
-                    if (entry.getIndex() != baseIndex + entries.size() + 1) {
+                    if (entry.getIndex() != lastIndex() + 1) {
                         throw new IOException("Log has a gap before index " + entry.getIndex());
                     }
-                    entries.add(entry);
-                    endOffsets.add((long) lineEnd + 1);
+                    if (endOffsets.size() == 0) {
+                        firstEntryStartOffset = lineStart;
+                    }
+                    remember(entry, lineEnd + 1L);
                 }
                 nextIndex++;
                 lineStart = lineEnd + 1;
@@ -193,10 +250,85 @@ public class FileLogStorage implements LogStorage {
             Files.delete(segments.remove(0).file());
             dirDirty = true;
         }
-        if (segments.size() == 1 && entries.isEmpty()) {
+        if (segments.size() == 1 && endOffsets.size() == 0) {
             closeChannel();
             deleteLastSegment();
         }
+    }
+
+    // ghi nhận một entry vừa nằm vào cuối log
+    private void remember(LogEntry entry, long endOffset) {
+        endOffsets.add(endOffset);
+        cache[(int) (entry.getIndex() % cache.length)] = entry;
+        if (entry.isConfigurationEntry()) {
+            configurationIndexes.add(entry.getIndex());
+        }
+    }
+
+    private LogEntry cached(long index) {
+        LogEntry entry = cache[(int) (index % cache.length)];
+        return entry != null && entry.getIndex() == index ? entry : null;
+    }
+
+    private Segment segmentOf(long index) {
+        for (int i = segments.size() - 1; i >= 0; i--) {
+            if (segments.get(i).firstIndex() <= index) {
+                return segments.get(i);
+            }
+        }
+        throw new IllegalStateException("No log segment holds index " + index);
+    }
+
+    private long startOffset(long index, Segment segment) {
+        if (index == baseIndex + 1) {
+            return firstEntryStartOffset;
+        }
+        return segment.firstIndex() == index ? 0 : endOffsets.get((int) (index - baseIndex - 2));
+    }
+
+    // đọc các entry [first, last] từ segment trên đĩa; cả hai phải nằm trong log
+    private List<LogEntry> readFromDisk(long first, long last) {
+        List<LogEntry> result = new ArrayList<>();
+        long next = first;
+        try {
+            while (next <= last) {
+                Segment segment = segmentOf(next);
+                // phần cần đọc nằm trong segment này tới đâu
+                long lastInSegment = last;
+                int position = segments.indexOf(segment);
+                if (position + 1 < segments.size()) {
+                    lastInSegment = Math.min(last, segments.get(position + 1).firstIndex() - 1);
+                }
+                long start = startOffset(next, segment);
+                long end = endOffsets.get((int) (lastInSegment - baseIndex - 1));
+                byte[] data = new byte[(int) (end - start)];
+                try (FileChannel reader = FileChannel.open(segment.file(), StandardOpenOption.READ)) {
+                    ByteBuffer buffer = ByteBuffer.wrap(data);
+                    while (buffer.hasRemaining()) {
+                        if (reader.read(buffer, start + buffer.position()) < 0) {
+                            throw new IOException("Log segment " + segment.file() + " is shorter than expected");
+                        }
+                    }
+                }
+                int lineStart = 0;
+                while (lineStart < data.length) {
+                    int lineEnd = lineStart;
+                    while (lineEnd < data.length && data[lineEnd] != '\n') {
+                        lineEnd++;
+                    }
+                    LogEntry entry = decode(data, lineStart, lineEnd);
+                    if (entry == null || entry.getIndex() != next) {
+                        throw new IOException("Corrupted log segment " + segment.file() + " at index " + next);
+                    }
+                    result.add(entry);
+                    next++;
+                    lineStart = lineEnd + 1;
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return result;
     }
 
     private void rollSegment(long firstIndex) throws IOException {
@@ -225,21 +357,40 @@ public class FileLogStorage implements LogStorage {
 
     @Override
     public synchronized long lastIndex() {
-        return baseIndex + entries.size();
+        return baseIndex + endOffsets.size();
     }
 
     @Override
     public synchronized long lastTerm() {
-        if (entries.isEmpty()) return baseTerm; // nếu empty thì term = baseTerm
-        return entries.get(entries.size() - 1).getTerm();
+        if (endOffsets.size() == 0) return baseTerm; // nếu empty thì term = baseTerm
+        return get(lastIndex()).getTerm();
     }
 
     @Override
     public synchronized LogEntry get(long index) {
-        if (index <= baseIndex) return null;
-        long pos = index - baseIndex - 1;
-        if (pos < 0 || pos >= entries.size()) return null;
-        return entries.get((int) pos);
+        if (index <= baseIndex || index > lastIndex()) return null;
+        LogEntry entry = cached(index);
+        if (entry != null) {
+            return entry;
+        }
+        if (!readAhead.isEmpty()) {
+            long offset = index - readAhead.get(0).getIndex();
+            if (offset >= 0 && offset < readAhead.size()) {
+                return readAhead.get((int) offset);
+            }
+        }
+        readAhead = readFromDisk(index, Math.min(lastIndex(), index + READ_AHEAD - 1));
+        return readAhead.get(0);
+    }
+
+    @Override
+    public synchronized long lastConfigurationIndex(long upTo) {
+        for (int i = configurationIndexes.size() - 1; i >= 0; i--) {
+            if (configurationIndexes.get(i) <= upTo) {
+                return configurationIndexes.get(i);
+            }
+        }
+        return 0;
     }
 
     @Override
@@ -265,15 +416,17 @@ public class FileLogStorage implements LogStorage {
                 rollSegment(newEntries.get(0).getIndex());
             }
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            List<Long> offsets = new ArrayList<>();
+            long[] offsets = new long[newEntries.size()];
+            int written = 0;
             for (LogEntry entry : newEntries) {
                 out.write(Checksum.encodeLine(objectMapper.writeValueAsBytes(entry)));
-                offsets.add(writeOffset + out.size());
+                offsets[written++] = writeOffset + out.size();
             }
             writeFully(channel, ByteBuffer.wrap(out.toByteArray()));
             writeOffset += out.size();
-            entries.addAll(newEntries);
-            endOffsets.addAll(offsets);
+            for (int i = 0; i < offsets.length; i++) {
+                remember(newEntries.get(i), offsets[i]);
+            }
         } catch (IOException e) {
             discardPartialWrite();
             throw new UncheckedIOException(e);
@@ -370,11 +523,27 @@ public class FileLogStorage implements LogStorage {
     }
 
     @Override
-    public synchronized List<LogEntry> readFrom(long fromIndex) {
-        if (fromIndex <= baseIndex) fromIndex = baseIndex + 1;
-        long pos = fromIndex - baseIndex - 1;
-        if (pos < 0 || pos >= entries.size()) return new ArrayList<>();
-        return new ArrayList<>(entries.subList((int) pos, entries.size()));
+    public synchronized List<LogEntry> readFrom(long fromIndex, int maxEntries) {
+        long first = Math.max(fromIndex, baseIndex + 1);
+        long last = Math.min(lastIndex(), first + maxEntries - 1L);
+        List<LogEntry> result = new ArrayList<>();
+        long next = first;
+        while (next <= last) {
+            LogEntry entry = cached(next);
+            if (entry != null) {
+                result.add(entry);
+                next++;
+                continue;
+            }
+            // đoạn không còn trong bộ nhớ: đọc từ đĩa tới chỗ bộ nhớ bắt đầu có lại
+            long gapEnd = next;
+            while (gapEnd < last && cached(gapEnd + 1) == null) {
+                gapEnd++;
+            }
+            result.addAll(readFromDisk(next, gapEnd));
+            next = gapEnd + 1;
+        }
+        return result;
     }
 
     @Override
@@ -382,6 +551,7 @@ public class FileLogStorage implements LogStorage {
         if (firstIndexRemoved > lastIndex()) return;
         long first = Math.max(firstIndexRemoved, baseIndex + 1);
         int pos = (int) (first - baseIndex - 1);
+        long oldLast = lastIndex();
         generation++;
         try {
             // xoá từ segment cuối trở về để phần còn lại trên đĩa luôn liền mạch
@@ -409,8 +579,19 @@ public class FileLogStorage implements LogStorage {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
-        entries.subList(pos, entries.size()).clear();
-        endOffsets.subList(pos, endOffsets.size()).clear();
+        for (long index = first; index <= oldLast && index < first + cache.length; index++) {
+            if (cached(index) != null) {
+                cache[(int) (index % cache.length)] = null;
+            }
+        }
+        readAhead = List.of();
+        endOffsets.truncate(pos);
+        while (configurationIndexes.size() > 0 && configurationIndexes.get(configurationIndexes.size() - 1) >= first) {
+            configurationIndexes.removeLast();
+        }
+        if (pos == 0) {
+            firstEntryStartOffset = 0;
+        }
         durableIndex = Math.min(durableIndex, first - 1);
     }
 
@@ -421,16 +602,29 @@ public class FileLogStorage implements LogStorage {
 
         long pos = firstIndexKept - baseIndex - 1;
         if (pos <= 0) return;
-        if (pos > entries.size()) pos = entries.size();
+        if (pos > endOffsets.size()) pos = endOffsets.size();
 
-        // cập nhật baseIndex + baseTerm theo phần tử ngay trước pos
-        LogEntry lastIncluded = entries.get((int) pos - 1);
-        baseIndex = lastIncluded.getIndex();
-        baseTerm = lastIncluded.getTerm();
+        // entry cuối cùng nằm trong snapshot trở thành mốc mới của log
+        long newBaseIndex = baseIndex + pos;
+        long newBaseTerm = get(newBaseIndex).getTerm();
+        long newBaseEndOffset = endOffsets.get((int) pos - 1);
+        long newFirstStart = 0;
+        if (pos < endOffsets.size()) {
+            // entry đầu tiên còn lại bắt đầu ngay sau mốc mới nếu cả hai nằm chung một segment
+            newFirstStart = segmentOf(newBaseIndex + 1).firstIndex() == newBaseIndex + 1 ? 0 : newBaseEndOffset;
+        }
+        baseIndex = newBaseIndex;
+        baseTerm = newBaseTerm;
+        firstEntryStartOffset = newFirstStart;
 
         // xóa prefix
-        entries.subList(0, (int) pos).clear();
-        endOffsets.subList(0, (int) pos).clear();
+        endOffsets.dropFirst((int) pos);
+        int covered = 0;
+        while (covered < configurationIndexes.size() && configurationIndexes.get(covered) <= baseIndex) {
+            covered++;
+        }
+        configurationIndexes.dropFirst(covered);
+        readAhead = List.of();
         durableIndex = Math.max(durableIndex, baseIndex);
 
         try {
@@ -456,8 +650,11 @@ public class FileLogStorage implements LogStorage {
         }
         this.baseIndex = baseIndex;
         this.baseTerm = baseTerm;
-        entries.clear();
+        java.util.Arrays.fill(cache, null);
+        readAhead = List.of();
         endOffsets.clear();
+        configurationIndexes.clear();
+        firstEntryStartOffset = 0;
         durableIndex = baseIndex;
     }
 

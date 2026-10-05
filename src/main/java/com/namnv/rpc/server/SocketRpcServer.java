@@ -1,8 +1,11 @@
 package com.namnv.rpc.server;
 
+import com.namnv.rpc.ClientService;
 import com.namnv.rpc.RaftServerService;
 import com.namnv.rpc.RpcCodec;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
+import com.namnv.rpc.model.request.ClientReadRequest;
+import com.namnv.rpc.model.request.ClientWriteRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
 import com.namnv.rpc.model.request.ReadIndexRequest;
@@ -22,6 +25,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -37,6 +41,7 @@ public class SocketRpcServer {
     private final RaftServerService raftServerService;
     // null: nhận kết nối không mã hoá
     private final SSLContext sslContext;
+    private final ClientService clientService;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
     private ServerSocket serverSocket;
@@ -50,9 +55,18 @@ public class SocketRpcServer {
      * @param sslContext TLS với chứng chỉ của node này; client phải xuất trình chứng chỉ mà truststore của context tin
      */
     public SocketRpcServer(int port, RaftServerService raftNode, SSLContext sslContext) {
+        this(port, raftNode, sslContext, null);
+    }
+
+    /**
+     * @param clientService nơi xử lý yêu cầu của client bên ngoài (thường là RaftClientService); null thì server
+     *                      chỉ nhận RPC giữa các node và đóng kết nối khi gặp yêu cầu của client
+     */
+    public SocketRpcServer(int port, RaftServerService raftNode, SSLContext sslContext, ClientService clientService) {
         this.port = port;
         this.raftServerService = raftNode;
         this.sslContext = sslContext;
+        this.clientService = clientService;
     }
 
     public void start() {
@@ -151,8 +165,17 @@ public class SocketRpcServer {
 
         private void handle(RpcCodec.Frame frame) {
             try {
+                // các yêu cầu chỉ có câu trả lời sau một lúc được trả lời bất đồng bộ, không giữ thread
+                CompletableFuture<?> pending = null;
                 if (frame.message() instanceof ReadIndexRequest readIndexRequest) {
-                    raftServerService.handleReadIndexRequest(readIndexRequest).whenComplete((response, error) -> {
+                    pending = raftServerService.handleReadIndexRequest(readIndexRequest);
+                } else if (clientService != null && frame.message() instanceof ClientWriteRequest write) {
+                    pending = clientService.handleClientWrite(write);
+                } else if (clientService != null && frame.message() instanceof ClientReadRequest read) {
+                    pending = clientService.handleClientRead(read);
+                }
+                if (pending != null) {
+                    pending.whenComplete((response, error) -> {
                         if (error == null) {
                             respond(frame.requestId(), response);
                         } else {

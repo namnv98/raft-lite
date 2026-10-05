@@ -126,7 +126,8 @@ public class RaftBenchmark {
                         .raftMetaUri(folder).logUri(folder).snapshotUri(folder)
                         .electionTimeoutMinMs(1000).electionTimeoutMaxMs(2000).heartbeatIntervalMs(100)
                         .clientTimeoutMs(10_000)
-                        .snapshotIntervalEntries(200_000)
+                        .snapshotIntervalEntries(Long.getLong("bench.snapshotInterval", 200_000))
+                        .commitIndexFlushIntervalMs(Integer.getInteger("bench.commitFlushMs", 1000))
                         .stateMachine(machine)
                         .raftConfig(RaftConfig.builder().self(id).peers(ids).build())
                         .build(), rpc);
@@ -189,19 +190,29 @@ public class RaftBenchmark {
      * Vòng kín: mỗi client gửi một thao tác, chờ xong rồi gửi thao tác kế tiếp.
      */
     static Result run(int clients, Supplier<java.util.concurrent.CompletableFuture<?>> operation) throws Exception {
+        return runLoops(clients, () -> operation);
+    }
+
+    // như run(), nhưng mỗi vòng kín được cấp một thao tác riêng (ví dụ gắn với một client riêng)
+    static Result runLoops(int clients, Supplier<Supplier<java.util.concurrent.CompletableFuture<?>>> operationPerLoop)
+            throws Exception {
         long warmupEnd = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
         long end = warmupEnd + TimeUnit.SECONDS.toNanos(MEASURE_SECONDS);
         long[] samples = new long[8_000_000];
+        long[] finishedAt = new long[samples.length];
         var count = new AtomicInteger();
         var failures = new AtomicLong();
         var finished = new CountDownLatch(clients);
         for (int c = 0; c < clients; c++) {
-            fire(operation, warmupEnd, end, samples, count, failures, finished);
+            fire(operationPerLoop.get(), warmupEnd, end, samples, finishedAt, count, failures, finished);
         }
         if (!finished.await(MEASURE_SECONDS + 60, TimeUnit.SECONDS)) {
             throw new IllegalStateException("benchmark clients did not finish");
         }
         int n = Math.min(count.get(), samples.length);
+        if (Boolean.getBoolean("bench.timeline")) {
+            printTimeline(samples, finishedAt, n, warmupEnd);
+        }
         long[] sorted = Arrays.copyOf(samples, n);
         Arrays.sort(sorted);
         return new Result(n, failures.get(), MEASURE_SECONDS,
@@ -209,8 +220,25 @@ public class RaftBenchmark {
                 n == 0 ? 0 : sorted[n - 1] / 1000);
     }
 
+    // -Dbench.timeline=true: số thao tác và độ trễ lớn nhất trong từng khoảng 100 ms
+    private static void printTimeline(long[] samples, long[] finishedAt, int n, long warmupEnd) {
+        int buckets = MEASURE_SECONDS * 10;
+        long[] worst = new long[buckets];
+        int[] done = new int[buckets];
+        for (int i = 0; i < n; i++) {
+            int bucket = (int) Math.min(buckets - 1, Math.max(0, (finishedAt[i] - warmupEnd) / 100_000_000L));
+            worst[bucket] = Math.max(worst[bucket], samples[i]);
+            done[bucket]++;
+        }
+        var line = new StringBuilder("  timeline (max ms / nghìn ops mỗi 100 ms):");
+        for (int b = 0; b < buckets; b++) {
+            line.append(String.format(" %d/%d", worst[b] / 1_000_000, done[b] / 1000));
+        }
+        System.out.println(line);
+    }
+
     private static void fire(Supplier<java.util.concurrent.CompletableFuture<?>> operation, long warmupEnd, long end,
-                             long[] samples, AtomicInteger count, AtomicLong failures, CountDownLatch finished) {
+                             long[] samples, long[] finishedAt, AtomicInteger count, AtomicLong failures, CountDownLatch finished) {
         long start = System.nanoTime();
         if (start >= end) {
             finished.countDown();
@@ -222,7 +250,7 @@ public class RaftBenchmark {
             if (!ok) {
                 failures.incrementAndGet();
                 // không gửi lại ngay để không quay vòng tại chỗ khi cluster đang lỗi
-                SCHEDULER.schedule(() -> fire(operation, warmupEnd, end, samples, count, failures, finished),
+                SCHEDULER.schedule(() -> fire(operation, warmupEnd, end, samples, finishedAt, count, failures, finished),
                         10, TimeUnit.MILLISECONDS);
                 return;
             }
@@ -230,10 +258,11 @@ public class RaftBenchmark {
                 int slot = count.getAndIncrement();
                 if (slot < samples.length) {
                     samples[slot] = now - start;
+                    finishedAt[slot] = now;
                 }
             }
             // sang thread khác để lời gọi kế tiếp không lồng trong callback của lời gọi này
-            SCHEDULER.execute(() -> fire(operation, warmupEnd, end, samples, count, failures, finished));
+            SCHEDULER.execute(() -> fire(operation, warmupEnd, end, samples, finishedAt, count, failures, finished));
         });
     }
 
@@ -351,7 +380,7 @@ public class RaftBenchmark {
                     try (var cluster = new Cluster(tcp, dir.resolve("write-" + (tcp ? "tcp" : "mem") + "-" + payload))) {
                         var leader = cluster.awaitLeader();
                         byte[] command = new byte[payload];
-                        for (int clients : new int[]{1, 32, 512}) {
+                        for (int clients : quick && Boolean.getBoolean("bench.timeline") ? new int[]{512} : new int[]{1, 32, 512}) {
                             var result = run(clients, () -> leader.appendClientCommand(command));
                             row((tcp ? "TCP" : "in-memory") + ", " + (dir == disk ? "đĩa" : "tmpfs") + ", " + payload + "B, "
                                     + clients + " client", result);

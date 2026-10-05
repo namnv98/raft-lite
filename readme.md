@@ -154,6 +154,27 @@ Thay đổi hoàn tất khi `node.getConf()` không còn ở trạng thái joint
 Node mới phải bắt kịp log trong `catchUpTimeoutMs`; nếu không, yêu cầu bị huỷ và cấu hình giữ nguyên.
 Leader gỡ chính mình sẽ trao quyền cho một follower rồi tự tắt. Node bị gỡ tự tắt khi biết chắc mình đã rời cluster.
 
+### Client qua mạng
+
+Các lời gọi ở trên chạy trong cùng tiến trình với node. Để ứng dụng ở tiến trình hoặc máy khác dùng được cluster,
+mở cổng cho client trên mỗi node rồi dùng `RaftClient`:
+
+```java
+// phía node: cùng cổng với RPC giữa các node; hàm thứ hai trả lời câu hỏi đọc từ state machine của node này
+var clientService = new RaftClientService(node, query -> answerFromStateMachine(query));
+new SocketRpcServer(8080, node, null, clientService).start();
+
+// phía ứng dụng
+RaftClient client = new RaftClient(List.of("localhost:8080", "localhost:8081", "localhost:8082"),
+        "client-7", 1000, 30_000);          // timeout mỗi lần gửi, tổng thời gian chờ tối đa
+client.write("set x=1".getBytes()).get();    // tự tìm leader, tự gửi lại, mỗi lệnh được apply nhiều nhất một lần
+byte[] answer = client.read(query).get();    // đọc nhất quán
+byte[] local = client.readFrom("localhost:8081", query).get();   // đọc nhất quán từ đúng một node, ví dụ một follower
+```
+
+`RaftClient` tự gán sequence cho từng lệnh, chuyển sang node khác khi leader đổi hoặc không trả lời, và gửi lại với cùng
+`(clientId, sequence)`. Một `clientId` chỉ nên được dùng bởi một `RaftClient` tại một thời điểm.
+
 ### Theo dõi
 
 ```java
@@ -188,6 +209,7 @@ node.shutdown();
 | `snapshotIntervalEntries` | `0` (tắt) | Tự tạo snapshot khi số entry đã apply mà chưa compact đạt mức này |
 | `snapshotChunkBytes` | `1048576` | Kích thước tối đa của một mẩu snapshot gửi cho follower |
 | `commitIndexFlushIntervalMs` | `1000` | Commit index được ghi xuống đĩa nhiều nhất mỗi khoảng này một lần; nó chỉ giúp khởi động lại nhanh hơn. `0` là ghi sau mỗi lần commit |
+| `logCacheEntries` | `16384` | Số entry mới nhất của log được giữ trong bộ nhớ; entry cũ hơn được đọc lại từ đĩa khi cần (follower tụt xa, khởi động lại) |
 | `catchUpTimeoutMs` | `30000` | Node mới phải bắt kịp log trong thời gian này thì mới được đưa vào cấu hình |
 | `shutdownOnRemoved` | `true` | Node tự `shutdown()` khi bị gỡ khỏi cluster; `false` thì node chỉ đứng yên |
 | `departingTimeoutMs` | `10000` | Leader cố gửi cấu hình cuối cho node vừa bị gỡ trong bao lâu trước khi bỏ cuộc |
@@ -424,7 +446,7 @@ và một entry bị đổi có thể khiến các node áp dụng những lện
   khởi động lại với danh sách peers rỗng (nên dùng id mới), rồi thêm lại (`onJoinPeerCluster`).
   Đừng chỉ xoá dữ liệu rồi bật lại với id cũ khi nó còn là thành viên: node đó có thể đã bầu hoặc đã ack những thứ nó không còn nhớ.
 - **Mất đa số** thì cluster ngừng nhận lệnh ghi và lệnh đọc nhất quán cho tới khi đủ đa số trở lại. Không có cơ chế ép đổi cấu hình.
-- **Bộ nhớ:** mọi entry chưa compact được giữ trong RAM. Đặt `snapshotIntervalEntries` để giới hạn con số đó.
+- **Bộ nhớ:** chỉ `logCacheEntries` entry mới nhất của log nằm trong RAM; phần còn lại nằm trên đĩa cho tới khi snapshot compact nó. Đặt `snapshotIntervalEntries` để log trên đĩa không lớn mãi.
 - **Định dạng đĩa và định dạng RPC** đã đổi nhiều lần trong quá trình phát triển và không có cơ chế nâng cấp:
   dữ liệu của bản cũ không đọc lại được, và các node phải chạy cùng một bản.
 - **Log** dùng Log4j2; cấu hình ở `src/main/resources/log4j2.xml`.
@@ -508,11 +530,27 @@ mvn test -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 không chờ apply, bỏ chống trùng, bỏ kiểm tra checksum, TLS không đòi chứng chỉ của client). Mỗi lỗi như vậy đều làm ít nhất một test fail.
 Những lỗi mà mô phỏng ngẫu nhiên khó chạm tới đều có test tất định riêng.
 
+## Đo hiệu năng
+
+Hai chương trình trong `src/test/java/com/namnv/bench` (không phải test, chạy bằng tay sau `mvn -q test-compile`):
+
+```bash
+CP="target/test-classes:target/classes:$(mvn -q dependency:build-classpath -Dmdep.includeScope=test -Dmdep.outputFile=/dev/stdout)"
+
+# 3 node là 3 tiến trình riêng, client ở tiến trình thứ tư, mọi thứ đi qua TCP
+java -cp "$CP" com.namnv.bench.ClusterBenchmark
+
+# 3 node trong một tiến trình: so sánh transport, đĩa thật với tmpfs, và bộ mã hoá
+java -cp "$CP" com.namnv.bench.RaftBenchmark
+```
+
+Kết quả phụ thuộc gần như hoàn toàn vào tốc độ fsync của ổ đĩa. Độ trễ đuôi cũng vậy: một số SSD có những đợt vài giây mà fsync chậm đi nhiều lần, và trong các đợt đó mọi lệnh ghi chậm theo. Trên một máy có ổ NVMe (fsync khoảng 1 ms),
+`ClusterBenchmark` cho khoảng 700 lệnh ghi/giây với một client và khoảng 60.000 lệnh ghi/giây với 512 client đồng thời.
+
 ## Giới hạn đã biết
 
 - **Chưa được kiểm chứng ở mức production.** Chưa có kiểm thử kiểu Jepsen trên nhiều máy thật, chưa chạy liên tục nhiều giờ dưới tải.
 - **Quy mô đã thử còn nhỏ:** 10.000 lệnh, cluster tối đa 7 node, nửa giờ thời gian ảo.
-- **Entry chưa compact nằm trong bộ nhớ.** Snapshot tự động giới hạn được con số này, nhưng log không được đọc lại từ đĩa theo yêu cầu.
 - **State machine chạy `onApply` trong lock của node**, nên một lệnh apply chậm chặn cả node.
 - **Không có lease read:** mỗi lần đọc nhất quán cần một vòng heartbeat của leader. Đây là lựa chọn có chủ ý, vì lease read phụ thuộc đồng hồ.
 - **Bảng chống trùng không tự hết hạn** (phải gọi `closeClientSession`), và sequence của một client phải bắt đầu từ 1, tăng liền nhau.

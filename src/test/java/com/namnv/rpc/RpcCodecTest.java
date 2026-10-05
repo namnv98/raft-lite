@@ -4,12 +4,16 @@ import com.namnv.entity.ClientSession;
 import com.namnv.entity.ConfigurationEntry;
 import com.namnv.entity.LogEntry;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
+import com.namnv.rpc.model.request.ClientReadRequest;
+import com.namnv.rpc.model.request.ClientWriteRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
 import com.namnv.rpc.model.request.ReadIndexRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
 import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
+import com.namnv.rpc.model.response.ClientReadResponse;
+import com.namnv.rpc.model.response.ClientWriteResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
 import com.namnv.rpc.model.response.ReadIndexResponse;
@@ -67,7 +71,13 @@ class RpcCodecTest {
                 new TimeoutNowResponse(8, true),
                 new ReadIndexRequest("B"),
                 new ReadIndexResponse(true, 99, null),
-                new ReadIndexResponse(false, 0, "C"));
+                new ReadIndexResponse(false, 0, "C"),
+                new ClientWriteRequest("client-1", 42, "set x=1".getBytes(StandardCharsets.UTF_8)),
+                new ClientWriteRequest(null, 0, new byte[0]),
+                new ClientWriteResponse(false, "localhost:8081"),
+                new ClientReadRequest(new byte[]{9, 8, 7}),
+                new ClientReadResponse(true, null, "kết quả".getBytes(StandardCharsets.UTF_8)),
+                new ClientReadResponse(false, "localhost:8081", null));
     }
 
     private static byte[] frame(long requestId, Object message) throws IOException {
@@ -142,7 +152,7 @@ class RpcCodecTest {
         for (int i = 0; i < 20_000; i++) {
             var body = new byte[random.nextInt(200)];
             random.nextBytes(body);
-            int type = random.nextInt(14);
+            int type = random.nextInt(18);
             try {
                 RpcCodec.decode(type, body);
             } catch (IOException expected) {

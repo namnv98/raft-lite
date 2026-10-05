@@ -4,12 +4,16 @@ import com.namnv.entity.ClientSession;
 import com.namnv.entity.ConfigurationEntry;
 import com.namnv.entity.LogEntry;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
+import com.namnv.rpc.model.request.ClientReadRequest;
+import com.namnv.rpc.model.request.ClientWriteRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
 import com.namnv.rpc.model.request.ReadIndexRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
 import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
+import com.namnv.rpc.model.response.ClientReadResponse;
+import com.namnv.rpc.model.response.ClientWriteResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
 import com.namnv.rpc.model.response.ReadIndexResponse;
@@ -33,7 +37,7 @@ import java.util.TreeSet;
  * {@code [4 byte độ dài][8 byte id của request][1 byte loại message][nội dung nhị phân]}.
  * Response mang cùng id với request của nó, nên nhiều lời gọi chạy xen kẽ được trên một kết nối.
  * <p>
- * Nội dung được mã hoá bằng tay theo từng trường. Bên nhận chỉ dựng được đúng 12 loại message dưới đây,
+ * Nội dung được mã hoá bằng tay theo từng trường. Bên nhận chỉ dựng được đúng 16 loại message dưới đây,
  * mọi độ dài đọc vào đều được đối chiếu với số byte còn lại, nên dữ liệu rác không thể khiến nó khởi tạo class tuỳ ý
  * hay cấp phát bộ nhớ theo một con số bịa.
  */
@@ -55,6 +59,10 @@ public final class RpcCodec {
     private static final int TIMEOUT_NOW_RESPONSE = 9;
     private static final int READ_INDEX_REQUEST = 10;
     private static final int READ_INDEX_RESPONSE = 11;
+    private static final int CLIENT_WRITE_REQUEST = 12;
+    private static final int CLIENT_WRITE_RESPONSE = 13;
+    private static final int CLIENT_READ_REQUEST = 14;
+    private static final int CLIENT_READ_RESPONSE = 15;
 
     public record Frame(long requestId, Object message) {
     }
@@ -173,6 +181,27 @@ public final class RpcCodec {
             writeString(out, m.leaderId);
             return READ_INDEX_RESPONSE;
         }
+        if (message instanceof ClientWriteRequest m) {
+            writeString(out, m.clientId);
+            out.writeLong(m.sequence);
+            writeBytes(out, m.command);
+            return CLIENT_WRITE_REQUEST;
+        }
+        if (message instanceof ClientWriteResponse m) {
+            out.writeBoolean(m.success);
+            writeString(out, m.leaderId);
+            return CLIENT_WRITE_RESPONSE;
+        }
+        if (message instanceof ClientReadRequest m) {
+            writeBytes(out, m.query);
+            return CLIENT_READ_REQUEST;
+        }
+        if (message instanceof ClientReadResponse m) {
+            out.writeBoolean(m.success);
+            writeString(out, m.leaderId);
+            writeBytes(out, m.result);
+            return CLIENT_READ_RESPONSE;
+        }
         throw new IOException("Not an RPC message: " + message.getClass().getName());
     }
 
@@ -253,6 +282,10 @@ public final class RpcCodec {
                 case TIMEOUT_NOW_RESPONSE -> new TimeoutNowResponse(in.readLong(), in.readBoolean());
                 case READ_INDEX_REQUEST -> new ReadIndexRequest(in.readString());
                 case READ_INDEX_RESPONSE -> new ReadIndexResponse(in.readBoolean(), in.readLong(), in.readString());
+                case CLIENT_WRITE_REQUEST -> new ClientWriteRequest(in.readString(), in.readLong(), in.readBytes());
+                case CLIENT_WRITE_RESPONSE -> new ClientWriteResponse(in.readBoolean(), in.readString());
+                case CLIENT_READ_REQUEST -> new ClientReadRequest(in.readBytes());
+                case CLIENT_READ_RESPONSE -> new ClientReadResponse(in.readBoolean(), in.readString(), in.readBytes());
                 default -> throw new IOException("Unknown RPC message type " + type);
             };
             if (in.remaining() != 0) {

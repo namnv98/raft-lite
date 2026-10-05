@@ -40,6 +40,11 @@ public class NodeOptions {
     @Builder.Default
     private int maxPendingCommands = 100_000;
 
+    // số entry mới nhất của log được giữ trong bộ nhớ; entry cũ hơn (cho follower tụt xa, hay khi khởi động lại)
+    // được đọc lại từ đĩa
+    @Builder.Default
+    private int logCacheEntries = 16_384;
+
     // commit index được ghi xuống đĩa nhiều nhất mỗi khoảng này một lần. Nó chỉ giúp lần khởi động sau apply lại
     // nhanh hơn chứ không cần cho tính đúng đắn, nên không đáng tốn một lần fsync cho mỗi lệnh; 0 là ghi sau mỗi lần commit
     @Builder.Default
