@@ -14,5 +14,8 @@ public class InstallSnapshotResponse implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
     private long term;
+    // mẩu được nhận (hoặc follower không cần snapshot này nữa)
     private boolean success;
+    // follower đã có toàn bộ state tới lastIncludedIndex: leader chuyển sang gửi log
+    private boolean complete;
 }

@@ -1,20 +1,26 @@
 package com.namnv.rpc.client;
 
-import com.namnv.rpc.RpcSerialization;
+import com.namnv.rpc.RpcCodec;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
+import com.namnv.rpc.model.request.ReadIndexRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
 import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
+import com.namnv.rpc.model.response.ReadIndexResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
 import com.namnv.rpc.model.response.TimeoutNowResponse;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.Map;
@@ -26,12 +32,22 @@ import java.util.concurrent.locks.ReentrantLock;
 
 public class SocketRpcClient implements RpcProcessor, AutoCloseable {
     private final int timeoutMs;
+    // null: kết nối không mã hoá
+    private final SSLContext sslContext;
     private final ExecutorService rpcExecutor;
     // mỗi peer một kết nối dùng lại, thay vì mở TCP mới cho từng RPC
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
 
     public SocketRpcClient(int timeoutMs) {
+        this(timeoutMs, null);
+    }
+
+    /**
+     * @param sslContext TLS với chứng chỉ của node này; server chỉ nhận client có chứng chỉ mà nó tin
+     */
+    public SocketRpcClient(int timeoutMs, SSLContext sslContext) {
         this.timeoutMs = timeoutMs;
+        this.sslContext = sslContext;
         rpcExecutor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().factory());
     }
 
@@ -60,6 +76,11 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
         return sendRPC(address, request, TimeoutNowResponse.class);
     }
 
+    @Override
+    public CompletableFuture<ReadIndexResponse> readIndex(String address, ReadIndexRequest request) {
+        return sendRPC(address, request, ReadIndexResponse.class);
+    }
+
     private <T> CompletableFuture<T> sendRPC(String address, Object request, Class<T> responseType) {
         return CompletableFuture.supplyAsync(() -> {
             try {
@@ -82,14 +103,14 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
         private final String address;
         private final ReentrantLock lock = new ReentrantLock();
         private Socket socket;
-        private ObjectOutputStream out;
-        private ObjectInputStream in;
+        private DataOutputStream out;
+        private DataInputStream in;
 
         Connection(String address) {
             this.address = address;
         }
 
-        Object call(Object request) throws IOException, ClassNotFoundException {
+        Object call(Object request) throws IOException {
             lock.lock();
             try {
                 boolean reused = socket != null;
@@ -113,27 +134,26 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
             }
         }
 
-        private Object exchange(Object request) throws IOException, ClassNotFoundException {
+        private Object exchange(Object request) throws IOException {
             if (socket == null) {
                 connect();
             }
-            out.writeObject(request);
-            out.flush();
-            out.reset(); // không giữ tham chiếu tới các object đã gửi
-            return in.readObject();
+            RpcCodec.write(out, request);
+            return RpcCodec.read(in);
         }
 
         private void connect() throws IOException {
             String[] parts = address.split(":");
-            Socket s = new Socket();
+            Socket s = sslContext != null ? sslContext.getSocketFactory().createSocket() : new Socket();
             try {
                 s.connect(new InetSocketAddress(parts[0], Integer.parseInt(parts[1])), timeoutMs);
                 s.setSoTimeout(timeoutMs);
                 s.setTcpNoDelay(true);
-                out = new ObjectOutputStream(s.getOutputStream());
-                out.flush();
-                in = new ObjectInputStream(s.getInputStream());
-                in.setObjectInputFilter(RpcSerialization.FILTER);
+                if (s instanceof SSLSocket tls) {
+                    tls.startHandshake();
+                }
+                out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
+                in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
                 socket = s;
             } catch (IOException e) {
                 s.close();

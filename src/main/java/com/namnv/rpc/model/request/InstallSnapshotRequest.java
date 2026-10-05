@@ -1,14 +1,21 @@
 package com.namnv.rpc.model.request;
 
+import com.namnv.entity.ClientSession;
 import com.namnv.entity.ConfigurationEntry;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.io.Serial;
 import java.io.Serializable;
+import java.util.List;
 import java.util.Map;
 
+/**
+ * Một mẩu của snapshot. Leader gửi lần lượt từng mẩu của từng file; follower ghép lại rồi cài khi nhận mẩu cuối (done).
+ */
 @Data
+@NoArgsConstructor
 @AllArgsConstructor
 public class InstallSnapshotRequest implements Serializable {
     @Serial
@@ -18,6 +25,10 @@ public class InstallSnapshotRequest implements Serializable {
     private long lastIncludedIndex;   // snapshot lastIncludedIndex
     private long lastIncludedTerm;    // snapshot lastIncludedTerm
     private ConfigurationEntry conf;  // cluster config tại lastIncludedIndex
-    private Map<String, byte[]> files; // tên file snapshot -> nội dung
-    private Map<String, Long> sessions; // clientId -> sequence lớn nhất đã apply tại lastIncludedIndex
+    private Map<String, ClientSession> sessions; // clientId -> các sequence đã apply tại lastIncludedIndex
+    private List<String> files;       // tên mọi file của snapshot, theo thứ tự gửi
+    private String fileName;          // file mà mẩu này thuộc về, null nếu snapshot không có file nào
+    private long offset;              // vị trí của mẩu trong file
+    private byte[] data;
+    private boolean done;             // mẩu cuối cùng của file cuối cùng
 }

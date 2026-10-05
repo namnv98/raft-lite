@@ -11,11 +11,13 @@ import com.namnv.rpc.client.InMemoryRpcClient;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
+import com.namnv.rpc.model.request.ReadIndexRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
 import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
+import com.namnv.rpc.model.response.ReadIndexResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
 import com.namnv.rpc.model.response.TimeoutNowResponse;
 import org.junit.jupiter.api.AfterEach;
@@ -130,6 +132,11 @@ class RaftChaosTest {
         @Override
         public CompletableFuture<TimeoutNowResponse> timeoutNow(String target, TimeoutNowRequest req) {
             return faulty(() -> super.timeoutNow(target, req));
+        }
+
+        @Override
+        public CompletableFuture<ReadIndexResponse> readIndex(String target, ReadIndexRequest req) {
+            return faulty(() -> super.readIndex(target, req));
         }
 
         void close() {
@@ -384,7 +391,7 @@ class RaftChaosTest {
             var ok = false;
             while (!ok && running) {
                 try {
-                    ok = leaderOrAny().appendClientCommand("client-" + clientId, n, command.getBytes(StandardCharsets.UTF_8))
+                    ok = leaderOrAny().appendClientCommand("client-" + clientId, n + 1, command.getBytes(StandardCharsets.UTF_8))
                             .get(2, TimeUnit.SECONDS);
                 } catch (Exception e) {
                     // timeout: không biết lệnh có được commit hay không
@@ -397,10 +404,10 @@ class RaftChaosTest {
         }
     }
 
-    // đọc nhất quán liên tục từ bất kỳ node nào tự nhận là leader
+    // đọc nhất quán liên tục từ một node bất kỳ, leader hay follower
     private void reader() {
         while (running) {
-            var target = leaderOrAny();
+            var target = nodes.get(pick(IDS));
             var machine = machines.get(target.getNodeId());
             var invokedAt = System.nanoTime();
             try {

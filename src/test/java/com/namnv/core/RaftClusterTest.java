@@ -14,11 +14,13 @@ import com.namnv.rpc.client.InMemoryRpcClient;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
+import com.namnv.rpc.model.request.ReadIndexRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
 import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
+import com.namnv.rpc.model.response.ReadIndexResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
 import com.namnv.rpc.model.response.TimeoutNowResponse;
 import com.namnv.statemachine.snapshot.SnapshotReader;
@@ -171,18 +173,28 @@ class RaftClusterTest {
 
         @Override
         public InstallSnapshotResponse handleInstallSnapshotRequest(InstallSnapshotRequest req) {
-            return new InstallSnapshotResponse(req.getTerm(), false);
+            return new InstallSnapshotResponse(req.getTerm(), false, false);
         }
 
         @Override
         public TimeoutNowResponse handleTimeoutNowRequest(TimeoutNowRequest req) {
             return new TimeoutNowResponse(req.term, false);
         }
+
+        @Override
+        public CompletableFuture<ReadIndexResponse> handleReadIndexRequest(ReadIndexRequest req) {
+            return CompletableFuture.completedFuture(new ReadIndexResponse(false, 0, null));
+        }
     }
 
     private TestRpc rpc;
     private final Map<String, PausableRuntime> runtimes = new HashMap<>();
     private DiskFaultInjector diskFaults = DiskFaultInjector.NONE;
+    private int maxPendingCommands = 100_000;
+    private int maxEntriesPerRequest = 1024;
+    private long snapshotIntervalEntries = 0;
+    private int catchUpTimeoutMs = 30_000;
+    private int snapshotChunkBytes = 1 << 20;
     private Supplier<ListStateMachine> machineFactory = ListStateMachine::new;
     private boolean shutdownOnRemoved = true;
     private int departingTimeoutMs = 10_000;
@@ -219,6 +231,11 @@ class RaftClusterTest {
                 .stateMachine(machine)
                 .runtime(runtime)
                 .diskFaults(diskFaults)
+                .maxPendingCommands(maxPendingCommands)
+                .maxEntriesPerRequest(maxEntriesPerRequest)
+                .snapshotIntervalEntries(snapshotIntervalEntries)
+                .catchUpTimeoutMs(catchUpTimeoutMs)
+                .snapshotChunkBytes(snapshotChunkBytes)
                 .raftConfig(RaftConfig.builder().self(id).peers(peers).build())
                 .build();
         var node = new RaftNode(options, rpc);
@@ -1011,10 +1028,13 @@ class RaftClusterTest {
         return node.appendClientCommand(clientId, sequence, command.getBytes(StandardCharsets.UTF_8));
     }
 
+    // clientId -> mốc "mọi sequence tới đây đã apply"
     private Map<String, Long> sessions(RaftNode node) {
         node.getLock().lock();
         try {
-            return Map.copyOf(node.getSessions());
+            var watermarks = new HashMap<String, Long>();
+            node.getSessions().forEach((client, session) -> watermarks.put(client, session.getWatermark()));
+            return watermarks;
         } finally {
             node.getLock().unlock();
         }
@@ -1117,16 +1137,41 @@ class RaftClusterTest {
     }
 
     @Test
-    void followerRejectsReads() {
+    void followerServesConsistentReads() throws Exception {
         startCluster("A", "B", "C");
         var leader = awaitLeader();
-        var follower = nodes.get(others(leader.getNodeId()).get(0));
+        var followers = others(leader.getNodeId());
+
+        for (int i = 0; i < 30; i++) {
+            write(leader, "w" + i);
+            // follower chưa chắc đã apply lệnh vừa commit, nhưng lần đọc nhất quán trên nó vẫn phải thấy
+            for (String id : followers) {
+                assertEquals(i + 1, nodes.get(id).read(machines.get(id)::getStore).get(5, TimeUnit.SECONDS).size());
+            }
+        }
+    }
+
+    @Test
+    void readFailsWithoutAReachableLeader() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        write(leader, "1");
+        var id = others(leader.getNodeId()).get(0);
+        var follower = nodes.get(id);
         await("follower to learn the leader", () -> leader.getNodeId().equals(follower.getLeaderId()));
 
+        // follower bị cô lập không hỏi được leader: thà báo lỗi còn hơn trả dữ liệu có thể đã cũ
+        isolate(id);
         var failure = assertThrows(ExecutionException.class,
-                () -> follower.read(machines.get(follower.getNodeId())::getStore).get(5, TimeUnit.SECONDS));
-        var notLeader = (NotLeaderException) failure.getCause();
-        assertEquals(leader.getNodeId(), notLeader.getLeaderId());
+                () -> follower.read(machines.get(id)::getStore).get(5, TimeUnit.SECONDS));
+        assertTrue(failure.getCause() instanceof NotLeaderException);
+
+        // node chưa từng biết leader nào
+        connect("D");
+        var loner = startNode("D", List.of());
+        failure = assertThrows(ExecutionException.class,
+                () -> loner.read(machines.get("D")::getStore).get(5, TimeUnit.SECONDS));
+        assertTrue(failure.getCause() instanceof NotLeaderException);
     }
 
     @Test
@@ -1172,5 +1217,211 @@ class RaftClusterTest {
         TimeUnit.MILLISECONDS.sleep(500);
         assertFalse(staleRead.isDone() && !staleRead.isCompletedExceptionally(),
                 "an isolated leader answered a read with stale data");
+    }
+
+    @Test
+    void concurrentCommandsOfOneClientAreEachAppliedOnce() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+
+        // 200 lệnh của cùng một client được gửi dồn dập không chờ nhau, mỗi lệnh gửi hai lần
+        var pending = new ArrayList<CompletableFuture<Boolean>>();
+        var expected = new ArrayList<String>();
+        for (int sequence = 1; sequence <= 200; sequence++) {
+            expected.add("cmd" + sequence);
+            pending.add(send(leader, "client-1", sequence, "cmd" + sequence));
+            pending.add(send(leader, "client-1", sequence, "cmd" + sequence));
+        }
+        for (var future : pending) {
+            assertTrue(future.get(10, TimeUnit.SECONDS));
+        }
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, expected);
+        }
+        // không còn sequence lẻ nào phải nhớ: bảng chỉ giữ một mốc cho mỗi client
+        assertEquals(Map.of("client-1", 200L), sessions(leader));
+        assertTrue(leader.getSessions().get("client-1").getAbove().isEmpty());
+    }
+
+    @Test
+    void closedSessionIsForgottenOnEveryNode() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        assertTrue(send(leader, "client-1", 1, "x").get(5, TimeUnit.SECONDS));
+        assertTrue(send(leader, "client-2", 1, "y").get(5, TimeUnit.SECONDS));
+
+        assertTrue(leader.closeClientSession("client-1").get(5, TimeUnit.SECONDS));
+        write(leader, "end");
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, List.of("x", "y", "end"));
+            await("session table of " + id, () -> sessions(nodes.get(id)).equals(Map.of("client-2", 1L)));
+        }
+    }
+
+    @Test
+    void leaderRejectsCommandsWhenTooManyArePending() throws Exception {
+        maxPendingCommands = 5;
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        // không follower nào trả lời nên không lệnh nào commit được
+        for (String id : others(leader.getNodeId())) {
+            isolate(id);
+        }
+
+        var pending = new ArrayList<CompletableFuture<Boolean>>();
+        for (int i = 0; i < 5; i++) {
+            pending.add(leader.appendClientCommand(("p" + i).getBytes(StandardCharsets.UTF_8)));
+        }
+        assertFalse(leader.appendClientCommand("over".getBytes(StandardCharsets.UTF_8)).get(1, TimeUnit.SECONDS));
+        assertEquals(1, leader.metrics().commandsRejected());
+        assertEquals(5, leader.metrics().pendingCommands());
+        assertFalse(pending.get(0).isDone());
+    }
+
+    @Test
+    void snapshotIsTakenAutomaticallyAndBatchesAreBounded() throws Exception {
+        snapshotIntervalEntries = 50;
+        maxEntriesPerRequest = 7;
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var lagging = others(leader.getNodeId()).get(0);
+        stopNode(lagging);
+
+        var expected = new ArrayList<String>();
+        for (int i = 0; i < 230; i++) {
+            expected.add("k" + i);
+            write(leader, "k" + i);
+        }
+        // log được compact mà không ai gọi createSnapshot()
+        await("automatic snapshots", () -> leader.metrics().snapshotsCreated() >= 4);
+        assertTrue(leader.metrics().firstLogIndex() > 150);
+
+        // node tụt lại bắt kịp qua snapshot rồi các request nhỏ
+        startNode(lagging, List.of("A", "B", "C"));
+        awaitStore(lagging, expected);
+        var metrics = leader.metrics();
+        assertEquals(NodeState.LEADER, metrics.state());
+        assertEquals(metrics.commitIndex(), metrics.lastApplied());
+        assertEquals(230, metrics.commandsAccepted());
+    }
+
+    @Test
+    void nodeThatNeverCatchesUpIsNotAddedAndDoesNotBlockTheCluster() throws Exception {
+        catchUpTimeoutMs = 1000;
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        write(leader, "1");
+
+        // D chưa hề chạy: nó chỉ là learner, cấu hình và quorum không đổi
+        assertTrue(leader.onJoinPeerCluster("D"));
+        assertFalse(leader.onJoinPeerCluster("E"));
+        write(leader, "2");
+        assertFalse(leader.getConf().isJoint());
+        assertEquals(List.of("A", "B", "C"), leader.getConf().getOldNodes());
+
+        // hết hạn thì yêu cầu bị huỷ và leader nhận thay đổi khác
+        connect("E");
+        startNode("E", List.of());
+        await("the pending change to be abandoned", () -> leader.onJoinPeerCluster("E"));
+        awaitFinalConf(List.of("A", "B", "C", "E"), List.of("A", "B", "C", "E"));
+        awaitStore("E", List.of("1", "2"));
+    }
+
+    @Test
+    void severalNodesCanBeReplacedInOneChange() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        write(leader, "1", "2");
+        var kept = leader.getNodeId();
+        var removed = others(kept);
+        for (String id : List.of("D", "E")) {
+            connect(id);
+            startNode(id, List.of());
+        }
+
+        var target = List.of(kept, "D", "E");
+        assertTrue(leader.changePeers(target));
+        awaitFinalConf(target, target);
+        for (String id : removed) {
+            await("removed node " + id + " to shut itself down", () -> nodes.get(id).isStopped());
+        }
+
+        write(awaitLeader(), "3");
+        for (String id : target) {
+            awaitStore(id, List.of("1", "2", "3"));
+        }
+        assertFalse(leader.changePeers(target));
+        assertFalse(leader.changePeers(List.of()));
+    }
+
+    @Test
+    void snapshotIsTransferredInSmallChunks() throws Exception {
+        snapshotChunkBytes = 7;
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var lagging = others(leader.getNodeId()).get(0);
+        stopNode(lagging);
+
+        var expected = new ArrayList<String>();
+        for (int i = 0; i < 40; i++) {
+            expected.add("value-" + i);
+            assertTrue(send(leader, "client-1", i + 1, "value-" + i).get(5, TimeUnit.SECONDS));
+        }
+        snapshot(leader);
+        var snapshotFile = dataDir.resolve(leader.getNodeId())
+                .resolve("snapshot_" + leader.getPersistent().getLastSnapshotIndex()).resolve("snapshot.data");
+        assertTrue(Files.size(snapshotFile) > 20L * snapshotChunkBytes, "snapshot must not fit in a few chunks");
+
+        // node tụt lại nhận file qua hàng chục mẩu 7 byte và ghép lại đúng từng byte
+        startNode(lagging, List.of("A", "B", "C"));
+        awaitStore(lagging, expected);
+        var received = dataDir.resolve(lagging)
+                .resolve("snapshot_" + nodes.get(lagging).getPersistent().getLastSnapshotIndex()).resolve("snapshot.data");
+        assertEquals(Files.readString(snapshotFile), Files.readString(received));
+        assertEquals(Map.of("client-1", 40L), sessions(nodes.get(lagging)));
+    }
+
+    @Test
+    void interruptedSnapshotTransferRestartsCleanly() throws Exception {
+        snapshotChunkBytes = 5;
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var lagging = others(leader.getNodeId()).get(0);
+        isolate(lagging);
+        var expected = new ArrayList<String>();
+        for (int i = 0; i < 60; i++) {
+            expected.add("value-" + i);
+            write(leader, "value-" + i);
+        }
+        snapshot(leader);
+
+        // cắt mạng nhiều lần giữa lúc đang truyền: mẩu bị mất, lần truyền phải làm lại mà không ghép sai
+        for (int round = 0; round < 6; round++) {
+            connect(lagging);
+            TimeUnit.MILLISECONDS.sleep(15);
+            isolate(lagging);
+            TimeUnit.MILLISECONDS.sleep(15);
+        }
+        connect(lagging);
+        awaitStore(lagging, expected);
+    }
+
+    @Test
+    void outOfOrderSequencesAreDeduplicated() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+
+        // lệnh 3 và 2 vào log trước lệnh 1, mỗi lệnh hai lần: bảng phải nhớ cả sequence nằm trên mốc liền mạch
+        var pending = new ArrayList<CompletableFuture<Boolean>>();
+        for (long sequence : List.of(3L, 2L, 3L, 2L, 1L, 1L)) {
+            pending.add(send(leader, "client-1", sequence, "cmd" + sequence));
+        }
+        for (var future : pending) {
+            assertTrue(future.get(5, TimeUnit.SECONDS));
+        }
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, List.of("cmd3", "cmd2", "cmd1"));
+        }
+        assertEquals(Map.of("client-1", 3L), sessions(leader));
     }
 }

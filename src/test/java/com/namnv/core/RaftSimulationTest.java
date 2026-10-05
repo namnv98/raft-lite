@@ -11,11 +11,13 @@ import com.namnv.rpc.client.RpcProcessor;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
+import com.namnv.rpc.model.request.ReadIndexRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
 import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
+import com.namnv.rpc.model.response.ReadIndexResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
 import com.namnv.rpc.model.response.TimeoutNowResponse;
 import org.junit.jupiter.api.Test;
@@ -58,7 +60,8 @@ class RaftSimulationTest {
     private static final List<String> SEVEN = List.of("A", "B", "C", "D", "E", "F", "G");
     private static final int CLIENTS = 3;
 
-    record Result(List<String> committed, int invoked, long acked, int reads, int terms, int confChanges, long events) {
+    record Result(List<String> committed, int invoked, long acked, int reads, int terms, int confChanges,
+                  long snapshotsInstalled, long events) {
     }
 
     @TempDir
@@ -97,9 +100,10 @@ class RaftSimulationTest {
     }
 
     private static void report(long seed, Result result) {
-        System.out.printf("sim seed=%d: %d ops invoked, %d acked, %d committed, %d reads, %d terms, %d conf changes, %d events%n",
+        System.out.printf("sim seed=%d: %d ops invoked, %d acked, %d committed, %d reads, %d terms, %d conf changes, "
+                        + "%d snapshots installed, %d events%n",
                 seed, result.invoked(), result.acked(), result.committed().size(), result.reads(), result.terms(),
-                result.confChanges(), result.events());
+                result.confChanges(), result.snapshotsInstalled(), result.events());
     }
 
     @Test
@@ -239,6 +243,7 @@ class RaftSimulationTest {
         private boolean actorsRunning = true;
         private long stamp;
         private int confChanges;
+        private long snapshotsInstalled;
         private String marker;
 
         private final double dropRate = 0.05;
@@ -295,6 +300,7 @@ class RaftSimulationTest {
             checkAppliedPrefixes();
             checkLogMatching();
 
+            ids.forEach(this::retire);
             var committed = machines.get(ids.get(0)).getStore();
             var acked = ops.stream().filter(Op::acked).count();
             assertEquals(List.of(), distinctViolations(), "seed " + seed + ": invariant violations during the run");
@@ -305,7 +311,8 @@ class RaftSimulationTest {
             RaftInvariants.assertReadsLinearizable(committed, ops, reads);
             assertTrue(acked > 0, "seed " + seed + ": no write was ever acknowledged");
             assertTrue(!reads.isEmpty(), "seed " + seed + ": no read ever succeeded");
-            return new Result(committed, ops.size(), acked, reads.size(), leaderByTerm.size(), confChanges, sim.executed);
+            return new Result(committed, ops.size(), acked, reads.size(), leaderByTerm.size(), confChanges,
+                    snapshotsInstalled, sim.executed);
         }
 
         // chạy sự kiện cho tới khi done hoặc hết durationMs giây ảo; Election Safety được kiểm tra sau mỗi sự kiện
@@ -350,6 +357,13 @@ class RaftSimulationTest {
                     .heartbeatIntervalMs(50)
                     // node bị gỡ vẫn chạy để nemesis có thể thêm nó lại
                     .shutdownOnRemoved(false)
+                    // snapshot tự động và request nhỏ, để compact log và gửi nhiều đợt xảy ra thường xuyên
+                    // node đang tắt được thêm vào sẽ không bao giờ bắt kịp: huỷ sớm để nemesis thử thay đổi khác
+                    .catchUpTimeoutMs(3000)
+                    // snapshot đi qua nhiều mẩu, đủ để mất mẩu và đổi leader giữa chừng xảy ra
+                    .snapshotChunkBytes(256)
+                    .snapshotIntervalEntries(150)
+                    .maxEntriesPerRequest(16)
                     .stateMachine(machine)
                     // mỗi lần khởi động node có một đồng hồ lệch khác nhau, từ chậm 25% tới nhanh 30%
                     .runtime(new SimRuntime(sim, 0.75 + random.nextDouble() * 0.55))
@@ -367,13 +381,20 @@ class RaftSimulationTest {
             node.start();
         }
 
+        // bộ đếm của node mất khi nó tắt, nên cộng dồn lại trước
+        private void retire(String id) {
+            snapshotsInstalled += nodes.get(id).metrics().snapshotsInstalled();
+        }
+
         private void crash(String id) {
+            retire(id);
             down.add(id);
             registry.remove(id);
             nodes.get(id).shutdown();
         }
 
         private void powerLoss(String id) {
+            retire(id);
             down.add(id);
             registry.remove(id);
             try {
@@ -441,8 +462,13 @@ class RaftSimulationTest {
             return 1 + random.nextInt(maxDelayMs);
         }
 
-        // request và response đều là sự kiện: có thể mất, trễ (nên đến sai thứ tự), request có thể đến thêm lần nữa
         private <T> CompletableFuture<T> call(String from, String to, Function<RaftServerService, T> invoke) {
+            return callAsync(from, to, handler -> CompletableFuture.completedFuture(invoke.apply(handler)));
+        }
+
+        // request và response đều là sự kiện: có thể mất, trễ (nên đến sai thứ tự), request có thể đến thêm lần nữa
+        private <T> CompletableFuture<T> callAsync(String from, String to,
+                                                   Function<RaftServerService, CompletableFuture<T>> invoke) {
             var result = new CompletableFuture<T>();
             var dropRequest = faults && random.nextDouble() < dropRate;
             sim.schedule(delay(), () -> {
@@ -455,19 +481,21 @@ class RaftSimulationTest {
                     // bản sao đến muộn hơn hẳn, sau cả những request gửi sau nó
                     sim.schedule(random.nextInt(maxDuplicateDelayMs), () -> deliverDuplicate(to, invoke));
                 }
-                T response;
+                CompletableFuture<T> answer;
                 try {
-                    response = invoke.apply(handler);
+                    answer = invoke.apply(handler);
                 } catch (RuntimeException e) {
                     result.completeExceptionally(e);
                     return;
                 }
-                if (faults && random.nextDouble() < dropRate) {
-                    // handler đã chạy xong nhưng người gửi không bao giờ biết
-                    sim.schedule(delay(), () -> result.completeExceptionally(new IOException("response dropped")));
-                } else {
-                    sim.schedule(delay(), () -> result.complete(response));
-                }
+                answer.whenComplete((response, error) -> {
+                    if (error != null || (faults && random.nextDouble() < dropRate)) {
+                        // handler đã chạy xong nhưng người gửi không bao giờ biết
+                        sim.schedule(delay(), () -> result.completeExceptionally(new IOException("response dropped")));
+                    } else {
+                        sim.schedule(delay(), () -> result.complete(response));
+                    }
+                });
             });
             return result;
         }
@@ -506,6 +534,11 @@ class RaftSimulationTest {
         @Override
         public CompletableFuture<TimeoutNowResponse> timeoutNow(String target, TimeoutNowRequest req) {
             return call(req.leaderId, target, h -> h.handleTimeoutNowRequest(req));
+        }
+
+        @Override
+        public CompletableFuture<ReadIndexResponse> readIndex(String target, ReadIndexRequest req) {
+            return callAsync(req.requesterId, target, h -> h.handleReadIndexRequest(req));
         }
 
         // ---------- actors ----------
@@ -617,17 +650,17 @@ class RaftSimulationTest {
                 }
                 return null;
             };
-            leaderOrAny().appendClientCommand("client-" + clientId, n, command.getBytes(StandardCharsets.UTF_8))
+            leaderOrAny().appendClientCommand("client-" + clientId, n + 1, command.getBytes(StandardCharsets.UTF_8))
                     .whenComplete((ok, error) -> finish.apply(Boolean.TRUE.equals(ok)));
             sim.schedule(2000, () -> finish.apply(false));
         }
 
-        // đọc nhất quán liên tục từ bất kỳ node nào tự nhận là leader
+        // đọc nhất quán liên tục từ một node bất kỳ, leader hay follower
         private void readerStep() {
             if (!actorsRunning) {
                 return;
             }
-            var target = leaderOrAny();
+            var target = nodes.get(pick(ids));
             var machine = machines.get(target.getNodeId());
             var invokedAt = ++stamp;
             target.read(machine::getStore).whenComplete((seen, error) -> {

@@ -1,10 +1,12 @@
 package com.namnv.state;
 
 import lombok.Getter;
+import lombok.Setter;
 
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -28,6 +30,30 @@ public class LeaderState {
     private long stamp;
     // số thứ tự lớn nhất của request mà mỗi peer đã trả lời: peer đó vẫn coi node này là leader ở thời điểm đó
     private final Map<String, Long> ackedStamp = new HashMap<>();
+
+    // thay đổi cấu hình đang chờ: các node mới trong catchingUp phải bắt kịp log (chưa được tính vào quorum)
+    // rồi leader mới ghi cấu hình joint dẫn tới pendingConf
+    @Setter
+    private List<String> pendingConf;
+    private final Set<String> catchingUp = new HashSet<>();
+    @Setter
+    private long catchUpDeadline;
+
+    // tiến độ gửi snapshot cho từng peer
+    private final Map<String, SnapshotTransfer> snapshotTransfers = new HashMap<>();
+
+    public static final class SnapshotTransfer {
+        public final long index;
+        public final String path;
+        // mẩu kế tiếp cần gửi
+        public int fileIndex;
+        public long offset;
+
+        public SnapshotTransfer(long index, String path) {
+            this.index = index;
+            this.path = path;
+        }
+    }
 
     public long nextStamp() {
         return ++stamp;

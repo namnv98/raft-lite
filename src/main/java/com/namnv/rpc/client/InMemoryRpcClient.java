@@ -5,11 +5,13 @@ import com.namnv.rpc.RaftServerService;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
+import com.namnv.rpc.model.request.ReadIndexRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
 import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
+import com.namnv.rpc.model.response.ReadIndexResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
 import com.namnv.rpc.model.response.TimeoutNowResponse;
 import lombok.Getter;
@@ -74,6 +76,12 @@ public class InMemoryRpcClient implements RpcProcessor {
     @Override
     public CompletableFuture<TimeoutNowResponse> timeoutNow(String target, TimeoutNowRequest req) {
         return call(req.leaderId, target, h -> h.handleTimeoutNowRequest(req));
+    }
+
+    @Override
+    public CompletableFuture<ReadIndexResponse> readIndex(String target, ReadIndexRequest req) {
+        // handler trả về future; nối nó vào kết quả của lời gọi
+        return call(req.requesterId, target, h -> h.handleReadIndexRequest(req)).thenCompose(response -> response);
     }
 
 }

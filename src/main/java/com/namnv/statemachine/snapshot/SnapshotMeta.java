@@ -1,5 +1,6 @@
 package com.namnv.statemachine.snapshot;
 
+import com.namnv.entity.ClientSession;
 import com.namnv.entity.ConfigurationEntry;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -17,6 +18,6 @@ public class SnapshotMeta {
     // cấu hình cluster tại lastIncludedIndex, vì config entry có thể đã bị compact khỏi log
     private ConfigurationEntry conf;
     private List<String> files;
-    // clientId -> sequence lớn nhất đã apply tính tới lastIncludedIndex, để việc chống ghi trùng sống qua snapshot
-    private Map<String, Long> sessions;
+    // clientId -> các sequence đã apply tính tới lastIncludedIndex, để việc chống ghi trùng sống qua snapshot
+    private Map<String, ClientSession> sessions;
 }

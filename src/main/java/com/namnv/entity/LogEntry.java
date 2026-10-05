@@ -20,6 +20,8 @@ public class LogEntry implements Serializable {
     // định danh của lệnh từ phía client, null nếu client không cần chống ghi trùng
     private String clientId;
     private long sequence;
+    // true: entry này kết thúc phiên của clientId, bảng chống trùng quên client đó
+    private boolean sessionClose;
 
     public LogEntry() {
     }
@@ -38,6 +40,13 @@ public class LogEntry implements Serializable {
         this(index, term, command);
         this.clientId = clientId;
         this.sequence = sequence;
+    }
+
+    public static LogEntry newSessionClose(long index, long term, String clientId) {
+        LogEntry e = new LogEntry(index, term, null);
+        e.clientId = clientId;
+        e.sessionClose = true;
+        return e;
     }
 
     // log cấu hình

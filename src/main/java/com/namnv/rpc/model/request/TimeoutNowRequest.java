@@ -1,5 +1,8 @@
 package com.namnv.rpc.model.request;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.io.Serial;
 import java.io.Serializable;
 
@@ -11,7 +14,9 @@ public class TimeoutNowRequest implements Serializable {
     public final long term;
     public final String leaderId;
 
-    public TimeoutNowRequest(long term, String leaderId) {
+    @JsonCreator
+    public TimeoutNowRequest(@JsonProperty("term") long term,
+            @JsonProperty("leaderId") String leaderId) {
         this.term = term;
         this.leaderId = leaderId;
     }

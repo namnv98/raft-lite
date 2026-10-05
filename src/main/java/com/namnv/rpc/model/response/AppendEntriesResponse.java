@@ -2,6 +2,9 @@ package com.namnv.rpc.model.response;
 
 import lombok.ToString;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.io.Serial;
 import java.io.Serializable;
 
@@ -14,7 +17,10 @@ public class AppendEntriesResponse implements Serializable {
     public final long matchIndex; // highest index matched on follower (or 0)
 
 
-    public AppendEntriesResponse(long term, boolean success, long matchIndex) {
+    @JsonCreator
+    public AppendEntriesResponse(@JsonProperty("term") long term,
+            @JsonProperty("success") boolean success,
+            @JsonProperty("matchIndex") long matchIndex) {
         this.term = term;
         this.success = success;
         this.matchIndex = matchIndex;

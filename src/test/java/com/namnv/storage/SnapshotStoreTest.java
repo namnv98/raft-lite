@@ -1,5 +1,6 @@
 package com.namnv.storage;
 
+import com.namnv.entity.ClientSession;
 import com.namnv.entity.ConfigurationEntry;
 import com.namnv.statemachine.snapshot.SnapshotMeta;
 import org.junit.jupiter.api.Test;
@@ -29,7 +30,13 @@ class SnapshotStoreTest {
 
     private static SnapshotMeta meta(long index) {
         return new SnapshotMeta(index, 1, new ConfigurationEntry(List.of("A", "B", "C")), List.of("snapshot.data"),
-                Map.of("client-1", 7L));
+                Map.of("client-1", session(7)));
+    }
+
+    private static ClientSession session(long watermark) {
+        var session = new ClientSession();
+        session.setWatermark(watermark);
+        return session;
     }
 
     private void commit(SnapshotStore store, long index, String content) throws IOException {

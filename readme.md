@@ -27,12 +27,13 @@ và giữ được dữ liệu khi node chết, mất điện hay mạng bị ch
 | Nhóm | Có gì |
 |---|---|
 | Bầu cử | Pre-vote, từ chối pre-vote khi leader còn sống, leader tự step-down khi mất đa số (check quorum), no-op khi nhậm chức |
-| Nhân bản log | Gom nhiều entry vào một request, lùi nhanh khi log lệch, một request đang bay cho mỗi follower |
+| Nhân bản log | Gom nhiều entry vào một request có giới hạn kích thước, lùi nhanh khi log lệch, một request đang bay cho mỗi follower |
 | Độ bền | Log chia segment có CRC32; fsync trước mọi lời hứa với node khác; mọi thao tác ghi đĩa nằm ngoài lock của node |
-| Snapshot | Tạo bất đồng bộ, lưu atomic, gửi cho follower tụt lại (InstallSnapshot), compact log bằng cách xoá segment |
-| Thành viên | Thêm và gỡ node bằng joint consensus, trao quyền leader, node bị gỡ tự tắt |
-| Client | Ghi có chống trùng (exactly-once theo `clientId` + `sequence`), đọc nhất quán bằng ReadIndex |
-| Transport | In-memory cho test, socket TCP có lọc deserialization và dùng lại kết nối |
+| Snapshot | Tạo bất đồng bộ (thủ công hoặc tự động theo số entry), lưu atomic, gửi cho follower tụt lại theo từng mẩu |
+| Thành viên | Thêm, gỡ hoặc thay nhiều node một lần bằng joint consensus; node mới bắt kịp log trước khi được tính vào quorum; trao quyền leader; node bị gỡ tự tắt |
+| Client | Ghi có chống trùng (`clientId` + `sequence`, gửi đồng thời được), đọc nhất quán bằng ReadIndex trên cả leader lẫn follower, backpressure |
+| Transport | In-memory cho test; socket TCP với JSON có khung, dùng lại kết nối, TLS xác thực hai chiều |
+| Quan sát | `metrics()` trả về trạng thái và các bộ đếm của node |
 | Kiểm thử | Mô phỏng tất định theo seed, fault injection chạy thread thật, test tất định cho từng quy tắc an toàn |
 
 ## Bắt đầu nhanh
@@ -40,7 +41,7 @@ và giữ được dữ liệu khi node chết, mất điện hay mạng bị ch
 Yêu cầu: JDK 21 trở lên và Maven.
 
 ```bash
-mvn test                                  # toàn bộ test, khoảng 45 giây
+mvn test                                  # toàn bộ test, khoảng 50 giây
 mvn compile
 
 # demo 3 node trong một tiến trình: ghi lệnh, cô lập leader, nối lại, thêm node D, snapshot
@@ -71,6 +72,7 @@ NodeOptions options = NodeOptions.builder()
         .electionTimeoutMinMs(300)
         .electionTimeoutMaxMs(500)
         .heartbeatIntervalMs(100)
+        .snapshotIntervalEntries(10_000)               // tự snapshot sau mỗi 10.000 entry
         .stateMachine(new ListStateMachine())
         .build();
 
@@ -90,27 +92,34 @@ Chỉ leader nhận lệnh. `node.getState()` cho biết vai trò hiện tại, 
 // không chống trùng: nếu bạn gửi lại sau khi không nhận được kết quả, lệnh có thể được apply hai lần
 CompletableFuture<Boolean> done = node.appendClientCommand("set x=1".getBytes());
 
-// có chống trùng: mỗi client một clientId cố định, mỗi lệnh mới một sequence lớn hơn lệnh trước
-boolean ok = node.appendClientCommand("client-7", 42, "set x=1".getBytes()).get();
+// có chống trùng: mỗi client một clientId cố định, sequence bắt đầu từ 1 và tăng liền nhau
+boolean ok = node.appendClientCommand("client-7", 1, "set x=1".getBytes()).get();
+
+// client sẽ không gửi lại lệnh nào nữa: cho cluster quên nó
+node.closeClientSession("client-7");
 ```
 
 Future trả về `true` khi lệnh đã được commit và apply trên leader. `false` nghĩa là **không biết kết quả**:
-node không phải leader, mất quyền giữa chừng, hoặc quá 5 giây chưa commit. Lệnh đó vẫn có thể được commit sau này.
-Với bản có `clientId`, cách xử lý đúng là gửi lại y nguyên `(clientId, sequence)` tới leader hiện tại cho tới khi nhận `true`;
-lệnh được apply nhiều nhất một lần dù gửi bao nhiêu lần. Client phải chờ lệnh trước có kết quả rồi mới gửi sequence kế tiếp.
+node không phải leader, mất quyền giữa chừng, quá `clientTimeoutMs` chưa commit, hoặc leader đang quá tải
+(số lệnh chờ commit vượt `maxPendingCommands`). Lệnh đó vẫn có thể được commit sau này.
+
+Với bản có `clientId`, cách xử lý đúng khi nhận `false` là gửi lại y nguyên `(clientId, sequence)` tới leader hiện tại
+cho tới khi nhận `true`; lệnh được apply nhiều nhất một lần dù gửi bao nhiêu lần. Client có thể gửi nhiều lệnh cùng lúc
+mà không cần chờ lệnh trước, miễn là không bỏ sót sequence nào.
 
 ### Đọc nhất quán
 
 Đọc thẳng từ state machine của một node có thể trả về dữ liệu cũ (node đó có thể là follower tụt lại, hoặc leader vừa mất quyền
-mà chưa biết). `read` đảm bảo kết quả chứa mọi lệnh đã được xác nhận trước khi nó được gọi:
+mà chưa biết). `read` đảm bảo kết quả chứa mọi lệnh đã được xác nhận trước khi nó được gọi, và gọi được trên **bất kỳ node nào**:
 
 ```java
 ListStateMachine machine = ...;                        // state machine của chính node này
 List<String> data = node.read(machine::getStore).get();
 ```
 
+Trên follower, node hỏi leader vị trí cần đọc rồi tự phục vụ từ dữ liệu của mình, nên việc đọc được chia tải ra cả cluster.
 Hàm truyền vào chạy khi node đang giữ lock, nên cần nhanh và không được gọi ngược vào node.
-Future thất bại với `NotLeaderException` (kèm `getLeaderId()` để thử lại) nếu node không phải leader hoặc mất quyền trong lúc chờ.
+Future thất bại với `NotLeaderException` nếu node không biết leader, không liên lạc được với leader, hoặc leader mất quyền trong lúc chờ.
 
 ### Snapshot
 
@@ -119,11 +128,12 @@ node.createSnapshot();
 ```
 
 Hàm trả về ngay. State machine ghi dữ liệu của nó, sau đó snapshot được lưu và phần log đã nằm trong snapshot bị xoá, đều ở thread nền.
-Raft Lite không tự tạo snapshot: bạn gọi theo lịch hoặc theo kích thước log.
+Đặt `snapshotIntervalEntries` để node tự làm việc này mỗi khi có đủ số entry đã apply mà chưa compact.
 
-### Thêm và gỡ node
+### Thay đổi thành viên
 
-Gọi trên leader. Mỗi lần chỉ một thay đổi; lời gọi trả về `false` nếu node không phải leader hoặc thay đổi trước chưa xong.
+Gọi trên leader. Mỗi lần chỉ một thay đổi; lời gọi trả về `false` nếu node không phải leader, danh sách không đổi,
+hoặc thay đổi trước chưa xong.
 
 ```java
 // node mới khởi động với danh sách peers rỗng, rồi leader thêm nó vào
@@ -135,10 +145,25 @@ newNode.start();
 leader.onJoinPeerCluster("localhost:8083");
 
 leader.onLeavePeerCluster("localhost:8081");           // gỡ một node, kể cả chính leader
+
+// thêm và gỡ nhiều node trong một lần
+leader.changePeers(List.of("localhost:8080", "localhost:8083", "localhost:8084"));
 ```
 
 Thay đổi hoàn tất khi `node.getConf()` không còn ở trạng thái joint và chứa đúng danh sách mới.
+Node mới phải bắt kịp log trong `catchUpTimeoutMs`; nếu không, yêu cầu bị huỷ và cấu hình giữ nguyên.
 Leader gỡ chính mình sẽ trao quyền cho một follower rồi tự tắt. Node bị gỡ tự tắt khi biết chắc mình đã rời cluster.
+
+### Theo dõi
+
+```java
+RaftMetrics m = node.metrics();
+// m.state(), m.term(), m.leaderId(), m.commitIndex(), m.lastApplied(), m.firstLogIndex(), m.lastLogIndex(),
+// m.pendingCommands(), m.pendingReads(), m.electionsStarted(), m.timesElectedLeader(), m.commandsAccepted(),
+// m.commandsRejected(), m.duplicateCommands(), m.readsServed(), m.snapshotsCreated(), m.snapshotsInstalled()
+```
+
+Các bộ đếm tính từ lúc node khởi động. Raft Lite không tự xuất metrics ra hệ thống nào; bạn đọc và đẩy đi theo cách của mình.
 
 ### Tắt node
 
@@ -157,12 +182,16 @@ node.shutdown();
 | `raftMetaUri`, `logUri`, `snapshotUri` | bắt buộc | Thư mục lưu term/phiếu bầu, log và snapshot |
 | `electionTimeoutMinMs`, `electionTimeoutMaxMs` | bắt buộc | Follower không nghe leader trong một khoảng ngẫu nhiên giữa hai giá trị này thì bắt đầu bầu cử. Leader mất liên lạc với đa số quá giá trị max thì step-down |
 | `heartbeatIntervalMs` | bắt buộc | Nhịp leader gửi heartbeat; nên nhỏ hơn nhiều so với election timeout |
+| `clientTimeoutMs` | `5000` | Một lệnh hoặc một lần đọc chờ tối đa bao lâu trước khi nhận kết quả "không rõ" |
+| `maxPendingCommands` | `100000` | Leader từ chối lệnh mới khi số lệnh đang chờ commit vượt mức này |
+| `maxEntriesPerRequest` | `1024` | Số entry tối đa trong một AppendEntries |
+| `snapshotIntervalEntries` | `0` (tắt) | Tự tạo snapshot khi số entry đã apply mà chưa compact đạt mức này |
+| `snapshotChunkBytes` | `1048576` | Kích thước tối đa của một mẩu snapshot gửi cho follower |
+| `catchUpTimeoutMs` | `30000` | Node mới phải bắt kịp log trong thời gian này thì mới được đưa vào cấu hình |
 | `shutdownOnRemoved` | `true` | Node tự `shutdown()` khi bị gỡ khỏi cluster; `false` thì node chỉ đứng yên |
 | `departingTimeoutMs` | `10000` | Leader cố gửi cấu hình cuối cho node vừa bị gỡ trong bao lâu trước khi bỏ cuộc |
 | `runtime` | `null` | Nguồn thời gian, timer và thread ghi đĩa. `null` nghĩa là dùng thread và đồng hồ thật (`ThreadedRuntime`) |
 | `diskFaults` | không làm gì | Điểm chèn lỗi ghi đĩa, chỉ dùng trong test |
-
-Thời hạn chờ một lệnh hay một lần đọc được cố định là 5 giây.
 
 ## Viết state machine
 
@@ -186,10 +215,14 @@ com.namnv
 │   ├── RaftNode            toàn bộ logic Raft của một node
 │   ├── RaftRuntime         đồng hồ, timer, thread ghi đĩa, nguồn ngẫu nhiên (tiêm được)
 │   ├── ThreadedRuntime     runtime mặc định: thread và đồng hồ thật
+│   ├── RaftMetrics         ảnh chụp trạng thái và bộ đếm
 │   ├── NodeState           LEADER / CANDIDATE / FOLLOWER
 │   └── NotLeaderException
 ├── config                  NodeOptions, RaftConfig
-├── entity                  LogEntry, ConfigurationEntry (cấu hình thành viên và phép tính quorum)
+├── entity
+│   ├── LogEntry            lệnh, no-op, thay đổi cấu hình hoặc kết thúc phiên client
+│   ├── ConfigurationEntry  cấu hình thành viên và phép tính quorum
+│   └── ClientSession       các sequence của một client đã được apply
 ├── state
 │   ├── PersistentState     term, phiếu bầu, commit index; sở hữu log và snapshot store
 │   ├── VolatileState       commitIndex, lastApplied
@@ -203,6 +236,8 @@ com.namnv
 ├── timer                   ElectionTimer, HeartbeatTimer
 ├── rpc
 │   ├── RaftServerService   các RPC một node phải xử lý
+│   ├── RpcCodec            định dạng trên dây của transport socket
+│   ├── TlsContexts         tạo SSLContext từ keystore
 │   ├── client              RpcProcessor, InMemoryRpcClient, SocketRpcClient
 │   ├── server              SocketRpcServer
 │   └── model               request/response của từng RPC
@@ -249,8 +284,8 @@ Election timer luôn được hẹn lại, nên một vòng bầu cử thất b�
 
 ### Nhân bản log
 
-- Mỗi follower chỉ có **một request đang bay**. Khi nó trả lời mà leader còn entry chưa gửi, leader gửi tiếp ngay;
-  entry đến trong lúc chờ được gom vào request sau.
+- Mỗi follower chỉ có **một request đang bay**, chứa nhiều nhất `maxEntriesPerRequest` entry. Khi nó trả lời mà leader còn entry
+  chưa gửi, leader gửi tiếp ngay; entry đến trong lúc chờ được gom vào request sau.
 - Follower kiểm tra entry đứng trước (`prevLogIndex`, `prevLogTerm`). Nếu không khớp, nó trả về một gợi ý để leader lùi nhanh
   thay vì lùi từng entry một.
 - Follower **chỉ cắt log khi thật sự xung đột term**. Entry đã có sẵn (do request gửi trùng hoặc đến muộn) được bỏ qua;
@@ -259,6 +294,7 @@ Election timer luôn được hẹn lại, nên một vòng bầu cử thất b�
 - Leader gửi entry cho follower **song song** với việc fsync log của chính nó, và chỉ tính mình vào quorum cho phần log đã nằm trên đĩa.
 - Commit index là index lớn nhất mà đa số đã có (với joint config: đa số ở cả hai cấu hình), với điều kiện entry đó thuộc term hiện tại.
 - Phần follower cần đã bị compact thì leader gửi snapshot thay cho entry.
+- Khi số lệnh chờ commit vượt `maxPendingCommands`, leader từ chối lệnh mới thay vì để hàng chờ lớn mãi.
 
 ### Các quy tắc về độ bền
 
@@ -268,18 +304,19 @@ Mọi thứ một node hứa với node khác phải nằm trên đĩa trước 
 |---|---|
 | "Tôi bầu cho bạn" | term và votedFor |
 | RequestVote của candidate | phiếu tự bầu của nó |
+| Mọi câu trả lời có kèm term | term đó |
 | "Tôi đã có các entry này" | các entry đó |
 | Leader tính mình vào quorum | phần log tương ứng của leader |
 | Xác nhận với client | entry đã commit (đã bền vững trên đa số) |
 
-Một ngoại lệ có chủ ý: khi leader hoặc candidate thấy term cao hơn trong một response, nó step-down ngay và ghi term mới sau.
-Điều này an toàn vì phiếu bầu luôn được ghi xong trước khi có hiệu lực, nên node không thể bầu hai lần trong một term.
+Khi leader hoặc candidate thấy term cao hơn trong một response, nó step-down ngay trong bộ nhớ và việc ghi term mới được xếp
+vào thread IO; node không gửi ra câu trả lời hay yêu cầu nào mang term đó trước khi việc ghi hoàn tất.
 
 Commit index cũng được lưu, nhưng chỉ để lần khởi động sau apply lại nhanh hơn; mất nó không ảnh hưởng tính đúng đắn.
 
 ### Snapshot
 
-**Tạo snapshot** (`createSnapshot`):
+**Tạo snapshot** (`createSnapshot`, hoặc tự động theo `snapshotIntervalEntries`):
 
 1. Trong lock: ghi nhận `lastApplied`, term của nó, cấu hình thành viên và bảng chống trùng tại thời điểm đó,
    rồi gọi `onSnapshotSave` với một thư mục `temp/`.
@@ -290,22 +327,27 @@ Commit index cũng được lưu, nhưng chỉ để lần khởi động sau ap
 
 Vì bước 3 là một lần rename, snapshot hoặc có đủ hoặc không có gì, dù mất điện ở bất kỳ lúc nào.
 
-**Cài snapshot** (follower nhận InstallSnapshot): ghi file vào `temp/` ngoài lock, cho state machine load từ `temp/`
-(việc apply bị hoãn trong lúc đó), rồi mới rename, cuối cùng cập nhật log và index trong lock.
-Load trước rồi mới lưu: nếu load hỏng thì snapshot và log cũ trên đĩa còn nguyên để lần khởi động sau dựng lại.
+**Gửi snapshot** cho follower tụt lại: leader đọc và gửi từng mẩu không quá `snapshotChunkBytes`, mỗi lần một mẩu,
+nên không bên nào phải giữ cả snapshot trong bộ nhớ. Follower ghi từng mẩu vào `temp/` và fsync.
+Mẩu không nối tiếp đúng chỗ (mất mẩu, đổi leader, snapshot mới thay snapshot đang gửi) làm lần truyền bắt đầu lại từ đầu.
+
+**Cài snapshot** khi mẩu cuối về: state machine load từ `temp/` ngoài lock (việc apply bị hoãn trong lúc đó), rồi mới rename,
+cuối cùng cập nhật log và index trong lock. Load trước rồi mới lưu: nếu load hỏng thì snapshot và log cũ trên đĩa còn nguyên
+để lần khởi động sau dựng lại.
 
 ### Thay đổi thành viên
 
-Dùng **joint consensus** hai bước:
-
-1. Leader ghi cấu hình joint C(old, new). Trong giai đoạn này mọi quyết định (bầu cử, commit) cần đa số ở **cả hai** cấu hình.
-2. Khi C(old, new) commit, leader ghi tiếp C(new). Khi C(new) commit, thay đổi hoàn tất.
+1. **Bắt kịp.** Node mới nhận log (hoặc snapshot) từ leader như một learner: nó chưa thuộc cấu hình, không được tính vào quorum
+   và không bầu cử. Nhờ vậy thêm một node trống, chậm hay đang chết không làm cluster chậm lại hay mất khả năng commit.
+2. **Joint.** Khi mọi node mới chỉ còn cách leader không quá một request, leader ghi cấu hình joint C(old, new).
+   Trong giai đoạn này mọi quyết định (bầu cử, commit) cần đa số ở **cả hai** cấu hình.
+3. **Kết thúc.** Khi C(old, new) commit, leader ghi tiếp C(new). Khi C(new) commit, thay đổi hoàn tất.
 
 Chi tiết:
 
 - Cấu hình có hiệu lực ngay khi entry vào log, kể cả chưa commit (đúng theo Raft). Nếu entry đó bị cắt bỏ, cấu hình quay về bản trước.
 - Cấu hình tại thời điểm snapshot được lưu cùng snapshot, vì entry cấu hình có thể đã bị compact khỏi log.
-- Node mới khởi động với danh sách thành viên rỗng nên không tự bầu cử; nó nhận log (hoặc snapshot) từ leader sau khi được thêm.
+- Nếu node mới không bắt kịp trong `catchUpTimeoutMs`, hoặc leader đổi trong lúc chờ, yêu cầu bị bỏ và phải gọi lại.
 - Leader tiếp tục gửi log cho node vừa bị gỡ tới khi node đó nhận được C(new) và biết C(new) đã commit, hoặc tới khi hết
   `departingTimeoutMs`. Leader mới đắc cử giữa chừng tự suy ra các node đang rời đi từ log.
 - Leader gỡ chính mình: điều phối tới khi C(new) commit, gửi `TimeoutNow` lần lượt cho các follower (log đầy đủ nhất trước)
@@ -314,28 +356,30 @@ Chi tiết:
 
 ### Đọc nhất quán (ReadIndex)
 
-Khi `read` được gọi trên leader:
+Trên leader:
 
 1. Leader ghi nhận **readIndex** = commit index hiện tại, nhưng không nhỏ hơn index của no-op mà nó ghi khi nhậm chức
    (trước khi no-op commit, leader mới chưa chắc commit index của mình đã đủ mới).
 2. Leader gửi một vòng heartbeat mới và chờ **đa số trả lời các request được gửi sau thời điểm đó**.
    Response của heartbeat gửi trước đó không được tính: chúng chỉ chứng minh node là leader trước khi có yêu cầu đọc.
-3. Leader chờ state machine apply tới readIndex.
-4. Hàm đọc chạy trong lock và kết quả được trả về.
+3. Node chờ state machine của mình apply tới readIndex, rồi chạy hàm đọc trong lock.
+
+Trên follower: node gửi RPC `ReadIndex` cho leader; leader làm bước 1 và 2 rồi trả về readIndex; follower làm bước 3 trên
+dữ liệu của chính nó.
 
 Cơ chế này không ghi gì vào log và không phụ thuộc đồng hồ, nên đúng cả khi đồng hồ các node chạy lệch nhau.
-Nếu leader mất quyền trong lúc chờ, lần đọc thất bại với `NotLeaderException`.
 
 ### Chống ghi trùng
 
-Một lệnh có `clientId` và `sequence` được ghi vào log kèm hai giá trị đó. Mỗi node giữ một bảng
-`clientId → sequence lớn nhất đã apply`. Khi apply một entry có sequence không lớn hơn giá trị trong bảng,
-node bỏ qua, không gọi state machine.
+Một lệnh có `clientId` và `sequence` được ghi vào log kèm hai giá trị đó. Mỗi node giữ, cho từng client, mốc
+"mọi sequence tới đây đã apply" cùng các sequence lẻ phía trên mốc (xuất hiện khi client gửi nhiều lệnh cùng lúc và chúng
+vào log không theo thứ tự). Entry có sequence đã apply bị bỏ qua, không gọi state machine.
 
 - Bảng chỉ phụ thuộc vào các entry đã apply, nên mọi node quyết định giống nhau.
-- Bảng được lưu trong snapshot và gửi kèm InstallSnapshot, nên sống qua restart và compact log.
+- Bảng được lưu trong snapshot và gửi kèm khi cài snapshot, nên sống qua restart và compact log.
 - Leader trả lời `true` ngay cho lệnh đã apply mà không ghi thêm vào log.
-- Bảng không bao giờ được dọn: mỗi `clientId` từng xuất hiện chiếm một dòng mãi mãi.
+- `closeClientSession` ghi một entry làm mọi node quên client đó. Không có cơ chế tự hết hạn: client không được đóng
+  sẽ chiếm một dòng trong bảng mãi mãi.
 
 ## Dữ liệu trên đĩa
 
@@ -379,21 +423,30 @@ và một entry bị đổi có thể khiến các node áp dụng những lện
   khởi động lại với danh sách peers rỗng (nên dùng id mới), rồi thêm lại (`onJoinPeerCluster`).
   Đừng chỉ xoá dữ liệu rồi bật lại với id cũ khi nó còn là thành viên: node đó có thể đã bầu hoặc đã ack những thứ nó không còn nhớ.
 - **Mất đa số** thì cluster ngừng nhận lệnh ghi và lệnh đọc nhất quán cho tới khi đủ đa số trở lại. Không có cơ chế ép đổi cấu hình.
-- **Snapshot** cần được gọi định kỳ, nếu không log và bộ nhớ của node sẽ lớn mãi: toàn bộ entry chưa compact được giữ trong RAM.
-- **Định dạng đĩa** đã đổi nhiều lần trong quá trình phát triển và không có cơ chế nâng cấp; dữ liệu của bản cũ không đọc lại được.
+- **Bộ nhớ:** mọi entry chưa compact được giữ trong RAM. Đặt `snapshotIntervalEntries` để giới hạn con số đó.
+- **Định dạng đĩa và định dạng RPC** đã đổi nhiều lần trong quá trình phát triển và không có cơ chế nâng cấp:
+  dữ liệu của bản cũ không đọc lại được, và các node phải chạy cùng một bản.
 - **Log** dùng Log4j2; cấu hình ở `src/main/resources/log4j2.xml`.
 
 ## Transport
 
 `RaftNode` gửi RPC qua interface `RpcProcessor` và nhận RPC qua interface `RaftServerService` (do chính nó cài đặt).
-Có năm RPC: PreVote, RequestVote, AppendEntries, InstallSnapshot, TimeoutNow.
+Có sáu RPC: PreVote, RequestVote, AppendEntries, InstallSnapshot, TimeoutNow, ReadIndex.
 
 - **`InMemoryRpcClient`**: gọi thẳng handler của node đích trong cùng tiến trình. Có bảng `reachable` để giả lập chia cắt mạng. Dùng cho test và demo.
-- **`SocketRpcClient` + `SocketRpcServer`**: TCP với Java serialization.
+- **`SocketRpcClient` + `SocketRpcServer`**: TCP.
+  - Mỗi message là một khung `[4 byte độ dài][1 byte loại][JSON]` (`RpcCodec`). Chỉ các loại message của Raft được đọc,
+    mỗi loại chỉ thành đúng class của nó, và khung lớn hơn 64 MiB bị từ chối. Bên gửi không thể khiến bên nhận khởi tạo một class tuỳ ý.
   - Mỗi node đích một kết nối dùng lại, các lời gọi tới cùng một node chạy tuần tự trên kết nối đó.
   - Kết nối lỗi thì đóng và nối lại ở lời gọi sau; có timeout cho cả lúc kết nối lẫn lúc chờ trả lời.
-  - Server chỉ cho deserialize các class message của Raft; class khác bị từ chối trước khi code của nó chạy.
-  - Không mã hoá và không xác thực. Snapshot được gửi nguyên khối trong một message.
+  - **TLS:** truyền một `SSLContext` vào cả client và server để mã hoá và xác thực hai chiều. Server luôn đòi chứng chỉ của client,
+    nên chỉ node có chứng chỉ được truststore tin mới gọi được RPC.
+
+```java
+SSLContext tls = TlsContexts.fromKeyStores(Path.of("node.p12"), Path.of("cluster-trust.p12"), password);
+RpcProcessor rpc = new SocketRpcClient(1000, tls);
+new SocketRpcServer(8080, node, tls).start();
+```
 
 Muốn dùng transport khác (gRPC, Netty...), cài đặt `RpcProcessor` cho phía gửi và gọi các hàm `handle...Request` của node ở phía nhận.
 Một lời gọi thất bại chỉ cần làm future hoàn tất với exception; node tự gửi lại ở nhịp sau.
@@ -416,7 +469,7 @@ mvn test -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 | `RaftSimulationTest` | Cả cluster, mạng, đĩa, client và nemesis chạy trên một thread với thời gian ảo. Một seed luôn cho đúng một lịch sử, nên lỗi tìm ra thì chạy lại được y hệt. Có lượt 5 node, 7 node và một lượt dài nửa giờ ảo |
 | `RaftChaosTest` | Cùng kịch bản nhưng với thread và đồng hồ thật, để bắt lỗi tranh chấp giữa các thread. Seed ở đây không tái hiện chắc chắn |
 | `RaftClusterTest` | Test tất định cho từng hành vi và từng quy tắc an toàn, trên cluster in-memory |
-| `SocketRpcTest` | Transport socket: từng loại RPC, lời gọi đồng thời, nối lại, timeout, lọc deserialization, cluster qua socket thật |
+| `SocketRpcTest` | Transport socket: từng loại RPC, lời gọi đồng thời, nối lại, timeout, khung không hợp lệ, TLS, cluster qua socket thật |
 | `FileLogStorageTest` | Segment, cắt đầu/cắt đuôi, ghi dở, dữ liệu hỏng, segment sống lại sau mất điện |
 | `SnapshotStoreTest` | Trạng thái đĩa ở từng thời điểm crash trong lúc ghi snapshot, snapshot hỏng |
 | `ConfigurationEntryTest` | Phép tính quorum, kể cả cấu hình joint |
@@ -426,8 +479,8 @@ mvn test -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 - Mạng: mất request hoặc response, trễ, đảo thứ tự, request đến hai lần, gói tin kẹt rất lâu rồi mới tới, chia cắt mạng, cô lập đúng leader.
 - Node: tắt bình thường, mất điện (mọi thứ chưa fsync biến mất), bật lại, đồng hồ chạy lệch từ chậm 25% tới nhanh 30%.
 - Đĩa: thao tác ghi log, fsync, ghi meta và lưu snapshot thất bại ngẫu nhiên.
-- Vận hành: tạo snapshot, gỡ và thêm thành viên, kể cả gỡ leader.
-- Client: ghi liên tục và gửi lại khi không biết kết quả; đọc nhất quán liên tục từ bất kỳ node nào tự nhận là leader.
+- Vận hành: snapshot thủ công và tự động, snapshot gửi qua nhiều mẩu nhỏ, gỡ và thêm thành viên, kể cả gỡ leader.
+- Client: ghi liên tục và gửi lại khi không biết kết quả; đọc nhất quán liên tục từ một node bất kỳ, leader hay follower.
 
 ### Bất biến được kiểm tra
 
@@ -443,22 +496,21 @@ mvn test -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 ### Kiểm tra ngược
 
 Để biết test có thật sự bắt được lỗi, từng quy tắc an toàn đã được cố tình phá trong mã nguồn rồi chạy lại test
-(ví dụ: commit không cần quorum, bầu hai lần trong một term, trả lời trước khi fsync, đọc không xác nhận với đa số, bỏ chống trùng,
-bỏ kiểm tra checksum). Mỗi lỗi như vậy đều làm ít nhất một test fail. Những lỗi mà mô phỏng ngẫu nhiên khó chạm tới đều có test tất định riêng.
+(ví dụ: commit không cần quorum, bầu hai lần trong một term, trả lời trước khi fsync, đọc không xác nhận với đa số, đọc trên follower
+không chờ apply, bỏ chống trùng, bỏ kiểm tra checksum, TLS không đòi chứng chỉ của client). Mỗi lỗi như vậy đều làm ít nhất một test fail.
+Những lỗi mà mô phỏng ngẫu nhiên khó chạm tới đều có test tất định riêng.
 
 ## Giới hạn đã biết
 
 - **Chưa được kiểm chứng ở mức production.** Chưa có kiểm thử kiểu Jepsen trên nhiều máy thật, chưa chạy liên tục nhiều giờ dưới tải.
 - **Quy mô đã thử còn nhỏ:** 10.000 lệnh, cluster tối đa 7 node, nửa giờ thời gian ảo.
-- **Toàn bộ log chưa compact nằm trong bộ nhớ**, và snapshot không tự kích hoạt.
-- **Snapshot được gửi nguyên khối** trong một message, nên snapshot lớn sẽ nằm trọn trong RAM ở cả hai đầu.
-- **Transport socket** không có TLS, không xác thực, dùng Java serialization.
-- **Bảng chống trùng không được dọn**, và mỗi client chỉ được gửi một lệnh tại một thời điểm.
-- **Đọc nhất quán chỉ phục vụ được ở leader** và mỗi lần đọc cần một vòng heartbeat; không có lease read hay đọc từ follower.
-- **Thay đổi thành viên** mỗi lần chỉ một node; không có learner (node mới được tính vào quorum ngay khi cấu hình joint có hiệu lực,
-  trước khi nó bắt kịp log).
-- **State machine vẫn chạy `onApply` trong lock của node.**
-- **Không có metrics, backpressure hay giới hạn kích thước batch.** Thời hạn chờ của client cố định 5 giây.
+- **Entry chưa compact nằm trong bộ nhớ.** Snapshot tự động giới hạn được con số này, nhưng log không được đọc lại từ đĩa theo yêu cầu.
+- **State machine chạy `onApply` trong lock của node**, nên một lệnh apply chậm chặn cả node.
+- **Không có lease read:** mỗi lần đọc nhất quán cần một vòng heartbeat của leader. Đây là lựa chọn có chủ ý, vì lease read phụ thuộc đồng hồ.
+- **Bảng chống trùng không tự hết hạn** (phải gọi `closeClientSession`), và sequence của một client phải bắt đầu từ 1, tăng liền nhau.
+- **TLS không kiểm tra tên máy chủ** trong chứng chỉ; việc xác thực dựa hoàn toàn vào truststore. Các mẩu snapshot không có checksum riêng
+  khi truyền (chỉ dựa vào TCP/TLS), dù snapshot được kiểm tra CRC khi lưu và khi mở lại.
+- **Yêu cầu thay đổi thành viên đang chờ node mới bắt kịp bị mất khi leader đổi**, và không có cơ chế ép đổi cấu hình khi mất đa số.
+- **Metrics chỉ là một ảnh chụp trong tiến trình**, không có exporter.
 - **Mô phỏng mất điện** chỉ áp lên log và file meta; các thời điểm crash quanh snapshot được kiểm tra bằng test dựng lại trạng thái đĩa.
-- **Một quy tắc lệch khỏi Raft sách giáo khoa** (term học được từ response được ghi đĩa trễ, xem
-  [Các quy tắc về độ bền](#các-quy-tắc-về-độ-bền)) dựa trên lập luận và test, chưa có chứng minh hình thức.
+- **Tính đúng đắn dựa trên test và lập luận**, không có chứng minh hình thức hay model checking.

@@ -1,5 +1,8 @@
 package com.namnv.rpc.model.request;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.io.Serial;
 import java.io.Serializable;
 
@@ -11,7 +14,11 @@ public class PreVoteRequest implements Serializable {
     public final long lastLogIndex;
     public final long lastLogTerm;
 
-    public PreVoteRequest(long term, String candidateId, long lastLogIndex, long lastLogTerm) {
+    @JsonCreator
+    public PreVoteRequest(@JsonProperty("term") long term,
+            @JsonProperty("candidateId") String candidateId,
+            @JsonProperty("lastLogIndex") long lastLogIndex,
+            @JsonProperty("lastLogTerm") long lastLogTerm) {
         this.term = term;
         this.candidateId = candidateId;
         this.lastLogIndex = lastLogIndex;

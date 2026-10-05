@@ -3,6 +3,9 @@ package com.namnv.rpc.model.request;
 
 import com.namnv.entity.LogEntry;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.io.Serial;
 import java.io.Serializable;
 import java.util.List;
@@ -20,8 +23,13 @@ public class AppendEntriesRequest implements Serializable {
     public final long leaderCommit;
 
 
-    public AppendEntriesRequest(long term, String leaderId, long prevLogIndex, long prevLogTerm,
-                                List<LogEntry> entries, long leaderCommit) {
+    @JsonCreator
+    public AppendEntriesRequest(@JsonProperty("term") long term,
+            @JsonProperty("leaderId") String leaderId,
+            @JsonProperty("prevLogIndex") long prevLogIndex,
+            @JsonProperty("prevLogTerm") long prevLogTerm,
+            @JsonProperty("entries") List<LogEntry> entries,
+            @JsonProperty("leaderCommit") long leaderCommit) {
         this.term = term;
         this.leaderId = leaderId;
         this.prevLogIndex = prevLogIndex;
