@@ -83,3 +83,87 @@ Nếu muốn độ trễ đuôi ổn định trên đĩa thật thì cần ổ c
 này). Bạn có muốn mình tìm tiếp nguyên nhân của trần 78.000 TPS ở đường client không?
 
 ✻ Sautéed for 22m 58s · done 16:59
+
+Nếu muốn độ trễ đuôi ổn định trên đĩa thật thì cần ổ có fsync đều hơn (SSD có bảo vệ mất điện thường không có các đợt
+này). Bạn có muốn mình tìm tiếp nguyên nhân của trần 78.000 TPS ở đường client không?
+
+❯ có tìm tiếp
+
+Read 1 file, ran 3 shell commands
+
+Đã xác nhận được nguyên nhân: server đang ghi câu trả lời ra socket ngay trên thread vừa commit lệnh, tức là trong lúc
+giữ lock của node. Lượt thử đầu sau khi chuyển việc ghi đó sang thread riêng đạt khoảng 106.000 TPS (trước là khoảng
+71.000). Mình đang chờ hai lượt đo lặp lại chạy xong rồi sẽ hoàn thiện bản sửa và chạy lại test.
+
+✻ Churned for 11m 41s · done 17:13
+
+❯ fix đi
+
+Ran 2 shell commands
+
+● Background command "Compare three baseline runs with three runs where the server writes responses off the node's lock"
+completed (exit code 0)
+
+Ran 1 shell command
+
+Đã sửa: trần thông lượng của đường client qua mạng tăng từ khoảng 71.000 lên k, dữ liệu trên tmpfs), ổn định qua 3 lần
+chạy. Suite 105 test pass sau khi sửa;
+chưa commit gì.
+
+Nguyên nhân
+
+Khi một lệnh được apply, thread của Raft hoàn tất future của lệnh đó trong lúcr lại ghi câu trả lời ra socket ngay trong
+callback của future ấy, nên mỗi lần
+ghi mạng diễn ra trong lock, và cả node (nhận lệnh mới, xử lý response của fol
+
+Bản sửa: server ghi câu trả lời ở thread riêng, ngoài lock. Thay đổi nằm trong
+
+Kết quả
+
+512 client, lệnh 128 byte, ba tiến trình node và một tiến trình client, dữ liệa), mỗi cột 3 lần chạy:
+
+┌─────┬───────────────┬─────────────────┐
+│ │ Trước │ Sau │
+├─────┼───────────────┼─────────────────┤
+│ TPS │ 70.337–72.375 │ 105.740–105.918 │
+├─────┼───────────────┼─────────────────┤
+│ p50 │ 6,8–7,1 ms │ 4,4–4,5 ms │
+├─────┼───────────────┼─────────────────┤
+│ p99 │ 11,5–11,9 ms │ 9,1–10,4 ms │
+└─────┴───────────────┴─────────────────┘
+
+Trên đĩa thật, sau khi sửa (một lần chạy, 5 giây mỗi cấu hình):
+
+┌──────────────────┬──────────────────┬─────────┬─────────┬─────────┐
+│ Thao tác │ Client đồng thời │ TPS │ p50 │ p99 │
+├──────────────────┼──────────────────┼─────────┼─────────┼─────────┤
+│ Ghi 128 byte │ 1 │ 664 │ 1,3 ms │ 3,0 ms │
+├──────────────────┼──────────────────┼─────────┼─────────┼─────────┤
+│ Ghi 128 byte │ 32 │ 9.130 │ 3,4 ms │ 5,9 ms │
+├──────────────────┼──────────────────┼─────────┼─────────┼─────────┤
+│ Ghi 128 byte │ 512 │ 89.138 │ 5,3 ms │ 10,1 ms │
+├──────────────────┼──────────────────┼─────────┼─────────┼─────────┤
+│ Ghi 4 KB │ 512 │ 17.052 │ 28,8 ms │ 65,2 ms │
+├──────────────────┼──────────────────┼─────────┼─────────┼─────────┤
+│ Đọc qua leader │ 512 │ 383.120 │ 0,9 ms │ 3,2 ms │
+├──────────────────┼──────────────────┼─────────┼─────────┼─────────┤
+│ Đọc qua follower │ 512 │ 81.848 │ 6,5 ms │ 9,4 ms │
+└──────────────────┴──────────────────┴─────────┴─────────┴─────────┘
+
+So với các lần đo trước trên đĩa thật, ghi 128 byte ở 512 client tăng từ 54.00ọc qua leader từ 107.000 lên 383.000
+lần/giây. Lần chạy này không trúng đợt
+chậm nào của ổ đĩa, nên p99 10 ms ở đây là trường hợp thuận lợi.
+
+Cần biết
+
+- Cùng vấn đề vẫn tồn tại cho người dùng gọi trong tiến trình: future của appehoàn tất khi node đang giữ lock, nên
+  callback gắn vào bằng
+  thenApply/whenComplete chạy trong lock. Mình mới chỉ ghi chú điều này vào Ja cho việc nặng), chưa đổi RaftNode để tự
+  hoàn tất future ngoài lock.
+- Lệnh 4 KB ở 512 client vẫn kém: 17.000 TPS với p50 29 ms. Ở mức đó mỗi giây a log của mỗi node; mình chưa tìm xem giới
+  hạn là ổ đĩa, bước mã hoá JSON của
+  log hay thứ khác.
+- Đọc qua follower không tăng (khoảng 82.000 lần/giây): mỗi lần đọc cần một lư chưa được xem.
+- Một lỗi của chính benchmark đã được sửa: ở chế độ nhanh nó không tự thoát mà120 giây, nên các lượt đo lặp lại trước đó
+  mất nhiều thời gian hơn cần thiết.
+  Kết quả đo không bị ảnh hưởng.

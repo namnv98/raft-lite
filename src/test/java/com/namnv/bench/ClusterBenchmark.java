@@ -132,8 +132,10 @@ public class ClusterBenchmark {
             }
             System.out.println("dòng ERROR/Exception trong log của ba node: " + problems);
             deleteRecursively(dataDir);
+            System.out.flush();
+            // các thread nền của benchmark không tự dừng
+            Runtime.getRuntime().halt(0);
         }
-        System.exit(0);
     }
 
     // node nào trả lời lần đọc nhanh nhất mà không cần hỏi ai chính là leader; ở đây chỉ cần biết một node không phải leader,

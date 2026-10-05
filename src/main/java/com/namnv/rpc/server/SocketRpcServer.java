@@ -175,13 +175,15 @@ public class SocketRpcServer {
                     pending = clientService.handleClientRead(read);
                 }
                 if (pending != null) {
-                    pending.whenComplete((response, error) -> {
+                    // Async: future này được hoàn tất bởi thread của Raft ngay lúc lệnh được apply, khi nó còn đang giữ
+                    // lock của node. Ghi response ra socket ngay tại đó sẽ bắt cả node chờ từng lần ghi mạng.
+                    pending.whenCompleteAsync((response, error) -> {
                         if (error == null) {
                             respond(frame.requestId(), response);
                         } else {
                             close();
                         }
-                    });
+                    }, executor);
                 } else {
                     respond(frame.requestId(), handleCommandRequest(frame.message()));
                 }

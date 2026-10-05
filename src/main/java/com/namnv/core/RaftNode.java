@@ -233,6 +233,10 @@ public class RaftNode implements RaftServerService {
      * khi không biết kết quả (false, timeout) thì gửi lại đúng (clientId, sequence) đó, ở bất kỳ leader nào.
      * Lệnh được apply nhiều nhất một lần dù được gửi bao nhiêu lần.
      * Client có thể gửi nhiều lệnh cùng lúc mà không cần chờ lệnh trước.
+     * <p>
+     * Future được hoàn tất bởi thread của Raft khi nó đang giữ lock của node. Việc gắn vào future bằng
+     * {@code thenApply}/{@code whenComplete} vì thế phải thật nhẹ; việc nặng hơn (ghi mạng, ghi đĩa) nên dùng các
+     * biến thể {@code ...Async} để chạy ở thread khác.
      */
     public CompletableFuture<Boolean> appendClientCommand(String clientId, long sequence, byte[] command) {
         lock.lock();
