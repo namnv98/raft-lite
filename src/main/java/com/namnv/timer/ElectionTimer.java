@@ -1,21 +1,17 @@
 package com.namnv.timer;
 
 
-import java.util.Random;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import com.namnv.core.RaftRuntime;
 
 public class ElectionTimer {
-    private final ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor();
+    private final RaftRuntime runtime;
     private final int minTimeoutMs;
     private final int maxTimeoutMs;
     private final Runnable onTimeout;
-    private final Random rand = new Random();
-    private ScheduledFuture<?> current;
+    private RaftRuntime.ScheduledTask current;
 
-    public ElectionTimer(int minTimeoutMs, int maxTimeoutMs, Runnable onTimeout) {
+    public ElectionTimer(RaftRuntime runtime, int minTimeoutMs, int maxTimeoutMs, Runnable onTimeout) {
+        this.runtime = runtime;
         this.minTimeoutMs = minTimeoutMs;
         this.maxTimeoutMs = maxTimeoutMs;
         this.onTimeout = onTimeout;
@@ -26,19 +22,13 @@ public class ElectionTimer {
     }
 
     public synchronized void reset() {
-        if (exec.isShutdown()) return;
-        // không interrupt: callback có thể đang ghi đĩa
-        if (current != null) current.cancel(false);
-        int timeout = minTimeoutMs + rand.nextInt(maxTimeoutMs - minTimeoutMs + 1);
-        current = exec.schedule(onTimeout, timeout, TimeUnit.MILLISECONDS);
+        if (current != null) current.cancel();
+        int timeout = minTimeoutMs + runtime.nextInt(maxTimeoutMs - minTimeoutMs + 1);
+        current = runtime.schedule(onTimeout, timeout);
     }
 
     public synchronized void stop() {
-        if (current != null) current.cancel(false);
-    }
-
-    public synchronized void shutdown() {
-        exec.shutdownNow();
+        if (current != null) current.cancel();
     }
 
 }

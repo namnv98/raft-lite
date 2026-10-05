@@ -1,13 +1,25 @@
 package com.namnv.core;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.namnv.ListStateMachine;
 import com.namnv.config.NodeOptions;
 import com.namnv.config.RaftConfig;
+import com.namnv.entity.ConfigurationEntry;
 import com.namnv.entity.LogEntry;
+import com.namnv.storage.Checksum;
+import com.namnv.storage.DiskFaultInjector;
+import com.namnv.rpc.RaftServerService;
 import com.namnv.rpc.client.InMemoryRpcClient;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
+import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
+import com.namnv.rpc.model.request.RequestVoteRequest;
 import com.namnv.rpc.model.request.TimeoutNowRequest;
+import com.namnv.rpc.model.response.AppendEntriesResponse;
+import com.namnv.rpc.model.response.InstallSnapshotResponse;
+import com.namnv.rpc.model.response.PreVoteResponse;
+import com.namnv.rpc.model.response.RequestVoteResponse;
 import com.namnv.rpc.model.response.TimeoutNowResponse;
 import com.namnv.statemachine.snapshot.SnapshotReader;
 import org.junit.jupiter.api.AfterEach;
@@ -23,11 +35,15 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -35,6 +51,7 @@ import java.util.function.Supplier;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -49,6 +66,31 @@ class RaftClusterTest {
     static class TestRpc extends InMemoryRpcClient {
         final Set<String> timeoutNowBlocked = ConcurrentHashMap.newKeySet();
         final List<String> timeoutNowCalls = new CopyOnWriteArrayList<>();
+        // gọi ngay trước khi một RequestVote rời khỏi candidate
+        volatile Consumer<RequestVoteRequest> onRequestVote = req -> {
+        };
+
+        @Override
+        public CompletableFuture<RequestVoteResponse> requestVote(String target, RequestVoteRequest req) {
+            onRequestVote.accept(req);
+            return super.requestVote(target, req);
+        }
+
+        // response của AppendEntries do leader này gửi bị giữ lại (request vẫn tới nơi) cho tới khi heldResponses hoàn tất
+        volatile String holdResponsesTo;
+        volatile CompletableFuture<Void> heldResponses;
+        final AtomicInteger held = new AtomicInteger();
+
+        @Override
+        public CompletableFuture<AppendEntriesResponse> appendEntries(String target, AppendEntriesRequest req) {
+            var response = super.appendEntries(target, req);
+            var gate = heldResponses;
+            if (gate != null && req.leaderId.equals(holdResponsesTo)) {
+                held.incrementAndGet();
+                return response.thenCombine(gate, (resp, released) -> resp);
+            }
+            return response;
+        }
 
         @Override
         public CompletableFuture<TimeoutNowResponse> timeoutNow(String target, TimeoutNowRequest req) {
@@ -73,7 +115,74 @@ class RaftClusterTest {
         }
     }
 
+    // runtime thật nhưng có thể giữ lại mọi thao tác ghi đĩa của node
+    static class PausableRuntime extends ThreadedRuntime {
+        private final Queue<Runnable> held = new ConcurrentLinkedQueue<>();
+        private volatile boolean paused;
+        // true: mọi timer của node (heartbeat, election, timeout) bị bỏ qua, node đứng im ở trạng thái hiện tại
+        volatile boolean timersFrozen;
+
+        @Override
+        public ScheduledTask schedule(Runnable task, long delayMs) {
+            return super.schedule(() -> {
+                if (!timersFrozen) {
+                    task.run();
+                }
+            }, delayMs);
+        }
+
+        @Override
+        public void executeIo(Runnable task) {
+            if (paused) {
+                held.add(task);
+            } else {
+                super.executeIo(task);
+            }
+        }
+
+        void pauseIo() {
+            paused = true;
+        }
+
+        void resumeIo() {
+            paused = false;
+            for (Runnable task = held.poll(); task != null; task = held.poll()) {
+                super.executeIo(task);
+            }
+        }
+    }
+
+    // peer giả: luôn bỏ phiếu thuận và không bao giờ nhận log
+    static class StubPeer implements RaftServerService {
+        @Override
+        public RequestVoteResponse handleRequestVoteRequest(RequestVoteRequest req) {
+            return new RequestVoteResponse(req.term, true);
+        }
+
+        @Override
+        public AppendEntriesResponse handleAppendEntriesRequest(AppendEntriesRequest req) {
+            return new AppendEntriesResponse(req.term, false, 0);
+        }
+
+        @Override
+        public PreVoteResponse handlePreVoteRequest(PreVoteRequest req) {
+            return new PreVoteResponse(req.term, true);
+        }
+
+        @Override
+        public InstallSnapshotResponse handleInstallSnapshotRequest(InstallSnapshotRequest req) {
+            return new InstallSnapshotResponse(req.getTerm(), false);
+        }
+
+        @Override
+        public TimeoutNowResponse handleTimeoutNowRequest(TimeoutNowRequest req) {
+            return new TimeoutNowResponse(req.term, false);
+        }
+    }
+
     private TestRpc rpc;
+    private final Map<String, PausableRuntime> runtimes = new HashMap<>();
+    private DiskFaultInjector diskFaults = DiskFaultInjector.NONE;
     private Supplier<ListStateMachine> machineFactory = ListStateMachine::new;
     private boolean shutdownOnRemoved = true;
     private int departingTimeoutMs = 10_000;
@@ -95,6 +204,8 @@ class RaftClusterTest {
 
     private RaftNode startNode(String id, List<String> peers) {
         var machine = machineFactory.get();
+        var runtime = new PausableRuntime();
+        runtimes.put(id, runtime);
         var folder = dataDir.resolve(id).toString();
         var options = NodeOptions.builder()
                 .raftMetaUri(folder)
@@ -106,6 +217,8 @@ class RaftClusterTest {
                 .shutdownOnRemoved(shutdownOnRemoved)
                 .departingTimeoutMs(departingTimeoutMs)
                 .stateMachine(machine)
+                .runtime(runtime)
+                .diskFaults(diskFaults)
                 .raftConfig(RaftConfig.builder().self(id).peers(peers).build())
                 .build();
         var node = new RaftNode(options, rpc);
@@ -186,7 +299,7 @@ class RaftClusterTest {
     // leader đã commit được entry của chính term mình: từ lúc này node tụt hậu không thể giành quyền nữa,
     // khác với leader vừa đắc cử còn có thể bị một candidate trùng thời điểm thay thế
     private static boolean isEstablishedLeader(RaftNode node) {
-        if (node.getState() != RaftNode.NodeState.LEADER) {
+        if (node.getState() != NodeState.LEADER) {
             return false;
         }
         var log = node.getPersistent().getLogStore();
@@ -257,7 +370,7 @@ class RaftClusterTest {
         for (String id : List.of("A", "B", "C")) {
             awaitStore(id, List.of("1", "2", "3", "4", "5"));
         }
-        assertEquals(1, nodes.values().stream().filter(n -> n.getState() == RaftNode.NodeState.LEADER).count());
+        assertEquals(1, nodes.values().stream().filter(n -> n.getState() == NodeState.LEADER).count());
     }
 
     @Test
@@ -311,7 +424,7 @@ class RaftClusterTest {
         isolate(oldLeader.getNodeId());
         var newLeader = awaitLeader(oldLeader.getNodeId());
         assertNotEquals(oldLeader.getNodeId(), newLeader.getNodeId());
-        await("old leader to step down", () -> oldLeader.getState() != RaftNode.NodeState.LEADER);
+        await("old leader to step down", () -> oldLeader.getState() != NodeState.LEADER);
 
         write(newLeader, "2");
         connect(oldLeader.getNodeId());
@@ -484,8 +597,8 @@ class RaftClusterTest {
         // leader cũ trao quyền xong thì tự tắt, cluster còn lại không bị gián đoạn
         await("old leader to shut itself down", oldLeader::isStopped);
         TimeUnit.MILLISECONDS.sleep(1000);
-        assertNotEquals(RaftNode.NodeState.LEADER, oldLeader.getState());
-        assertEquals(RaftNode.NodeState.LEADER, newLeader.getState());
+        assertNotEquals(NodeState.LEADER, oldLeader.getState());
+        assertEquals(NodeState.LEADER, newLeader.getState());
     }
 
     @Test
@@ -521,7 +634,7 @@ class RaftClusterTest {
         assertFalse(follower.handleTimeoutNowRequest(new TimeoutNowRequest(0, "L")).success);
 
         assertTrue(follower.handleTimeoutNowRequest(new TimeoutNowRequest(1, "L")).success);
-        assertEquals(RaftNode.NodeState.CANDIDATE, follower.getState());
+        assertEquals(NodeState.CANDIDATE, follower.getState());
         assertEquals(2, follower.getPersistent().getCurrentTerm());
     }
 
@@ -580,7 +693,7 @@ class RaftClusterTest {
         assertEquals(Set.of(removed), departing(leader));
 
         await("leader to give up on the removed node", () -> departing(leader).isEmpty());
-        assertEquals(RaftNode.NodeState.LEADER, leader.getState());
+        assertEquals(NodeState.LEADER, leader.getState());
         assertFalse(nodes.get(removed).isStopped());
     }
 
@@ -598,8 +711,8 @@ class RaftClusterTest {
 
         TimeUnit.MILLISECONDS.sleep(700);
         assertFalse(nodes.get(removed).isStopped());
-        assertEquals(RaftNode.NodeState.FOLLOWER, nodes.get(removed).getState());
-        assertEquals(RaftNode.NodeState.LEADER, leader.getState());
+        assertEquals(NodeState.FOLLOWER, nodes.get(removed).getState());
+        assertEquals(NodeState.LEADER, leader.getState());
     }
 
     @Test
@@ -632,5 +745,432 @@ class RaftClusterTest {
         stopNode(lagging);
         startNode(lagging, List.of("A", "B", "C"));
         awaitStore(lagging, List.of("1", "2", "3", "4"));
+    }
+
+    // ---------- durability: mọi thứ node hứa với node khác phải nằm trên đĩa trước khi lời hứa được gửi đi ----------
+
+    private JsonNode metaOnDisk(String id) {
+        try {
+            var file = dataDir.resolve(id).resolve("raft_meta.json");
+            return new ObjectMapper().readTree(Checksum.unwrap(Files.readAllBytes(file), file.toString()));
+        } catch (IOException e) {
+            return fail(e);
+        }
+    }
+
+    @Test
+    void voteIsOnDiskBeforeItIsGranted() {
+        var follower = startNode("B", List.of("L", "B", "C"));
+
+        assertTrue(follower.handleRequestVoteRequest(new RequestVoteRequest(5, "C", 0, 0)).voteGranted);
+
+        var meta = metaOnDisk("B");
+        assertEquals(5, meta.get("currentTerm").asLong());
+        assertEquals("C", meta.get("votedFor").asText());
+    }
+
+    @Test
+    void entriesAreOnDiskBeforeTheyAreAcknowledged() {
+        var follower = startNode("B", List.of("L", "B"));
+
+        var response = follower.handleAppendEntriesRequest(
+                new AppendEntriesRequest(1, "L", 0, 0, List.of(entry(1, 1), entry(2, 1), entry(3, 1)), 0));
+
+        assertEquals(3, response.matchIndex);
+        assertEquals(3, follower.getPersistent().getLogStore().durableIndex());
+        assertEquals(1, metaOnDisk("B").get("currentTerm").asLong());
+    }
+
+    @Test
+    void candidateSelfVoteIsOnDiskBeforeVotesAreRequested() {
+        var metaWhenAsked = new CopyOnWriteArrayList<JsonNode>();
+        rpc.onRequestVote = req -> metaWhenAsked.add(metaOnDisk(req.candidateId));
+        var follower = startNode("B", List.of("L", "B", "C"));
+        follower.handleAppendEntriesRequest(new AppendEntriesRequest(1, "L", 0, 0, List.of(), 0));
+
+        assertTrue(follower.handleTimeoutNowRequest(new TimeoutNowRequest(1, "L")).success);
+
+        await("vote requests to be sent", () -> metaWhenAsked.size() == 2);
+        for (JsonNode meta : metaWhenAsked) {
+            assertEquals(2, meta.get("currentTerm").asLong());
+            assertEquals("B", meta.get("votedFor").asText());
+        }
+    }
+
+    private long matchIndex(RaftNode leader, String peer) {
+        leader.getLock().lock();
+        try {
+            var leaderState = leader.getLeaderState();
+            return leaderState == null ? 0 : leaderState.getMatchIndex().getOrDefault(peer, 0L);
+        } finally {
+            leader.getLock().unlock();
+        }
+    }
+
+    private void setMatchIndex(RaftNode leader, String peer, long index) {
+        leader.getLock().lock();
+        try {
+            leader.getLeaderState().getMatchIndex().put(peer, index);
+        } finally {
+            leader.getLock().unlock();
+        }
+    }
+
+    @Test
+    void leaderDoesNotCountItselfBeforeItsLogIsOnDisk() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        write(leader, "1");
+        var followers = others(leader.getNodeId());
+
+        // chỉ còn leader và một follower: quorum buộc phải tính cả leader
+        isolate(followers.get(1));
+        runtimes.get(leader.getNodeId()).pauseIo();
+        var future = leader.appendClientCommand("2".getBytes(StandardCharsets.UTF_8));
+        var index = leader.getPersistent().getLogStore().lastIndex();
+        await("follower to store the entry", () -> matchIndex(leader, followers.get(0)) >= index);
+
+        // follower đã có entry trên đĩa, nhưng leader chưa fsync nên chưa được commit
+        TimeUnit.MILLISECONDS.sleep(300);
+        assertFalse(future.isDone());
+        assertTrue(leader.getVolatileState().getCommitIndex() < index);
+
+        runtimes.get(leader.getNodeId()).resumeIo();
+        assertTrue(future.get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void oldTermEntryIsNotCommittedByCountingReplicas() throws Exception {
+        // B và C là peer giả: bầu cho A nhưng không nhận log, để test tự đặt matchIndex
+        for (String id : List.of("A", "B", "C")) {
+            connect(id);
+        }
+        rpc.register("B", new StubPeer());
+        rpc.register("C", new StubPeer());
+        var node = startNode("A", List.of("A", "B", "C"));
+
+        // A nhận một entry của term 1 (chưa commit), rồi thành leader của term 2
+        node.handleAppendEntriesRequest(new AppendEntriesRequest(1, "B", 0, 0, List.of(entry(1, 1)), 0));
+        assertTrue(node.handleTimeoutNowRequest(new TimeoutNowRequest(1, "B")).success);
+        await("A to become leader", () -> node.getState() == NodeState.LEADER);
+        assertEquals(2, node.getPersistent().getCurrentTerm());
+
+        // như thể B đã có entry của term 1 nhưng chưa có entry nào của term 2: đủ quorum cho index 1
+        setMatchIndex(node, "B", 1);
+        node.appendClientCommand("y".getBytes(StandardCharsets.UTF_8)); // buộc leader tính lại commit index
+        var log = node.getPersistent().getLogStore();
+        await("leader log to be on disk", () -> log.durableIndex() == log.lastIndex());
+        TimeUnit.MILLISECONDS.sleep(300);
+        assertEquals(0, node.getVolatileState().getCommitIndex());
+        assertEquals(List.of(), machines.get("A").getStore());
+
+        // khi một entry của term 2 đạt quorum thì entry cũ được commit theo
+        setMatchIndex(node, "B", log.lastIndex());
+        node.appendClientCommand("z".getBytes(StandardCharsets.UTF_8));
+        awaitStore("A", List.of("cmd1", "y"));
+    }
+
+    @Test
+    void configurationRollsBackWhenItsEntryIsTruncated() {
+        var follower = startNode("B", List.of("L", "B", "C"));
+        var joint = new ConfigurationEntry(List.of("L", "B", "C"), List.of("L", "B", "C", "D"), true);
+
+        // cấu hình có hiệu lực ngay khi entry vào log, dù chưa commit
+        follower.handleAppendEntriesRequest(new AppendEntriesRequest(1, "L", 0, 0,
+                List.of(entry(1, 1), LogEntry.newConfigurationEntry(2, 1, joint)), 0));
+        assertTrue(follower.getConf().isJoint());
+        assertTrue(follower.getConf().contains("D"));
+
+        // leader mới ghi đè entry đó: cấu hình phải quay về bản trước
+        follower.handleAppendEntriesRequest(new AppendEntriesRequest(2, "C", 1, 1, List.of(entry(2, 2)), 0));
+        assertFalse(follower.getConf().isJoint());
+        assertEquals(List.of("L", "B", "C"), follower.getConf().getOldNodes());
+        assertFalse(follower.getConf().contains("D"));
+    }
+
+    @Test
+    void secondConfigurationChangeIsRejectedWhileOneIsInProgress() {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var follower = others(leader.getNodeId()).get(0);
+
+        // giữ lock để thay đổi thứ nhất chưa thể commit trước khi thử thay đổi thứ hai
+        leader.getLock().lock();
+        try {
+            assertTrue(leader.onJoinPeerCluster("D"));
+            assertFalse(leader.onLeavePeerCluster(follower));
+            assertFalse(leader.onJoinPeerCluster("E"));
+        } finally {
+            leader.getLock().unlock();
+        }
+    }
+
+    @Test
+    void leaderStepsDownWhenItCannotWriteItsNoOp() {
+        var failNextAppend = new boolean[1];
+        diskFaults = operation -> {
+            if (failNextAppend[0] && operation.equals("log.append")) {
+                failNextAppend[0] = false;
+                throw new IOException("injected failure of " + operation);
+            }
+        };
+        for (String id : List.of("A", "B", "C")) {
+            connect(id);
+        }
+        rpc.register("B", new StubPeer());
+        rpc.register("C", new StubPeer());
+        var node = startNode("A", List.of("A", "B", "C"));
+        node.handleAppendEntriesRequest(new AppendEntriesRequest(1, "B", 0, 0, List.of(), 0));
+
+        // thắng cử ở term 2 nhưng không ghi được no-op: không được kẹt ở trạng thái leader mà không gửi heartbeat
+        failNextAppend[0] = true;
+        assertTrue(node.handleTimeoutNowRequest(new TimeoutNowRequest(1, "B")).success);
+        await("the failed leader to step down", () -> !failNextAppend[0] && node.getState() == NodeState.FOLLOWER);
+        assertEquals(0, node.getPersistent().getLogStore().lastIndex());
+
+        // đĩa hoạt động lại thì bầu lại và làm leader bình thường
+        await("node to be elected again", () -> node.getState() == NodeState.LEADER);
+        assertTrue(node.getPersistent().getCurrentTerm() > 2);
+        assertEquals(1, node.getPersistent().getLogStore().lastIndex());
+    }
+
+    @Test
+    void nodeWithCorruptedLogRefusesToStartAndClusterCarriesOn() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        write(leader, "1", "2", "3");
+        var broken = others(leader.getNodeId()).get(0);
+        awaitStore(broken, List.of("1", "2", "3"));
+        stopNode(broken);
+
+        // một bit hỏng giữa log của node đang tắt
+        var segment = dataDir.resolve(broken).resolve("log_1.jsonl");
+        var data = Files.readAllBytes(segment);
+        data[30] ^= 0x01;
+        Files.write(segment, data);
+
+        assertThrows(Exception.class, () -> startNode(broken, List.of("A", "B", "C")));
+        runtimes.get(broken).shutdown();
+
+        // hai node còn lại vẫn là đa số
+        write(awaitLeader(), "4");
+        for (String id : others(broken)) {
+            awaitStore(id, List.of("1", "2", "3", "4"));
+        }
+    }
+
+    @Test
+    void replicatesTenThousandCommandsAndCatchesUpFromSnapshot() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var lagging = others(leader.getNodeId()).get(0);
+        stopNode(lagging);
+
+        // gửi dồn dập không chờ từng lệnh: leader phải gom lại và commit kịp trong thời hạn của client
+        var expected = new ArrayList<String>();
+        var pending = new ArrayList<CompletableFuture<Boolean>>();
+        for (int i = 0; i < 10_000; i++) {
+            expected.add("k" + i);
+            pending.add(leader.appendClientCommand(("k" + i).getBytes(StandardCharsets.UTF_8)));
+        }
+        for (var future : pending) {
+            assertTrue(future.get(30, TimeUnit.SECONDS));
+        }
+        snapshot(leader);
+
+        // node tụt lại 10.000 lệnh nhận snapshot rồi bắt kịp phần còn lại
+        expected.add("last");
+        write(leader, "last");
+        startNode(lagging, List.of("A", "B", "C"));
+        for (String id : List.of("A", "B", "C")) {
+            await("store of " + id + " to hold " + expected.size() + " commands",
+                    () -> machines.get(id).getStore().equals(expected));
+        }
+        assertTrue(nodes.get(lagging).getPersistent().getLogStore().getBaseIndex() >= 10_000);
+    }
+
+    @Test
+    void nodeWithCorruptedMetaRefusesToStart() throws Exception {
+        startCluster("A");
+        write(awaitLeader(), "1");
+        stopNode("A");
+
+        // term hoặc phiếu bầu bị đổi âm thầm còn nguy hiểm hơn mất hẳn: node có thể bỏ phiếu hai lần
+        var meta = dataDir.resolve("A").resolve("raft_meta.json");
+        var text = Files.readString(meta);
+        assertTrue(text.contains("\"currentTerm\" : 1"));
+        Files.writeString(meta, text.replace("\"currentTerm\" : 1", "\"currentTerm\" : 0"));
+
+        assertThrows(Exception.class, () -> startNode("A", List.of("A")));
+        runtimes.get("A").shutdown();
+    }
+
+    // ---------- chống ghi trùng ----------
+
+    private CompletableFuture<Boolean> send(RaftNode node, String clientId, long sequence, String command) {
+        return node.appendClientCommand(clientId, sequence, command.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private Map<String, Long> sessions(RaftNode node) {
+        node.getLock().lock();
+        try {
+            return Map.copyOf(node.getSessions());
+        } finally {
+            node.getLock().unlock();
+        }
+    }
+
+    @Test
+    void retriedCommandIsAppliedOnce() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+
+        // gửi lại sau khi đã có kết quả, và gửi hai lần liền nhau khi lần đầu còn chưa commit
+        assertTrue(send(leader, "client-1", 1, "x").get(5, TimeUnit.SECONDS));
+        assertTrue(send(leader, "client-1", 1, "x").get(5, TimeUnit.SECONDS));
+        var first = send(leader, "client-1", 2, "y");
+        var second = send(leader, "client-1", 2, "y");
+        assertTrue(first.get(5, TimeUnit.SECONDS));
+        assertTrue(second.get(5, TimeUnit.SECONDS));
+
+        // client khác dùng lại cùng sequence thì không liên quan
+        assertTrue(send(leader, "client-2", 1, "z").get(5, TimeUnit.SECONDS));
+        // lần gửi lại rất muộn của một lệnh cũ cũng bị bỏ qua
+        assertTrue(send(leader, "client-1", 1, "x").get(5, TimeUnit.SECONDS));
+        write(leader, "end");
+
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, List.of("x", "y", "z", "end"));
+        }
+    }
+
+    @Test
+    void retryAfterLeaderChangeIsAppliedOnce() throws Exception {
+        startCluster("A", "B", "C");
+        var oldLeader = awaitLeader();
+        assertTrue(send(oldLeader, "client-1", 1, "x").get(5, TimeUnit.SECONDS));
+
+        // client không nhận được kết quả và gửi lại cho leader mới
+        isolate(oldLeader.getNodeId());
+        var newLeader = awaitLeader(oldLeader.getNodeId());
+        assertTrue(send(newLeader, "client-1", 1, "x").get(5, TimeUnit.SECONDS));
+        assertTrue(send(newLeader, "client-1", 2, "y").get(5, TimeUnit.SECONDS));
+        connect(oldLeader.getNodeId());
+
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, List.of("x", "y"));
+        }
+    }
+
+    @Test
+    void deduplicationSurvivesSnapshotRestartAndInstallSnapshot() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var lagging = others(leader.getNodeId()).get(0);
+        isolate(lagging);
+        assertTrue(send(leader, "client-1", 1, "x").get(5, TimeUnit.SECONDS));
+        assertTrue(send(leader, "client-1", 2, "y").get(5, TimeUnit.SECONDS));
+        snapshot(leader);
+        write(leader, "after");
+
+        // node tụt lại nhận bảng sessions qua InstallSnapshot
+        connect(lagging);
+        awaitStore(lagging, List.of("x", "y", "after"));
+        assertEquals(Map.of("client-1", 2L), sessions(nodes.get(lagging)));
+
+        // sau khi cả cluster restart, bảng được dựng lại từ snapshot nên lệnh gửi lại vẫn bị nhận ra
+        for (String id : List.of("A", "B", "C")) {
+            stopNode(id);
+        }
+        for (String id : List.of("A", "B", "C")) {
+            startNode(id, List.of("A", "B", "C"));
+        }
+        var newLeader = awaitLeader();
+        assertTrue(send(newLeader, "client-1", 2, "y").get(5, TimeUnit.SECONDS));
+        assertTrue(send(newLeader, "client-1", 3, "w").get(5, TimeUnit.SECONDS));
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, List.of("x", "y", "after", "w"));
+        }
+    }
+
+    // ---------- đọc nhất quán ----------
+
+    @Test
+    void readSeesEveryAcknowledgedWrite() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var machine = machines.get(leader.getNodeId());
+
+        for (int i = 0; i < 50; i++) {
+            write(leader, "w" + i);
+            // lệnh vừa được xác nhận phải có trong lần đọc ngay sau đó
+            assertEquals(i + 1, leader.read(machine::getStore).get(5, TimeUnit.SECONDS).size());
+        }
+    }
+
+    @Test
+    void singleNodeClusterServesReads() throws Exception {
+        startCluster("A");
+        var leader = awaitLeader();
+        write(leader, "1");
+        assertEquals(List.of("1"), leader.read(machines.get("A")::getStore).get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void followerRejectsReads() {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var follower = nodes.get(others(leader.getNodeId()).get(0));
+        await("follower to learn the leader", () -> leader.getNodeId().equals(follower.getLeaderId()));
+
+        var failure = assertThrows(ExecutionException.class,
+                () -> follower.read(machines.get(follower.getNodeId())::getStore).get(5, TimeUnit.SECONDS));
+        var notLeader = (NotLeaderException) failure.getCause();
+        assertEquals(leader.getNodeId(), notLeader.getLeaderId());
+    }
+
+    @Test
+    void isolatedLeaderCannotServeStaleRead() throws Exception {
+        startCluster("A", "B", "C");
+        var oldLeader = awaitLeader();
+        write(oldLeader, "1");
+
+        // leader cũ vẫn tưởng mình là leader trong một lúc, nhưng không còn xác nhận được với đa số
+        isolate(oldLeader.getNodeId());
+        var staleRead = oldLeader.read(machines.get(oldLeader.getNodeId())::getStore);
+        var newLeader = awaitLeader(oldLeader.getNodeId());
+        write(newLeader, "2");
+
+        // nếu trả lời, nó sẽ trả về dữ liệu thiếu lệnh "2" đã được xác nhận
+        var failure = assertThrows(ExecutionException.class, () -> staleRead.get(10, TimeUnit.SECONDS));
+        assertTrue(failure.getCause() instanceof NotLeaderException);
+        assertEquals(List.of("1", "2"),
+                newLeader.read(machines.get(newLeader.getNodeId())::getStore).get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void readIsNotConfirmedByResponsesToEarlierHeartbeats() throws Exception {
+        startCluster("A", "B", "C");
+        var oldLeader = awaitLeader();
+        var id = oldLeader.getNodeId();
+        write(oldLeader, "1");
+
+        // giữ lại response của một vòng heartbeat, rồi đóng băng và cô lập leader: nó sẽ không tự step-down
+        rpc.holdResponsesTo = id;
+        rpc.heldResponses = new CompletableFuture<>();
+        await("a heartbeat to each follower to be in flight", () -> rpc.held.get() >= 2);
+        runtimes.get(id).timersFrozen = true;
+        isolate(id);
+
+        // yêu cầu đọc đến SAU khi các heartbeat đó được gửi đi
+        var staleRead = oldLeader.read(machines.get(id)::getStore);
+        var newLeader = awaitLeader(id);
+        write(newLeader, "2");
+
+        // response cũ về tới nơi: chúng chỉ chứng minh node này là leader trước khi có yêu cầu đọc, không phải sau
+        rpc.heldResponses.complete(null);
+        TimeUnit.MILLISECONDS.sleep(500);
+        assertFalse(staleRead.isDone() && !staleRead.isCompletedExceptionally(),
+                "an isolated leader answered a read with stale data");
     }
 }

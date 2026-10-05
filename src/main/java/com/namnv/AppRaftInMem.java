@@ -2,6 +2,7 @@ package com.namnv;
 
 import com.namnv.config.NodeOptions;
 import com.namnv.config.RaftConfig;
+import com.namnv.core.NodeState;
 import com.namnv.core.RaftNode;
 import com.namnv.rpc.client.InMemoryRpcClient;
 import lombok.extern.slf4j.Slf4j;
@@ -102,7 +103,7 @@ public class AppRaftInMem {
         long deadline = System.currentTimeMillis() + 10_000;
         while (System.currentTimeMillis() < deadline) {
             for (RaftNode n : clusters) {
-                if (n.getState() == RaftNode.NodeState.LEADER) {
+                if (n.getState() == NodeState.LEADER) {
                     return n;
                 }
             }

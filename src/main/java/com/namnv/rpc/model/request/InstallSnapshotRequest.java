@@ -19,4 +19,5 @@ public class InstallSnapshotRequest implements Serializable {
     private long lastIncludedTerm;    // snapshot lastIncludedTerm
     private ConfigurationEntry conf;  // cluster config tại lastIncludedIndex
     private Map<String, byte[]> files; // tên file snapshot -> nội dung
+    private Map<String, Long> sessions; // clientId -> sequence lớn nhất đã apply tại lastIncludedIndex
 }

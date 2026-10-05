@@ -1,7 +1,9 @@
 package com.namnv.config;
 
 
+import com.namnv.core.RaftRuntime;
 import com.namnv.statemachine.StateMachine;
+import com.namnv.storage.DiskFaultInjector;
 import lombok.Builder;
 import lombok.Data;
 
@@ -14,6 +16,13 @@ public class NodeOptions {
     private String snapshotUri;
 
     private RaftConfig raftConfig;
+
+    // null: dùng ThreadedRuntime (thread và đồng hồ thật)
+    private RaftRuntime runtime;
+
+    // chỉ dùng trong test để giả lập lỗi ghi đĩa
+    @Builder.Default
+    private DiskFaultInjector diskFaults = DiskFaultInjector.NONE;
 
     private int electionTimeoutMinMs;
     private int electionTimeoutMaxMs;

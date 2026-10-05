@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.namnv.config.NodeOptions;
 import com.namnv.entity.ConfigurationEntry;
+import com.namnv.storage.Checksum;
+import com.namnv.storage.DiskFaultInjector;
 import com.namnv.storage.FileLogStorage;
 import com.namnv.storage.FileUtil;
 import com.namnv.storage.LogStorage;
@@ -15,6 +17,7 @@ import lombok.SneakyThrows;
 import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -39,6 +42,7 @@ public class PersistentState {
     @Getter
     private final LogStorage logStore;
     private final File stateFile;
+    private final DiskFaultInjector faults;
 
     private final ObjectMapper objectMapper = new ObjectMapper()
             .enable(SerializationFeature.INDENT_OUTPUT)
@@ -52,7 +56,8 @@ public class PersistentState {
         }
         this.stateFile = new File(folder, "raft_meta.json");
         load();
-        this.snapshotStore = new SnapshotStore(nodeOptions.getSnapshotUri());
+        this.faults = nodeOptions.getDiskFaults();
+        this.snapshotStore = new SnapshotStore(nodeOptions.getSnapshotUri(), faults);
         this.logStore = new FileLogStorage(nodeOptions, getLastSnapshotIndex(), getLastSnapshotTerm());
     }
 
@@ -60,7 +65,8 @@ public class PersistentState {
         if (stateFile.length() == 0) {
             return;
         }
-        var data = objectMapper.readValue(stateFile, StateData.class);
+        var bytes = Files.readAllBytes(stateFile.toPath());
+        var data = objectMapper.readValue(Checksum.unwrap(bytes, stateFile.toString()), StateData.class);
         this.currentTerm = data.currentTerm;
         this.votedFor = data.votedFor;
         this.lastCommitIndex = data.lastCommitIndex;
@@ -98,7 +104,8 @@ public class PersistentState {
                 commitIndexDirty = false;
             }
             try {
-                FileUtil.atomicWrite(stateFile.toPath(), objectMapper.writeValueAsBytes(data));
+                faults.beforeWrite("meta.write");
+                FileUtil.atomicWrite(stateFile.toPath(), Checksum.wrap(objectMapper.writeValueAsBytes(data)));
             } catch (IOException e) {
                 synchronized (this) {
                     commitIndexDirty |= hadCommitIndex;

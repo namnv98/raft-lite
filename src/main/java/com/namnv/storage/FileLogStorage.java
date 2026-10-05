@@ -19,7 +19,7 @@ import java.util.List;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Log chia thành các segment log_&lt;firstIndex&gt;.jsonl, mỗi dòng một entry.
+ * Log chia thành các segment log_&lt;firstIndex&gt;.jsonl, mỗi dòng một entry kèm CRC32.
  * Nhờ vậy mọi thao tác trong lock của node đều rẻ: append chỉ ghi nối đuôi, truncate suffix là cắt file,
  * truncate prefix là xoá nguyên segment. Việc tốn kém duy nhất là fsync, nằm riêng trong sync().
  */
@@ -34,6 +34,9 @@ public class FileLogStorage implements LogStorage {
     private long baseTerm;
 
     private final Path folder;
+    private final DiskFaultInjector faults;
+    // một lần ghi hỏng mà không dọn được phần ghi dở: file không còn khớp với bộ nhớ, từ chối ghi tiếp
+    private boolean broken;
     private final List<LogEntry> entries = new ArrayList<>();
     // endOffsets.get(i): vị trí byte kết thúc của entries.get(i) trong segment chứa nó
     private final List<Long> endOffsets = new ArrayList<>();
@@ -58,6 +61,7 @@ public class FileLogStorage implements LogStorage {
 
     public FileLogStorage(NodeOptions nodeOptions, long baseIndex, long baseTerm) throws IOException {
         this.folder = Path.of(nodeOptions.getLogUri());
+        this.faults = nodeOptions.getDiskFaults();
         Files.createDirectories(folder);
         this.baseIndex = baseIndex;
         this.baseTerm = baseTerm;
@@ -101,24 +105,22 @@ public class FileLogStorage implements LogStorage {
                 while (lineEnd < data.length && data[lineEnd] != '\n') {
                     lineEnd++;
                 }
-                LogEntry entry = null;
-                if (lineEnd < data.length) {
-                    try {
-                        entry = objectMapper.readValue(data, lineStart, lineEnd - lineStart, LogEntry.class);
-                    } catch (IOException e) {
-                        // xử lý bên dưới
-                    }
-                }
-                if (entry == null || entry.getIndex() != nextIndex) {
-                    if (!lastFile) {
+                LogEntry entry = lineEnd < data.length ? decode(data, lineStart, lineEnd) : null;
+                if (entry == null) {
+                    // dòng hỏng chỉ được coi là đuôi ghi dở do crash (chưa từng được ack) khi sau nó không còn
+                    // entry nguyên vẹn nào. Nếu còn thì đây là dữ liệu đã ghi xong bị hỏng: không được âm thầm cắt bỏ.
+                    if (!lastFile || hasIntactLineAfter(data, lineEnd + 1)) {
                         throw new IOException("Corrupted log segment " + file + " at offset " + lineStart);
                     }
-                    // phần đuôi ghi dở do crash, chưa từng được ack nên cắt bỏ
                     try (FileChannel ch = FileChannel.open(file, StandardOpenOption.WRITE)) {
                         ch.truncate(lineStart);
                         ch.force(true);
                     }
                     break;
+                }
+                if (entry.getIndex() != nextIndex) {
+                    throw new IOException("Log segment " + file + " has index " + entry.getIndex()
+                            + " where " + nextIndex + " was expected");
                 }
                 // entry <= baseIndex đã nằm trong snapshot, chỉ bỏ qua
                 if (entry.getIndex() > baseIndex) {
@@ -137,6 +139,34 @@ public class FileLogStorage implements LogStorage {
             openLastSegment();
         }
         durableIndex = lastIndex();
+    }
+
+    // entry của dòng data[start, end), null nếu sai checksum hoặc không đọc được
+    private LogEntry decode(byte[] data, int start, int end) {
+        byte[] payload = Checksum.decodeLine(data, start, end);
+        if (payload == null) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(payload, LogEntry.class);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private boolean hasIntactLineAfter(byte[] data, int from) {
+        int lineStart = from;
+        while (lineStart < data.length) {
+            int lineEnd = lineStart;
+            while (lineEnd < data.length && data[lineEnd] != '\n') {
+                lineEnd++;
+            }
+            if (lineEnd < data.length && decode(data, lineStart, lineEnd) != null) {
+                return true;
+            }
+            lineStart = lineEnd + 1;
+        }
+        return false;
     }
 
     private void openLastSegment() throws IOException {
@@ -226,26 +256,46 @@ public class FileLogStorage implements LogStorage {
             throw new IllegalArgumentException("Append index " + newEntries.get(0).getIndex()
                     + " does not follow last index " + lastIndex());
         }
+        if (broken) {
+            throw new IllegalStateException("Log storage " + folder + " is broken after a failed write");
+        }
         try {
+            faults.beforeWrite("log.append");
             if (channel == null || rollOnAppend) {
                 rollSegment(newEntries.get(0).getIndex());
             }
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             List<Long> offsets = new ArrayList<>();
             for (LogEntry entry : newEntries) {
-                out.write(objectMapper.writeValueAsBytes(entry));
-                out.write('\n');
+                out.write(Checksum.encodeLine(objectMapper.writeValueAsBytes(entry)));
                 offsets.add(writeOffset + out.size());
             }
-            ByteBuffer buffer = ByteBuffer.wrap(out.toByteArray());
-            while (buffer.hasRemaining()) {
-                channel.write(buffer);
-            }
+            writeFully(channel, ByteBuffer.wrap(out.toByteArray()));
             writeOffset += out.size();
             entries.addAll(newEntries);
             endOffsets.addAll(offsets);
         } catch (IOException e) {
+            discardPartialWrite();
             throw new UncheckedIOException(e);
+        }
+    }
+
+    protected void writeFully(FileChannel target, ByteBuffer buffer) throws IOException {
+        while (buffer.hasRemaining()) {
+            target.write(buffer);
+        }
+    }
+
+    // lần ghi thất bại có thể đã để lại vài byte: cắt bỏ để file vẫn khớp với các entry trong bộ nhớ,
+    // nếu không entry ghi sau đó sẽ nằm sau một dòng rác và bị bỏ khi mở lại
+    private void discardPartialWrite() {
+        if (channel == null) {
+            return;
+        }
+        try {
+            channel.truncate(writeOffset);
+        } catch (IOException e) {
+            broken = true;
         }
     }
 
@@ -271,6 +321,7 @@ public class FileLogStorage implements LogStorage {
             }
             syncLock.lock();
             try {
+                faults.beforeWrite("log.sync");
                 for (FileChannel old : toClose) {
                     force(old);
                     old.close();
@@ -310,11 +361,7 @@ public class FileLogStorage implements LogStorage {
 
     // để file segment mới tạo / vừa xoá không biến mất hay sống lại sau khi mất điện
     private void forceDirectory() {
-        try (FileChannel dir = FileChannel.open(folder, StandardOpenOption.READ)) {
-            dir.force(true);
-        } catch (IOException e) {
-            // một số hệ điều hành không cho fsync thư mục
-        }
+        FileUtil.syncDirectory(folder);
     }
 
     @Override
@@ -339,9 +386,15 @@ public class FileLogStorage implements LogStorage {
         try {
             // xoá từ segment cuối trở về để phần còn lại trên đĩa luôn liền mạch
             // pos == 0: không còn entry nào sau snapshot nên bỏ hết
+            var deleted = false;
             while (!segments.isEmpty() && (pos == 0 || segments.get(segments.size() - 1).firstIndex() >= first)) {
                 closeChannel();
                 deleteLastSegment();
+                deleted = true;
+            }
+            if (deleted) {
+                // nếu mất điện làm segment vừa xoá sống lại, nó sẽ chồng lên các entry ghi sau đây
+                FileUtil.syncDirectory(folder);
             }
             if (!segments.isEmpty()) {
                 if (channel == null) {
@@ -349,6 +402,9 @@ public class FileLogStorage implements LogStorage {
                 }
                 writeOffset = endOffsets.get(pos - 1);
                 channel.truncate(writeOffset);
+                // việc cắt phải bền vững trước khi entry mới được ghi đè lên chỗ đó, nếu không mất điện có thể
+                // để lại file trộn giữa nội dung cũ và mới
+                channel.force(true);
             }
         } catch (IOException e) {
             throw new UncheckedIOException(e);
@@ -393,6 +449,8 @@ public class FileLogStorage implements LogStorage {
                 closeChannel();
                 deleteLastSegment();
             }
+            // các entry cũ không được sống lại sau mất điện và nằm sau snapshot mới
+            FileUtil.syncDirectory(folder);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

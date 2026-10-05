@@ -25,5 +25,15 @@ public final class FileUtil {
             channel.force(true);
         }
         Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        syncDirectory(target.toAbsolutePath().getParent());
+    }
+
+    // rename, tạo hay xoá file chỉ bền vững sau khi thư mục chứa nó được fsync
+    public static void syncDirectory(Path directory) {
+        try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            channel.force(true);
+        } catch (IOException e) {
+            // một số hệ điều hành không cho fsync thư mục
+        }
     }
 }

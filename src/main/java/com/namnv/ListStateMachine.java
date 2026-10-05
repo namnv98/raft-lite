@@ -42,7 +42,7 @@ public class ListStateMachine implements StateMachine {
     public void onSnapshotSave(SnapshotWriter writer, Closure done) {
         // chỉ chụp bản sao khi node đang giữ lock, việc ghi file diễn ra sau ở thread khác
         List<String> copy = getStore();
-        Thread.ofVirtual().start(() -> {
+        runSnapshotWrite(() -> {
             try {
                 File snapshotFile = new File(writer.getPath(), "snapshot.data");
 
@@ -64,6 +64,11 @@ public class ListStateMachine implements StateMachine {
                 done.run(Status.ERROR(e.getMessage()));
             }
         });
+    }
+
+    // ghi file ở thread riêng để không giữ lock của node; test chạy một thread có thể override để ghi tại chỗ
+    protected void runSnapshotWrite(Runnable write) {
+        Thread.ofVirtual().start(write);
     }
 
     @Override

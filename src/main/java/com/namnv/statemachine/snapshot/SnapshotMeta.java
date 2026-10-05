@@ -6,6 +6,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.util.List;
+import java.util.Map;
 
 @Data
 @NoArgsConstructor
@@ -16,4 +17,6 @@ public class SnapshotMeta {
     // cấu hình cluster tại lastIncludedIndex, vì config entry có thể đã bị compact khỏi log
     private ConfigurationEntry conf;
     private List<String> files;
+    // clientId -> sequence lớn nhất đã apply tính tới lastIncludedIndex, để việc chống ghi trùng sống qua snapshot
+    private Map<String, Long> sessions;
 }

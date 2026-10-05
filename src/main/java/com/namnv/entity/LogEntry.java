@@ -17,6 +17,9 @@ public class LogEntry implements Serializable {
     private byte[] command; // opaque command
     private boolean isConfigurationEntry; // true nếu là config log
     private ConfigurationEntry configuration; // dữ liệu config nếu isConfiguration=true
+    // định danh của lệnh từ phía client, null nếu client không cần chống ghi trùng
+    private String clientId;
+    private long sequence;
 
     public LogEntry() {
     }
@@ -28,6 +31,13 @@ public class LogEntry implements Serializable {
         this.command = command;
         this.isConfigurationEntry = false;
         this.configuration = null;
+    }
+
+    // log có định danh client: (clientId, sequence) đã apply rồi thì không apply lần nữa
+    public LogEntry(long index, long term, byte[] command, String clientId, long sequence) {
+        this(index, term, command);
+        this.clientId = clientId;
+        this.sequence = sequence;
     }
 
     // log cấu hình

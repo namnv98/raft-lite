@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.ToLongFunction;
 
 import static java.util.Objects.isNull;
 
@@ -63,6 +64,25 @@ public class ConfigurationEntry implements Serializable {
             return hasMajority(oldNodes, granted) && hasMajority(newNodes, granted);
         }
         return hasMajority(oldNodes, granted);
+    }
+
+    /**
+     * Index lớn nhất mà đa số node của cấu hình đã có (với joint config: đa số ở cả hai phía).
+     */
+    public long quorumIndex(ToLongFunction<String> matchIndexOf) {
+        if (isJoint) {
+            return Math.min(majorityIndex(oldNodes, matchIndexOf), majorityIndex(newNodes, matchIndexOf));
+        }
+        return majorityIndex(oldNodes, matchIndexOf);
+    }
+
+    private static long majorityIndex(List<String> nodes, ToLongFunction<String> matchIndexOf) {
+        if (nodes.isEmpty()) {
+            return 0;
+        }
+        long[] sorted = nodes.stream().mapToLong(matchIndexOf).sorted().toArray();
+        // phần tử lớn thứ (size/2 + 1): đúng một đa số có index >= giá trị này
+        return sorted[sorted.length - (sorted.length / 2 + 1)];
     }
 
     private static boolean hasMajority(List<String> nodes, Set<String> granted) {
