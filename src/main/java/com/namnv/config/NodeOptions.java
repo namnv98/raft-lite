@@ -40,6 +40,11 @@ public class NodeOptions {
     @Builder.Default
     private int maxPendingCommands = 100_000;
 
+    // commit index được ghi xuống đĩa nhiều nhất mỗi khoảng này một lần. Nó chỉ giúp lần khởi động sau apply lại
+    // nhanh hơn chứ không cần cho tính đúng đắn, nên không đáng tốn một lần fsync cho mỗi lệnh; 0 là ghi sau mỗi lần commit
+    @Builder.Default
+    private int commitIndexFlushIntervalMs = 1000;
+
     // snapshot được gửi cho follower theo từng mẩu không quá kích thước này
     @Builder.Default
     private int snapshotChunkBytes = 1 << 20;

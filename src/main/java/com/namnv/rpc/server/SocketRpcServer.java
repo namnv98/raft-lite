@@ -25,14 +25,13 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 @Slf4j
 public class SocketRpcServer {
     // kết nối im lặng quá lâu thì đóng, client sẽ tự kết nối lại
     private static final int IDLE_TIMEOUT_MS = 60_000;
-    private static final int READ_INDEX_TIMEOUT_MS = 10_000;
 
     private final int port;
     private final RaftServerService raftServerService;
@@ -115,6 +114,9 @@ public class SocketRpcServer {
 
     private class ClientHandler implements Runnable {
         private final Socket socket;
+        // các response được ghi từ nhiều thread, mỗi lần một khung trọn vẹn
+        private final ReentrantLock writeLock = new ReentrantLock();
+        private DataOutputStream out;
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
@@ -124,16 +126,17 @@ public class SocketRpcServer {
         public void run() {
             clients.add(socket);
             try {
-                // đặt timeout trước khi tạo stream: constructor ObjectInputStream đã đọc header
+                // đặt timeout trước khi đọc: với TLS, lần đọc đầu tiên còn gồm cả handshake
                 socket.setSoTimeout(IDLE_TIMEOUT_MS);
                 socket.setTcpNoDelay(true);
                 DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-                DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
 
-                // một kết nối phục vụ nhiều request nối tiếp nhau
+                // mỗi request được xử lý ở thread riêng và trả lời theo id của nó, nên một request chậm
+                // (ví dụ ReadIndex đang chờ leader xác nhận) không chặn các request khác trên cùng kết nối
                 while (running.get()) {
-                    Object request = RpcCodec.read(in);
-                    RpcCodec.write(out, handleCommandRequest(request));
+                    var frame = RpcCodec.read(in);
+                    executor.submit(() -> handle(frame));
                 }
             } catch (EOFException | SocketTimeoutException e) {
                 // client đóng kết nối hoặc kết nối idle
@@ -142,12 +145,49 @@ public class SocketRpcServer {
                     log.error("Client handling error: " + e.getMessage());
                 }
             } finally {
-                clients.remove(socket);
-                try {
-                    socket.close();
-                } catch (IOException e) {
-                    // Ignore close errors
+                close();
+            }
+        }
+
+        private void handle(RpcCodec.Frame frame) {
+            try {
+                if (frame.message() instanceof ReadIndexRequest readIndexRequest) {
+                    raftServerService.handleReadIndexRequest(readIndexRequest).whenComplete((response, error) -> {
+                        if (error == null) {
+                            respond(frame.requestId(), response);
+                        } else {
+                            close();
+                        }
+                    });
+                } else {
+                    respond(frame.requestId(), handleCommandRequest(frame.message()));
                 }
+            } catch (Exception e) {
+                // node chưa chạy hoặc message không phải request: đóng kết nối để phía gọi biết ngay thay vì chờ hết hạn
+                if (running.get()) {
+                    log.error("Client handling error: " + e.getMessage());
+                }
+                close();
+            }
+        }
+
+        private void respond(long requestId, Object response) {
+            writeLock.lock();
+            try {
+                RpcCodec.write(out, requestId, response);
+            } catch (IOException e) {
+                close();
+            } finally {
+                writeLock.unlock();
+            }
+        }
+
+        private void close() {
+            clients.remove(socket);
+            try {
+                socket.close();
+            } catch (IOException e) {
+                // Ignore close errors
             }
         }
 
@@ -167,15 +207,7 @@ public class SocketRpcServer {
             if (request instanceof TimeoutNowRequest timeoutNowRequest) {
                 return raftServerService.handleTimeoutNowRequest(timeoutNowRequest);
             }
-            if (request instanceof ReadIndexRequest readIndexRequest) {
-                // chờ leader xác nhận xong; quá lâu thì đóng kết nối để phía gọi coi như lỗi
-                try {
-                    return raftServerService.handleReadIndexRequest(readIndexRequest).get(READ_INDEX_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                } catch (Exception e) {
-                    throw new IllegalStateException("ReadIndex was not answered", e);
-                }
-            }
-            // một response gửi nhầm chiều: đóng kết nối
+            // một response gửi nhầm chiều
             throw new IllegalArgumentException("Not a request: " + request.getClass().getSimpleName());
         }
     }

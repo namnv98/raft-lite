@@ -32,7 +32,7 @@ và giữ được dữ liệu khi node chết, mất điện hay mạng bị ch
 | Snapshot | Tạo bất đồng bộ (thủ công hoặc tự động theo số entry), lưu atomic, gửi cho follower tụt lại theo từng mẩu |
 | Thành viên | Thêm, gỡ hoặc thay nhiều node một lần bằng joint consensus; node mới bắt kịp log trước khi được tính vào quorum; trao quyền leader; node bị gỡ tự tắt |
 | Client | Ghi có chống trùng (`clientId` + `sequence`, gửi đồng thời được), đọc nhất quán bằng ReadIndex trên cả leader lẫn follower, backpressure |
-| Transport | In-memory cho test; socket TCP với JSON có khung, dùng lại kết nối, TLS xác thực hai chiều |
+| Transport | In-memory cho test; TCP tự viết với mã hoá nhị phân, nhiều lời gọi song song trên một kết nối, TLS xác thực hai chiều |
 | Quan sát | `metrics()` trả về trạng thái và các bộ đếm của node |
 | Kiểm thử | Mô phỏng tất định theo seed, fault injection chạy thread thật, test tất định cho từng quy tắc an toàn |
 
@@ -187,6 +187,7 @@ node.shutdown();
 | `maxEntriesPerRequest` | `1024` | Số entry tối đa trong một AppendEntries |
 | `snapshotIntervalEntries` | `0` (tắt) | Tự tạo snapshot khi số entry đã apply mà chưa compact đạt mức này |
 | `snapshotChunkBytes` | `1048576` | Kích thước tối đa của một mẩu snapshot gửi cho follower |
+| `commitIndexFlushIntervalMs` | `1000` | Commit index được ghi xuống đĩa nhiều nhất mỗi khoảng này một lần; nó chỉ giúp khởi động lại nhanh hơn. `0` là ghi sau mỗi lần commit |
 | `catchUpTimeoutMs` | `30000` | Node mới phải bắt kịp log trong thời gian này thì mới được đưa vào cấu hình |
 | `shutdownOnRemoved` | `true` | Node tự `shutdown()` khi bị gỡ khỏi cluster; `false` thì node chỉ đứng yên |
 | `departingTimeoutMs` | `10000` | Leader cố gửi cấu hình cuối cho node vừa bị gỡ trong bao lâu trước khi bỏ cuộc |
@@ -236,7 +237,7 @@ com.namnv
 ├── timer                   ElectionTimer, HeartbeatTimer
 ├── rpc
 │   ├── RaftServerService   các RPC một node phải xử lý
-│   ├── RpcCodec            định dạng trên dây của transport socket
+│   ├── RpcCodec            khung và mã hoá nhị phân của transport TCP
 │   ├── TlsContexts         tạo SSLContext từ keystore
 │   ├── client              RpcProcessor, InMemoryRpcClient, SocketRpcClient
 │   ├── server              SocketRpcServer
@@ -434,11 +435,17 @@ và một entry bị đổi có thể khiến các node áp dụng những lện
 Có sáu RPC: PreVote, RequestVote, AppendEntries, InstallSnapshot, TimeoutNow, ReadIndex.
 
 - **`InMemoryRpcClient`**: gọi thẳng handler của node đích trong cùng tiến trình. Có bảng `reachable` để giả lập chia cắt mạng. Dùng cho test và demo.
-- **`SocketRpcClient` + `SocketRpcServer`**: TCP.
-  - Mỗi message là một khung `[4 byte độ dài][1 byte loại][JSON]` (`RpcCodec`). Chỉ các loại message của Raft được đọc,
-    mỗi loại chỉ thành đúng class của nó, và khung lớn hơn 64 MiB bị từ chối. Bên gửi không thể khiến bên nhận khởi tạo một class tuỳ ý.
-  - Mỗi node đích một kết nối dùng lại, các lời gọi tới cùng một node chạy tuần tự trên kết nối đó.
-  - Kết nối lỗi thì đóng và nối lại ở lời gọi sau; có timeout cho cả lúc kết nối lẫn lúc chờ trả lời.
+- **`SocketRpcClient` + `SocketRpcServer`**: TCP tự viết, không phụ thuộc thư viện mạng nào.
+  - **Khung:** mỗi message là `[4 byte độ dài][8 byte id của request][1 byte loại][nội dung nhị phân]` (`RpcCodec`).
+    Nội dung được mã hoá theo từng trường, `byte[]` đi nguyên dạng.
+  - **Ghép kênh:** mỗi node đích một kết nối dùng lại. Mọi lời gọi tới node đó đi chung kết nối và không chờ nhau:
+    response mang id của request, một thread đọc response về và trả cho đúng lời gọi. Phía server xử lý mỗi request ở thread riêng,
+    nên một lời gọi chậm (ví dụ `ReadIndex` đang chờ leader xác nhận) không chặn heartbeat.
+  - **Thời hạn:** có timeout cho lúc kết nối và cho từng lời gọi. Response về sau khi lời gọi đã hết hạn bị bỏ qua, không lẫn sang lời gọi khác.
+  - **Kết nối hỏng:** mọi lời gọi đang chờ trên nó thất bại ngay và lời gọi sau mở kết nối mới. Lời gọi đi trên một kết nối cũ
+    mà phía kia đã đóng được tự gửi lại một lần trên kết nối mới.
+  - **Dữ liệu không hợp lệ:** bên nhận chỉ dựng được 12 loại message của Raft; mọi độ dài đọc vào được đối chiếu với kích thước khung,
+    khung lớn hơn 64 MiB bị từ chối, và kết nối bị đóng khi gặp bất cứ thứ gì không hợp lệ.
   - **TLS:** truyền một `SSLContext` vào cả client và server để mã hoá và xác thực hai chiều. Server luôn đòi chứng chỉ của client,
     nên chỉ node có chứng chỉ được truststore tin mới gọi được RPC.
 
@@ -469,7 +476,8 @@ mvn test -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 | `RaftSimulationTest` | Cả cluster, mạng, đĩa, client và nemesis chạy trên một thread với thời gian ảo. Một seed luôn cho đúng một lịch sử, nên lỗi tìm ra thì chạy lại được y hệt. Có lượt 5 node, 7 node và một lượt dài nửa giờ ảo |
 | `RaftChaosTest` | Cùng kịch bản nhưng với thread và đồng hồ thật, để bắt lỗi tranh chấp giữa các thread. Seed ở đây không tái hiện chắc chắn |
 | `RaftClusterTest` | Test tất định cho từng hành vi và từng quy tắc an toàn, trên cluster in-memory |
-| `SocketRpcTest` | Transport socket: từng loại RPC, lời gọi đồng thời, nối lại, timeout, khung không hợp lệ, TLS, cluster qua socket thật |
+| `SocketRpcTest` | Transport TCP: từng loại RPC, lời gọi đồng thời và lời gọi chậm trên cùng kết nối, nối lại, timeout, khung không hợp lệ, TLS, cluster qua socket thật |
+| `RpcCodecTest` | Mã hoá nhị phân: mọi loại message đi và về đúng từng byte, message bị cắt cụt hoặc thừa byte, 20.000 khung ngẫu nhiên |
 | `FileLogStorageTest` | Segment, cắt đầu/cắt đuôi, ghi dở, dữ liệu hỏng, segment sống lại sau mất điện |
 | `SnapshotStoreTest` | Trạng thái đĩa ở từng thời điểm crash trong lúc ghi snapshot, snapshot hỏng |
 | `ConfigurationEntryTest` | Phép tính quorum, kể cả cấu hình joint |

@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
@@ -61,12 +62,18 @@ class SocketRpcTest {
     static class EchoService implements RaftServerService {
         final AtomicInteger calls = new AtomicInteger();
         volatile long delayMs;
+        // chỉ RequestVote của term này bị chậm; -1 là mọi lời gọi
+        volatile long slowTerm = -1;
         volatile AppendEntriesRequest lastAppend;
         volatile InstallSnapshotRequest lastSnapshot;
 
         private void handle() {
+            handle(-1);
+        }
+
+        private void handle(long term) {
             calls.incrementAndGet();
-            if (delayMs > 0) {
+            if (delayMs > 0 && (slowTerm == -1 || slowTerm == term)) {
                 try {
                     TimeUnit.MILLISECONDS.sleep(delayMs);
                 } catch (InterruptedException e) {
@@ -77,7 +84,7 @@ class SocketRpcTest {
 
         @Override
         public RequestVoteResponse handleRequestVoteRequest(RequestVoteRequest req) {
-            handle();
+            handle(req.term);
             return new RequestVoteResponse(req.term, true);
         }
 
@@ -250,6 +257,44 @@ class SocketRpcTest {
     }
 
     @Test
+    void callIsRetriedWhenAReusedConnectionTurnsOutToBeDead() throws Exception {
+        // server giả: trả lời request đầu, nhận request thứ hai rồi đóng kết nối mà không trả lời
+        // (như một server vừa khởi động lại), sau đó phục vụ bình thường trên kết nối mới
+        try (ServerSocket fake = new ServerSocket(0)) {
+            var served = new AtomicInteger();
+            var serverThread = Thread.ofVirtual().start(() -> {
+                try {
+                    try (Socket first = fake.accept()) {
+                        var in = new DataInputStream(first.getInputStream());
+                        var out = new DataOutputStream(first.getOutputStream());
+                        var frame = RpcCodec.read(in);
+                        RpcCodec.write(out, frame.requestId(), new PreVoteResponse(1, true));
+                        served.incrementAndGet();
+                        RpcCodec.read(in);
+                    }
+                    try (Socket second = fake.accept()) {
+                        var in = new DataInputStream(second.getInputStream());
+                        var out = new DataOutputStream(second.getOutputStream());
+                        var frame = RpcCodec.read(in);
+                        RpcCodec.write(out, frame.requestId(), new PreVoteResponse(2, true));
+                        served.incrementAndGet();
+                    }
+                } catch (IOException e) {
+                    // test sẽ fail ở phần kiểm tra bên dưới
+                }
+            });
+            var address = "localhost:" + fake.getLocalPort();
+            var rpc = client(3000);
+
+            assertEquals(1, rpc.preVote(address, new PreVoteRequest(1, "A", 0, 0)).get(5, TimeUnit.SECONDS).term);
+            // lời gọi này đi trên kết nối cũ, bị đóng giữa chừng, và phải tự chuyển sang kết nối mới
+            assertEquals(2, rpc.preVote(address, new PreVoteRequest(2, "A", 0, 0)).get(5, TimeUnit.SECONDS).term);
+            serverThread.join(5000);
+            assertEquals(2, served.get());
+        }
+    }
+
+    @Test
     void slowPeerTimesOutWithoutPoisoningLaterCalls() throws Exception {
         var service = new EchoService();
         var port = freePort();
@@ -261,9 +306,11 @@ class SocketRpcTest {
         assertThrows(ExecutionException.class,
                 () -> rpc.requestVote(address, new RequestVoteRequest(1, "A", 0, 0)).get(5, TimeUnit.SECONDS));
 
-        // response muộn của lời gọi trước không được trả về cho lời gọi sau
-        service.delayMs = 0;
+        // response muộn của lời gọi trước không được trả về cho lời gọi sau, kể cả khi nó về trong lúc lời gọi sau đang chờ
+        service.slowTerm = 1;
         assertEquals(42, rpc.requestVote(address, new RequestVoteRequest(42, "A", 0, 0)).get(5, TimeUnit.SECONDS).term);
+        TimeUnit.MILLISECONDS.sleep(1500);
+        assertEquals(43, rpc.requestVote(address, new RequestVoteRequest(43, "A", 0, 0)).get(5, TimeUnit.SECONDS).term);
     }
 
     // gửi các byte thô tới server và trả về true nếu server đóng kết nối mà không trả lời gì
@@ -276,13 +323,17 @@ class SocketRpcTest {
         }
     }
 
-    private static byte[] frame(int length, int type, String json) throws IOException {
+    // một khung PreVoteRequest hợp lệ, để từ đó làm hỏng từng phần
+    private static byte[] validFrame() throws IOException {
         var bytes = new ByteArrayOutputStream();
-        var out = new DataOutputStream(bytes);
-        out.writeInt(length);
-        out.writeByte(type);
-        out.write(json.getBytes(StandardCharsets.UTF_8));
+        RpcCodec.write(new DataOutputStream(bytes), 1, new PreVoteRequest(1, "A", 0, 0));
         return bytes.toByteArray();
+    }
+
+    private static byte[] withLength(byte[] frame, int length) {
+        var changed = frame.clone();
+        java.nio.ByteBuffer.wrap(changed).putInt(length);
+        return changed;
     }
 
     @Test
@@ -290,24 +341,52 @@ class SocketRpcTest {
         var service = new EchoService();
         var port = freePort();
         startServer(port, service);
+        var valid = validFrame();
+        var typeOffset = 4 + 8;
 
-        var json = "{\"term\":1,\"candidateId\":\"A\",\"lastLogIndex\":0,\"lastLogTerm\":0}";
         // loại message không tồn tại
-        assertTrue(closedWithoutAnswer(port, frame(json.length() + 1, 99, json)));
+        var unknownType = valid.clone();
+        unknownType[typeOffset] = 99;
+        assertTrue(closedWithoutAnswer(port, unknownType));
         // độ dài khung vô lý: server không được cấp phát theo nó
-        assertTrue(closedWithoutAnswer(port, frame(Integer.MAX_VALUE, 0, json)));
-        assertTrue(closedWithoutAnswer(port, frame(-5, 0, json)));
-        // JSON hỏng, và JSON hợp lệ nhưng không khớp loại message
-        assertTrue(closedWithoutAnswer(port, frame(8, 0, "{\"term\"")));
-        assertTrue(closedWithoutAnswer(port, frame(18, 0, "{\"surprise\":true}")));
-        // một response gửi nhầm chiều (loại 1 là PreVoteResponse)
-        var response = "{\"term\":1,\"voteGranted\":true}";
-        assertTrue(closedWithoutAnswer(port, frame(response.length() + 1, 1, response)));
+        assertTrue(closedWithoutAnswer(port, withLength(valid, Integer.MAX_VALUE)));
+        assertTrue(closedWithoutAnswer(port, withLength(valid, -5)));
+        assertTrue(closedWithoutAnswer(port, withLength(valid, 3)));
+        // nội dung bị cắt cụt (khung khai ngắn hơn message thật) và nội dung là rác
+        assertTrue(closedWithoutAnswer(port, withLength(valid, valid.length - 4 - 6)));
+        var garbage = valid.clone();
+        java.util.Arrays.fill(garbage, typeOffset + 1, garbage.length, (byte) 0x7f);
+        assertTrue(closedWithoutAnswer(port, garbage));
+        // một response gửi nhầm chiều
+        var response = new ByteArrayOutputStream();
+        RpcCodec.write(new DataOutputStream(response), 1, new PreVoteResponse(1, true));
+        assertTrue(closedWithoutAnswer(port, response.toByteArray()));
         assertEquals(0, service.calls.get());
 
         // server vẫn phục vụ bình thường sau đó
         assertEquals(9, client(1000).requestVote("localhost:" + port, new RequestVoteRequest(9, "A", 0, 0))
                 .get(5, TimeUnit.SECONDS).term);
+    }
+
+    @Test
+    void slowCallDoesNotBlockOtherCallsOnTheSameConnection() throws Exception {
+        var service = new EchoService();
+        var port = freePort();
+        startServer(port, service);
+        var address = "localhost:" + port;
+        var rpc = client(5000);
+        // mở sẵn kết nối để cả hai lời gọi sau chắc chắn đi chung một kết nối
+        assertEquals(1, rpc.requestVote(address, new RequestVoteRequest(1, "A", 0, 0)).get(5, TimeUnit.SECONDS).term);
+
+        service.delayMs = 1500;
+        service.slowTerm = 7;
+        var slow = rpc.requestVote(address, new RequestVoteRequest(7, "A", 0, 0));
+        // các lời gọi gửi sau về trước, trong lúc lời gọi chậm vẫn đang được xử lý
+        for (int term = 100; term < 120; term++) {
+            assertEquals(term, rpc.requestVote(address, new RequestVoteRequest(term, "A", 0, 0)).get(1, TimeUnit.SECONDS).term);
+        }
+        assertFalse(slow.isDone());
+        assertEquals(7, slow.get(5, TimeUnit.SECONDS).term);
     }
 
     @Test

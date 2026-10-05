@@ -1,8 +1,5 @@
 package com.namnv.rpc.model.request;
 
-import com.fasterxml.jackson.annotation.JsonCreator;
-import com.fasterxml.jackson.annotation.JsonProperty;
-
 import java.io.Serial;
 import java.io.Serializable;
 
@@ -13,8 +10,7 @@ public class ReadIndexRequest implements Serializable {
 
     public final String requesterId;
 
-    @JsonCreator
-    public ReadIndexRequest(@JsonProperty("requesterId") String requesterId) {
+    public ReadIndexRequest(String requesterId) {
         this.requesterId = requesterId;
     }
 }

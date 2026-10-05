@@ -116,6 +116,7 @@ public class RaftNode implements RaftServerService {
     private boolean snapshotting;
     // state machine đang load snapshot ngoài lock, tạm hoãn apply
     private boolean loadingSnapshot;
+    private boolean commitIndexFlushScheduled;
     // snapshot đang nhận dần từ leader; trong lúc đó cờ snapshotting cũng được bật
     private IncomingSnapshot incomingSnapshot;
 
@@ -1861,14 +1862,37 @@ public class RaftNode implements RaftServerService {
                 future.complete(true);
             }
         }
-        // commit index chỉ cập nhật trong bộ nhớ, ghi xuống đĩa sau ở thread IO
+        // commit index chỉ cập nhật trong bộ nhớ, ghi xuống đĩa sau theo nhịp ở thread IO
         persistent.setLastCommitIndex(commitIndex);
-        runIo(persistent::flush);
+        scheduleCommitIndexFlush();
         onConfCommitted();
         maybeShutdownRemoved();
         completeReads();
         runAppliedWaiters();
         maybeSnapshot();
+    }
+
+    // việc ghi commit index dùng chung thread IO với việc fsync log: ghi sau mỗi lần commit sẽ bắt lệnh kế tiếp
+    // chờ thêm hai lần fsync, nên gom lại và ghi theo nhịp
+    private void scheduleCommitIndexFlush() {
+        var interval = nodeOptions.getCommitIndexFlushIntervalMs();
+        if (interval <= 0) {
+            runIo(persistent::flush);
+            return;
+        }
+        if (commitIndexFlushScheduled) {
+            return;
+        }
+        commitIndexFlushScheduled = true;
+        runtime.schedule(() -> {
+            lock.lock();
+            try {
+                commitIndexFlushScheduled = false;
+            } finally {
+                lock.unlock();
+            }
+            runIo(persistent::flush);
+        }, interval);
     }
 
     private void maybeSnapshot() {
