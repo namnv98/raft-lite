@@ -328,7 +328,7 @@ public class RaftBenchmark {
             long decode = perSecond(() -> RpcCodec.read(new DataInputStream(new ByteArrayInputStream(binary))));
             System.out.printf("| %-12s | %-18s | %10d | %14d | %14d |%n", payload + " byte", "nhị phân (hiện tại)", binary.length, encode, decode);
 
-            // JSON của cùng danh sách entry, như transport trước đây và như log trên đĩa
+            // JSON của cùng danh sách entry, như transport và log của các phiên bản trước, để so sánh
             byte[] text = json.writeValueAsBytes(entries);
             long jsonEncode = perSecond(() -> json.writeValueAsBytes(entries));
             long jsonDecode = perSecond(() -> json.readValue(text, LogEntry[].class));

@@ -209,6 +209,9 @@ node.shutdown();
 | `snapshotIntervalEntries` | `0` (tắt) | Tự tạo snapshot khi số entry đã apply mà chưa compact đạt mức này |
 | `snapshotChunkBytes` | `1048576` | Kích thước tối đa của một mẩu snapshot gửi cho follower |
 | `commitIndexFlushIntervalMs` | `1000` | Commit index được ghi xuống đĩa nhiều nhất mỗi khoảng này một lần; nó chỉ giúp khởi động lại nhanh hơn. `0` là ghi sau mỗi lần commit |
+| `logSync` | `true` | `false`: không fsync log, coi entry là bền vững ngay khi đã ghi vào file như Aeron Cluster. Nhanh hơn nhiều trên đĩa chậm, nhưng một node mất điện có thể quên entry đã hứa và làm mất lệnh đã commit. Chỉ dùng khi các node có nguồn điện độc lập |
+| `logPreallocate` | `true` | Cấp phát sẵn file segment kế tiếp ở thread nền. fsync trên file cấp phát sẵn nhanh hơn vài lần so với file thưa; đổi lại mỗi segment được ghi hai lần, nên log chỉ làm việc này khi nó lớn chậm (dưới khoảng 40 MB/giây) và `logSync` bật |
+| `logSegmentBytes` | `67108864` | Kích thước mỗi file segment của log; một entry không được lớn hơn một segment |
 | `logCacheEntries` | `16384` | Số entry mới nhất của log được giữ trong bộ nhớ; entry cũ hơn được đọc lại từ đĩa khi cần (follower tụt xa, khởi động lại) |
 | `catchUpTimeoutMs` | `30000` | Node mới phải bắt kịp log trong thời gian này thì mới được đưa vào cấu hình |
 | `shutdownOnRemoved` | `true` | Node tự `shutdown()` khi bị gỡ khỏi cluster; `false` thì node chỉ đứng yên |
@@ -251,7 +254,7 @@ com.namnv
 │   ├── VolatileState       commitIndex, lastApplied
 │   └── LeaderState         nextIndex/matchIndex và các sổ theo dõi khác của leader
 ├── storage
-│   ├── FileLogStorage      log chia segment
+│   ├── binary              BinaryLogStorage: log nhị phân, ghi theo khối (kiểu Aeron Archive)
 │   ├── SnapshotStore       thư mục snapshot, lưu atomic
 │   ├── Checksum, FileUtil  CRC32, ghi file atomic, fsync thư mục
 │   └── DiskFaultInjector   điểm chèn lỗi đĩa cho test
@@ -280,6 +283,10 @@ Nguyên tắc: **không ghi đĩa khi đang giữ lock** trên các đường ch
 
 Leader đưa bước 2 sang thread IO của `RaftRuntime`; follower làm bước 2 ngay trên thread đang xử lý RPC, giữa hai lần lấy lock.
 Nhiều lệnh đến cùng lúc được gộp vào một lần fsync.
+
+Kết quả trả cho người gọi cũng nằm ngoài lock: future của `appendClientCommand` và `read` được hoàn tất sau khi node nhả lock,
+lần lượt theo thứ tự commit. Callback gắn vào future vì thế không chặn node và gọi ngược vào node được, nhưng một callback chậm
+vẫn làm kết quả của các lệnh sau nó đến trễ.
 
 ### `RaftRuntime`
 
@@ -316,6 +323,8 @@ Election timer luôn được hẹn lại, nên một vòng bầu cử thất b�
 - Follower chỉ trả lời thành công sau khi entry đã được fsync.
 - Leader gửi entry cho follower **song song** với việc fsync log của chính nó, và chỉ tính mình vào quorum cho phần log đã nằm trên đĩa.
 - Commit index là index lớn nhất mà đa số đã có (với joint config: đa số ở cả hai cấu hình), với điều kiện entry đó thuộc term hiện tại.
+- Phần follower cần đã rời khỏi bộ nhớ (xem `logCacheEntries`) thì leader đọc lại từ segment trên đĩa ở một thread riêng,
+  ngoài lock, rồi mới gửi; các lệnh mới không phải chờ lần đọc đó.
 - Phần follower cần đã bị compact thì leader gửi snapshot thay cho entry.
 - Khi số lệnh chờ commit vượt `maxPendingCommands`, leader từ chối lệnh mới thay vì để hàng chờ lớn mãi.
 
@@ -346,7 +355,8 @@ Commit index cũng được lưu, nhưng chỉ để lần khởi động sau ap
 2. State machine ghi file của nó vào `temp/`.
 3. Ở thread IO: tính CRC32 của từng file, ghi file meta, fsync, rồi **rename** `temp/` thành `snapshot_<index>/`.
    Snapshot cũ bị xoá sau đó.
-4. Trong lock: xoá các segment log đã nằm trọn trong snapshot.
+4. Trong lock: bỏ các segment log đã nằm trọn trong snapshot khỏi log (chỉ trong bộ nhớ). File của chúng được xoá ngay sau đó
+   ở thread nền: xoá trong lock làm cả node đứng hàng chục mili giây mỗi lần snapshot.
 
 Vì bước 3 là một lần rename, snapshot hoặc có đủ hoặc không có gì, dù mất điện ở bất kỳ lúc nào.
 
@@ -388,7 +398,8 @@ Trên leader:
 3. Node chờ state machine của mình apply tới readIndex, rồi chạy hàm đọc trong lock.
 
 Trên follower: node gửi RPC `ReadIndex` cho leader; leader làm bước 1 và 2 rồi trả về readIndex; follower làm bước 3 trên
-dữ liệu của chính nó.
+dữ liệu của chính nó. Mỗi lúc follower chỉ có một `ReadIndex` đang bay: các lần đọc đến trong lúc đó được gom lại và đi chung
+request kế tiếp, nên số request tới leader không tăng theo số lần đọc đồng thời.
 
 Cơ chế này không ghi gì vào log và không phụ thuộc đồng hồ, nên đúng cả khi đồng hồ các node chạy lệch nhau.
 
@@ -410,9 +421,10 @@ Mỗi node ghi vào ba thư mục cấu hình trong `NodeOptions` (có thể là
 
 ```
 data/n1/
-├── raft_meta.json            term, votedFor, commit index
-├── log_1.jsonl               segment log, tên file là index đầu tiên của segment
-├── log_5001.jsonl
+├── raft_meta.json            term, votedFor
+├── commit_index              commit index gần nhất, ghi không fsync
+├── log_1.rec                 segment log kích thước cố định, tên file là index đầu tiên của segment
+├── log_5001.rec
 ├── snapshot_5000/
 │   ├── snapshot.data         file do state machine ghi
 │   └── __raft_snapshot_meta.json
@@ -420,10 +432,36 @@ data/n1/
 ```
 
 - **`raft_meta.json`**: dòng đầu là CRC32 của phần còn lại, tiếp theo là JSON. Được thay bằng cách ghi file tạm, fsync, rename, fsync thư mục.
-- **`log_<firstIndex>.jsonl`**: mỗi dòng là `<crc32> <entry dạng JSON>`. Entry mới được ghi nối vào segment cuối.
-  Sau mỗi snapshot, entry mới sang một segment mới để segment cũ có thể bị xoá nguyên file ở lần snapshot kế tiếp.
+- **`commit_index`**: commit index được ghi đè theo nhịp `commitIndexFlushIntervalMs`, có CRC32 nhưng **không fsync**: nó chỉ giúp lần
+  khởi động sau apply lại nhanh hơn, và file hỏng hay mất thì bị bỏ qua. Ghi nó vào `raft_meta.json` (có fsync) từng làm mọi lệnh
+  đang ghi khựng lại hàng trăm mili giây mỗi giây, vì một lần fsync trên ext4 kéo theo cả lượng log đang chờ xuống đĩa.
+- **`log_<firstIndex>.rec`**: các khung nhị phân nối nhau, xem [Định dạng log](#định-dạng-log) bên dưới.
 - **`snapshot_<index>/`**: file của state machine và file meta. File meta chứa index và term cuối cùng của snapshot,
   cấu hình thành viên, bảng chống trùng, danh sách file và CRC32 của từng file.
+
+### Định dạng log
+
+Log được lưu theo kiểu Aeron Archive bởi `com.namnv.storage.binary.BinaryLogStorage`:
+
+- Các file `log_<firstIndex>.rec` có **kích thước cố định** (`logSegmentBytes`, file thưa). 32 byte đầu là header của segment
+  (magic, version, index đầu tiên, mốc "đã lên đĩa"). Sau đó là các **khung** nối nhau, mỗi khung bắt đầu ở vị trí chia hết cho 32:
+  `[độ dài][CRC32][index][term][sequence]` rồi cờ, `clientId`, cấu hình và lệnh (chép nguyên byte). Một khung không vắt qua hai segment.
+- Việc ghi chia làm **hai tầng** như Aeron. Append (trong lock của node) chỉ dựng khung trong bộ nhớ và xếp vào hàng chờ: nó
+  không bao giờ chạm tới đĩa nên không thể bị hệ điều hành giữ lại. `sync()` (ngoài lock) ghi cả khối khung đang chờ xuống file
+  bằng một lời gọi rồi fsync; entry chỉ được coi là bền vững sau bước này. Mỗi lúc chỉ một thread ghi file.
+- Khi log được fsync và lớn chậm, file của segment kế tiếp được **cấp phát sẵn** ở thread nền (`logPreallocate`): fsync trên
+  file thưa phải chờ filesystem ghi nhận các block mới cấp phát, chậm hơn vài lần so với fsync trên file đã cấp phát.
+- Segment chỉ bị xoá khi mọi entry của nó đã nằm trong snapshot, nên log trên đĩa giữ thừa nhiều nhất một segment.
+- Cùng các khung đó được gửi cho follower trong AppendEntries, nên leader không mã hoá lại entry cho từng follower.
+  Khung chỉ được giữ trong bộ nhớ một lúc ngắn (vài MB gần nhất): giữ lâu hơn làm GC phải chép đi chép lại chúng.
+- Khác Aeron ở một điểm: mặc định `sync()` vẫn fsync trước khi entry được coi là bền vững (xem `logSync`), nên các quy tắc về
+  độ bền ở trên không đổi.
+- Khi mở lại, mỗi segment được đọc tới khung nguyên vẹn cuối cùng. Phần đứng sau mốc "đã lên đĩa" là đuôi chưa từng được ack và bị bỏ;
+  khung hỏng đứng trước mốc đó làm việc mở log thất bại thay vì bị âm thầm cắt. Mốc này được ghi sau mỗi lần fsync nhưng chỉ
+  lên đĩa cùng lần fsync kế tiếp, nên một entry hỏng nằm giữa hai mốc sẽ bị coi là đuôi ghi dở.
+
+Log dạng JSON (`log_*.jsonl`) của các phiên bản trước không còn đọc được: node từ chối khởi động trên thư mục còn các file đó
+thay vì coi như log rỗng.
 
 ### Khi khởi động lại
 
@@ -461,8 +499,11 @@ Có sáu RPC: PreVote, RequestVote, AppendEntries, InstallSnapshot, TimeoutNow, 
   - **Khung:** mỗi message là `[4 byte độ dài][8 byte id của request][1 byte loại][nội dung nhị phân]` (`RpcCodec`).
     Nội dung được mã hoá theo từng trường, `byte[]` đi nguyên dạng.
   - **Ghép kênh:** mỗi node đích một kết nối dùng lại. Mọi lời gọi tới node đó đi chung kết nối và không chờ nhau:
-    response mang id của request, một thread đọc response về và trả cho đúng lời gọi. Phía server xử lý mỗi request ở thread riêng,
-    nên một lời gọi chậm (ví dụ `ReadIndex` đang chờ leader xác nhận) không chặn heartbeat.
+    response mang id của request, một thread đọc response về và trả cho đúng lời gọi. Phía server trả lời theo id nên
+    một lời gọi chậm không chặn heartbeat: RPC có thể chờ đĩa (AppendEntries, RequestVote, InstallSnapshot) chạy ở thread riêng,
+    còn yêu cầu của client và `ReadIndex` chỉ đăng ký việc rồi được trả lời sau, nên được xử lý ngay trên thread đọc.
+  - **Ghi theo đợt:** mỗi chiều của một kết nối có một hàng ghi (`FrameWriter`). Message được xếp hàng mà không chờ mạng, và một
+    thread ghi hết những gì đang chờ rồi mới flush một lần, nên khi tải cao nhiều message đi chung một lời gọi hệ thống.
   - **Thời hạn:** có timeout cho lúc kết nối và cho từng lời gọi. Response về sau khi lời gọi đã hết hạn bị bỏ qua, không lẫn sang lời gọi khác.
   - **Kết nối hỏng:** mọi lời gọi đang chờ trên nó thất bại ngay và lời gọi sau mở kết nối mới. Lời gọi đi trên một kết nối cũ
     mà phía kia đã đóng được tự gửi lại một lần trên kết nối mới.
@@ -500,7 +541,7 @@ mvn test -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 | `RaftClusterTest` | Test tất định cho từng hành vi và từng quy tắc an toàn, trên cluster in-memory |
 | `SocketRpcTest` | Transport TCP: từng loại RPC, lời gọi đồng thời và lời gọi chậm trên cùng kết nối, nối lại, timeout, khung không hợp lệ, TLS, cluster qua socket thật |
 | `RpcCodecTest` | Mã hoá nhị phân: mọi loại message đi và về đúng từng byte, message bị cắt cụt hoặc thừa byte, 20.000 khung ngẫu nhiên |
-| `FileLogStorageTest` | Segment, cắt đầu/cắt đuôi, ghi dở, dữ liệu hỏng, segment sống lại sau mất điện |
+| `BinaryLogStorageTest` | Mọi loại entry, nhiều segment, cắt đầu/cắt đuôi, khung ghi dở, đuôi chưa sync sau một lỗ hổng, dữ liệu đã sync bị hỏng |
 | `SnapshotStoreTest` | Trạng thái đĩa ở từng thời điểm crash trong lúc ghi snapshot, snapshot hỏng |
 | `ConfigurationEntryTest` | Phép tính quorum, kể cả cấu hình joint |
 
@@ -539,6 +580,10 @@ CP="target/test-classes:target/classes:$(mvn -q dependency:build-classpath -Dmde
 
 # 3 node là 3 tiến trình riêng, client ở tiến trình thứ tư, mọi thứ đi qua TCP
 java -cp "$CP" com.namnv.bench.ClusterBenchmark
+# không fsync log (NodeOptions.logSync = false)
+java -Dbench.logSync=false -cp "$CP" com.namnv.bench.ClusterBenchmark
+# chỉ đo một phần của bảng, ví dụ lệnh 4 KB với 512 client:
+java -Dbench.payloads=4096 -Dbench.clients=512 -Dbench.phases=write -cp "$CP" com.namnv.bench.ClusterBenchmark
 
 # 3 node trong một tiến trình: so sánh transport, đĩa thật với tmpfs, và bộ mã hoá
 java -cp "$CP" com.namnv.bench.RaftBenchmark

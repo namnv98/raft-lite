@@ -34,6 +34,11 @@ public class ClientSession implements Serializable {
     }
 
     public void markApplied(long sequence) {
+        // trường hợp thường gặp: client gửi tuần tự, không có sequence lẻ nào đang chờ
+        if (sequence == watermark + 1 && above.isEmpty()) {
+            watermark = sequence;
+            return;
+        }
         above.add(sequence);
         while (!above.isEmpty() && above.first() == watermark + 1) {
             watermark = above.pollFirst();

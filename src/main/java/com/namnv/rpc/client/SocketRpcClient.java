@@ -1,5 +1,6 @@
 package com.namnv.rpc.client;
 
+import com.namnv.rpc.FrameWriter;
 import com.namnv.rpc.RpcCodec;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
@@ -37,6 +38,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * mỗi request mang một id, một thread đọc response về và trả cho đúng lời gọi theo id.
  */
 public class SocketRpcClient implements RpcProcessor, AutoCloseable {
+    // đủ lớn để nhiều message nhỏ đi chung một lần ghi/đọc socket
+    private static final int BUFFER_BYTES = 1 << 16;
+
     private final int timeoutMs;
     // null: kết nối không mã hoá
     private final SSLContext sslContext;
@@ -97,8 +101,12 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
      */
     public <T> CompletableFuture<T> send(String address, Object request, Class<T> responseType) {
         var result = new CompletableFuture<Object>();
-        // kết nối và ghi ra socket ở thread riêng: người gọi (đang giữ lock của node) không bao giờ bị chặn bởi mạng
-        rpcExecutor.execute(() -> connections.computeIfAbsent(address, Connection::new).send(request, result, true));
+        // Người gọi (đang giữ lock của node) không bao giờ bị chặn bởi mạng: kết nối đã có thì request chỉ được xếp vào
+        // hàng ghi của nó, chưa có thì việc kết nối chạy ở thread riêng.
+        var connection = connections.get(address);
+        if (connection == null || !connection.trySend(request, result)) {
+            rpcExecutor.execute(() -> connections.computeIfAbsent(address, Connection::new).send(request, result, true));
+        }
         return result.orTimeout(timeoutMs, TimeUnit.MILLISECONDS).thenApply(responseType::cast);
     }
 
@@ -114,10 +122,20 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
     private class Connection {
         private final String address;
         private final ReentrantLock lock = new ReentrantLock();
-        private Link link;
+        private volatile Link link;
 
         Connection(String address) {
             this.address = address;
+        }
+
+        // gửi trên kết nối đang mở mà không chờ gì; false nếu phải kết nối (lại) trước
+        boolean trySend(Object request, CompletableFuture<Object> result) {
+            Link current = link;
+            if (current == null || current.closed) {
+                return false;
+            }
+            call(current, true, request, result, true);
+            return true;
         }
 
         void send(Object request, CompletableFuture<Object> result, boolean mayRetry) {
@@ -137,6 +155,10 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
                 lock.unlock();
             }
 
+            call(current, reused, request, result, mayRetry);
+        }
+
+        private void call(Link current, boolean reused, Object request, CompletableFuture<Object> result, boolean mayRetry) {
             var response = current.call(request);
             // lời gọi hết hạn hoặc bị huỷ thì không giữ chỗ chờ response của nó nữa
             result.whenComplete((value, error) -> response.cancel(false));
@@ -167,8 +189,7 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
     // một kết nối TCP: nhiều lời gọi ghi xen kẽ vào, một thread đọc response và ghép lại theo id
     private class Link {
         private final Socket socket;
-        private final DataOutputStream out;
-        private final ReentrantLock writeLock = new ReentrantLock();
+        private final FrameWriter writer;
         private final Map<Long, CompletableFuture<Object>> pending = new ConcurrentHashMap<>();
         private final AtomicLong nextId = new AtomicLong();
         volatile boolean closed;
@@ -185,8 +206,9 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
                 }
                 // thread đọc chờ response bao lâu cũng được; thời hạn của từng lời gọi do future của nó lo
                 s.setSoTimeout(0);
-                out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
-                var in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
+                writer = new FrameWriter(new DataOutputStream(new BufferedOutputStream(s.getOutputStream(), BUFFER_BYTES)),
+                        rpcExecutor, this::close);
+                var in = new DataInputStream(new BufferedInputStream(s.getInputStream(), BUFFER_BYTES));
                 socket = s;
                 rpcExecutor.execute(() -> readResponses(in));
             } catch (IOException | RuntimeException e) {
@@ -200,16 +222,12 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
             var response = new CompletableFuture<Object>();
             pending.put(id, response);
             response.whenComplete((value, error) -> pending.remove(id));
-            writeLock.lock();
-            try {
-                if (closed) {
-                    throw new IOException("connection closed");
-                }
-                RpcCodec.write(out, id, request);
-            } catch (IOException e) {
-                close(e);
-            } finally {
-                writeLock.unlock();
+            if (!closed) {
+                writer.send(id, request);
+            }
+            // kết nối đóng ngay trước hoặc ngay sau khi xếp hàng thì không ai còn báo lỗi cho lời gọi này
+            if (closed) {
+                response.completeExceptionally(new IOException("connection closed"));
             }
             return response;
         }

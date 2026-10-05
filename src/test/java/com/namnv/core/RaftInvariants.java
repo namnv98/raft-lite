@@ -1,10 +1,7 @@
 package com.namnv.core;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.namnv.entity.LogEntry;
-import com.namnv.storage.Checksum;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,7 +23,6 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 final class RaftInvariants {
 
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private RaftInvariants() {
     }
@@ -234,25 +230,30 @@ final class RaftInvariants {
 
     private static List<Path> logSegments(Path folder) throws IOException {
         try (var files = Files.list(folder)) {
-            return files.filter(p -> p.getFileName().toString().matches("log_\\d+\\.jsonl")).toList();
+            return files.filter(p -> p.getFileName().toString().matches("log_\\d+\\.rec")).toList();
         }
     }
 
-    // giữ lại các dòng nguyên vẹn có index <= durableIndex
-    private static byte[] dropUnsyncedEntries(byte[] segment, long durableIndex) throws IOException {
-        var out = new ByteArrayOutputStream();
-        int lineStart = 0;
-        for (int i = 0; i < segment.length; i++) {
-            if (segment[i] != '\n') {
-                continue;
-            }
-            var payload = Checksum.decodeLine(segment, lineStart, i);
-            if (payload == null || OBJECT_MAPPER.readValue(payload, LogEntry.class).getIndex() > durableIndex) {
+    // Giữ lại các khung có index <= durableIndex, phần còn lại của segment trở về byte 0 như chưa từng được ghi.
+    // Trả về mảng rỗng nếu không còn khung nào (file đó chưa tồn tại ở thời điểm bền vững gần nhất).
+    private static byte[] dropUnsyncedEntries(byte[] segment, long durableIndex) {
+        var data = java.nio.ByteBuffer.wrap(segment).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        int offset = 32; // header của segment
+        while (offset + 32 < segment.length) {
+            int length = data.getInt(offset);
+            if (length <= 32 || length > segment.length - offset || data.getLong(offset + 8) > durableIndex) {
                 break;
             }
-            out.write(segment, lineStart, i - lineStart + 1);
-            lineStart = i + 1;
+            offset += (length + 31) & -32;
         }
-        return out.toByteArray();
+        if (offset == 32) {
+            return new byte[0];
+        }
+        byte[] durable = new byte[segment.length];
+        System.arraycopy(segment, 0, durable, 0, offset);
+        // mốc "đã lên đĩa" trong header có thể đã được ghi cho một lần fsync mà node chưa kịp ghi nhận
+        var header = java.nio.ByteBuffer.wrap(durable).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        header.putLong(16, Math.min(header.getLong(16), offset));
+        return durable;
     }
 }

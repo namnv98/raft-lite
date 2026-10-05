@@ -243,6 +243,8 @@ class RaftChaosTest {
         var options = NodeOptions.builder()
                 .raftMetaUri(folder)
                 .logUri(folder)
+                // segment nhỏ: log đi qua nhiều file, và mỗi lần mất điện giả lập không phải chép cả file 64 MB
+                .logSegmentBytes(16 << 10)
                 .snapshotUri(folder)
                 .electionTimeoutMinMs(150)
                 .electionTimeoutMaxMs(300)

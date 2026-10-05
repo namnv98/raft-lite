@@ -94,6 +94,18 @@ class RaftClusterTest {
             return response;
         }
 
+        // số ReadIndex đã gửi; response của chúng bị giữ lại cho tới khi heldReadIndex hoàn tất
+        final AtomicInteger readIndexCalls = new AtomicInteger();
+        volatile CompletableFuture<Void> heldReadIndex;
+
+        @Override
+        public CompletableFuture<ReadIndexResponse> readIndex(String target, ReadIndexRequest req) {
+            readIndexCalls.incrementAndGet();
+            var response = super.readIndex(target, req);
+            var gate = heldReadIndex;
+            return gate == null ? response : response.thenCombine(gate, (resp, released) -> resp);
+        }
+
         @Override
         public CompletableFuture<TimeoutNowResponse> timeoutNow(String target, TimeoutNowRequest req) {
             timeoutNowCalls.add(target);
@@ -192,6 +204,7 @@ class RaftClusterTest {
     private DiskFaultInjector diskFaults = DiskFaultInjector.NONE;
     private int maxPendingCommands = 100_000;
     private int maxEntriesPerRequest = 1024;
+    private int logCacheEntries = 16_384;
     private long snapshotIntervalEntries = 0;
     private int catchUpTimeoutMs = 30_000;
     private int snapshotChunkBytes = 1 << 20;
@@ -233,6 +246,8 @@ class RaftClusterTest {
                 .diskFaults(diskFaults)
                 .maxPendingCommands(maxPendingCommands)
                 .maxEntriesPerRequest(maxEntriesPerRequest)
+                .logCacheEntries(logCacheEntries)
+                .logSegmentBytes(4096)
                 .snapshotIntervalEntries(snapshotIntervalEntries)
                 .catchUpTimeoutMs(catchUpTimeoutMs)
                 .snapshotChunkBytes(snapshotChunkBytes)
@@ -624,7 +639,7 @@ class RaftClusterTest {
         write(awaitLeader(), "1", "2", "3");
 
         var folder = dataDir.resolve("A");
-        var logFile = folder.resolve("log_1.jsonl");
+        var logFile = folder.resolve("log_1.rec");
         var logBeforeSnapshot = folder.resolve("log.backup");
         Files.copy(logFile, logBeforeSnapshot);
 
@@ -961,9 +976,9 @@ class RaftClusterTest {
         stopNode(broken);
 
         // một bit hỏng giữa log của node đang tắt
-        var segment = dataDir.resolve(broken).resolve("log_1.jsonl");
+        var segment = dataDir.resolve(broken).resolve("log_1.rec");
         var data = Files.readAllBytes(segment);
-        data[30] ^= 0x01;
+        data[32 + 10] ^= 0x01; // trong khung đầu tiên, ngay sau header 32 byte của segment
         Files.write(segment, data);
 
         assertThrows(Exception.class, () -> startNode(broken, List.of("A", "B", "C")));
@@ -1423,5 +1438,149 @@ class RaftClusterTest {
             awaitStore(id, List.of("cmd3", "cmd2", "cmd1"));
         }
         assertEquals(Map.of("client-1", 3L), sessions(leader));
+    }
+
+    @Test
+    void resultCallbacksRunOutsideTheNodeLock() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var follower = nodes.get(others(leader.getNodeId()).get(0));
+
+        // callback gắn trực tiếp vào future chạy trên thread hoàn tất nó: thread đó không được còn giữ lock của node
+        var written = leader.appendClientCommand("1".getBytes(StandardCharsets.UTF_8))
+                .thenApply(ok -> ok && !leader.getLock().isHeldByCurrentThread());
+        assertTrue(written.get(5, TimeUnit.SECONDS));
+        assertFalse(leader.read(() -> 1).thenApply(v -> leader.getLock().isHeldByCurrentThread()).get(5, TimeUnit.SECONDS));
+        assertFalse(follower.read(() -> 1).thenApply(v -> follower.getLock().isHeldByCurrentThread()).get(5, TimeUnit.SECONDS));
+
+        // và nó gọi lại node được mà không bị kẹt
+        var chained = leader.appendClientCommand("2".getBytes(StandardCharsets.UTF_8))
+                .thenCompose(ok -> leader.appendClientCommand("3".getBytes(StandardCharsets.UTF_8)));
+        assertTrue(chained.get(5, TimeUnit.SECONDS));
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, List.of("1", "2", "3"));
+        }
+    }
+
+    @Test
+    void concurrentFollowerReadsShareOneReadIndexRequest() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        write(leader, "1", "2");
+        var id = others(leader.getNodeId()).get(0);
+        var follower = nodes.get(id);
+
+        var gate = new CompletableFuture<Void>();
+        rpc.heldReadIndex = gate;
+        var before = rpc.readIndexCalls.get();
+        var reads = new ArrayList<CompletableFuture<List<String>>>();
+        for (int i = 0; i < 50; i++) {
+            reads.add(follower.read(() -> List.copyOf(machines.get(id).getStore())));
+        }
+        // lần đọc đầu đã gửi một request; 49 lần còn lại chờ, không gửi thêm request nào
+        assertEquals(before + 1, rpc.readIndexCalls.get());
+        assertTrue(reads.stream().noneMatch(CompletableFuture::isDone));
+
+        rpc.heldReadIndex = null;
+        gate.complete(null);
+        for (var read : reads) {
+            assertEquals(List.of("1", "2"), read.get(5, TimeUnit.SECONDS));
+        }
+        // các lần đọc đến sau khi request đầu được gửi đi chung đúng một request nữa
+        assertEquals(before + 2, rpc.readIndexCalls.get());
+    }
+
+    @Test
+    void followerBehindTheLogCacheCatchesUpFromDisk() throws Exception {
+        logCacheEntries = 8;
+        maxEntriesPerRequest = 5;
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var lagging = others(leader.getNodeId()).get(0);
+
+        isolate(lagging);
+        var expected = new ArrayList<String>();
+        for (int i = 0; i < 60; i++) {
+            expected.add("w" + i);
+        }
+        write(leader, expected.toArray(String[]::new));
+        // phần follower cần đã rời khỏi bộ nhớ của leader và không có snapshot nào thay cho nó
+        var logStore = leader.getPersistent().getLogStore();
+        assertEquals(0, logStore.getBaseIndex());
+        assertFalse(logStore.isCached(1, maxEntriesPerRequest));
+
+        connect(lagging);
+        awaitStore(lagging, expected);
+        write(awaitLeader(), "last");
+        expected.add("last");
+        for (String node : List.of("A", "B", "C")) {
+            awaitStore(node, expected);
+        }
+    }
+
+    @Test
+    void logReplicatesRestartsAndCatchesUpAcrossSegments() throws Exception {
+        logCacheEntries = 8;
+        maxEntriesPerRequest = 5;
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var lagging = others(leader.getNodeId()).get(0);
+
+        // follower tụt xa hơn bộ nhớ của leader: phần nó cần được đọc lại từ các file segment
+        isolate(lagging);
+        var expected = new ArrayList<String>();
+        for (int i = 0; i < 120; i++) {
+            expected.add("w" + i);
+        }
+        write(leader, expected.toArray(String[]::new));
+        connect(lagging);
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, expected);
+        }
+        try (var files = Files.list(dataDir.resolve(leader.getNodeId()))) {
+            var names = files.map(p -> p.getFileName().toString()).filter(name -> name.startsWith("log_")).toList();
+            assertTrue(names.size() > 1 && names.stream().allMatch(name -> name.endsWith(".rec")), "segments: " + names);
+        }
+
+        // khởi động lại từng node: log đọc lại từ file, rồi snapshot compact nó
+        for (String id : List.of("A", "B", "C")) {
+            stopNode(id);
+            startNode(id, List.of("A", "B", "C"));
+            awaitStore(id, expected);
+        }
+        snapshot(awaitLeader());
+        write(awaitLeader(), "after");
+        expected.add("after");
+        for (String id : List.of("A", "B", "C")) {
+            awaitStore(id, expected);
+        }
+
+        // thư mục còn log dạng JSON của phiên bản cũ phải bị từ chối thay vì được coi là log rỗng
+        stopNode("A");
+        Files.writeString(dataDir.resolve("A").resolve("log_1.jsonl"), "");
+        assertThrows(IOException.class, () -> startNode("A", List.of("A", "B", "C")));
+        nodes.remove("A");
+    }
+
+    @Test
+    void commitIndexIsKeptInItsOwnFileAndADamagedOneIsIgnored() throws Exception {
+        startCluster("A");
+        write(awaitLeader(), "1", "2", "3");
+        var commitIndex = nodes.get("A").getVolatileState().getCommitIndex();
+        stopNode("A");
+
+        // file riêng, không nằm trong raft_meta.json: ghi nó không cần fsync
+        var file = dataDir.resolve("A").resolve("commit_index");
+        var saved = new String(Checksum.unwrap(Files.readAllBytes(file), file.toString()), StandardCharsets.US_ASCII);
+        assertEquals(commitIndex, Long.parseLong(saved));
+        startNode("A", List.of("A"));
+        // apply lại ngay lúc khởi động, trước khi có leader nào
+        assertEquals(List.of("1", "2", "3"), machines.get("A").getStore());
+        stopNode("A");
+
+        // mất điện giữa lúc ghi đè: node vẫn khởi động, chỉ phải chờ leader commit lại
+        Files.writeString(file, "0000");
+        startNode("A", List.of("A"));
+        awaitStore("A", List.of("1", "2", "3"));
     }
 }

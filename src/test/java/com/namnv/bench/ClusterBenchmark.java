@@ -26,6 +26,9 @@ import java.util.stream.DoubleStream;
  *      com.namnv.bench.ClusterBenchmark [thư mục dữ liệu]
  * </pre>
  * -Dbench.seconds=3: thời gian đo mỗi cấu hình. -Dbench.connections=16: số kết nối TCP mà các client dùng chung tới mỗi node.
+ * -Dbench.logSync=false: các node không fsync log (NodeOptions.logSync).
+ * -Dbench.logPreallocate=false: không cấp phát sẵn file segment (NodeOptions.logPreallocate).
+ * -Dbench.payloads=128,4096, -Dbench.clients=1,32,512 và -Dbench.phases=write,read: chỉ đo một phần của bảng.
  */
 public class ClusterBenchmark {
 
@@ -47,6 +50,10 @@ public class ClusterBenchmark {
             var log = dataDir.resolve("node" + i + ".log").toFile();
             // -Dbench.nodeArgs="...": tham số JVM thêm cho các tiến trình node; log GC của từng node luôn được ghi lại
             var command = new ArrayList<String>(List.of(java, "-Xlog:gc:file=" + dataDir.resolve("gc" + i + ".log")));
+            command.add("-Dbench.logSync=" + System.getProperty("bench.logSync", "true"));
+            command.add("-Dbench.logPreallocate=" + System.getProperty("bench.logPreallocate", "true"));
+            command.add("-Dbench.snapshotInterval=" + System.getProperty("bench.snapshotInterval", "200000"));
+            command.add("-Dbench.commitFlushMs=" + System.getProperty("bench.commitFlushMs", "1000"));
             var extra = System.getProperty("bench.nodeArgs", "").trim();
             if (!extra.isEmpty()) {
                 command.addAll(List.of(extra.split("\\s+")));
@@ -80,9 +87,12 @@ public class ClusterBenchmark {
             System.out.println("## Ghi qua mạng (mỗi client có clientId riêng, có chống ghi trùng)");
             printHeader();
             boolean quick = Boolean.getBoolean("bench.quick");
-            for (int payload : quick ? new int[]{128} : new int[]{128, 4096}) {
+            int[] payloads = ints("bench.payloads", quick ? "128" : "128,4096");
+            int[] clientCounts = ints("bench.clients", quick ? "512" : "1,32,512");
+            var phases = List.of(System.getProperty("bench.phases", quick ? "write" : "write,read").split(","));
+            for (int payload : phases.contains("write") ? payloads : new int[0]) {
                 byte[] command = new byte[payload];
-                for (int clients : quick ? new int[]{512} : new int[]{1, 32, 512}) {
+                for (int clients : clientCounts) {
                     var pool = new ArrayList<RaftClient>();
                     for (int c = 0; c < clients; c++) {
                         pool.add(newClient.get());
@@ -93,7 +103,7 @@ public class ClusterBenchmark {
                 }
             }
 
-            if (quick) {
+            if (!phases.contains("read")) {
                 return;
             }
             System.out.println();
@@ -101,7 +111,7 @@ public class ClusterBenchmark {
             printHeader();
             var leader = findLeader(probe, servers);
             var follower = servers.stream().filter(s -> !s.equals(leader)).findFirst().orElseThrow();
-            for (int clients : new int[]{1, 32, 512}) {
+            for (int clients : clientCounts) {
                 var pool = new ArrayList<RaftClient>();
                 for (int c = 0; c < clients; c++) {
                     pool.add(newClient.get());
@@ -131,7 +141,10 @@ public class ClusterBenchmark {
                         DoubleStream.of(pauses).max().orElse(0), DoubleStream.of(pauses).sum());
             }
             System.out.println("dòng ERROR/Exception trong log của ba node: " + problems);
-            deleteRecursively(dataDir);
+            // -Dbench.keep=true: giữ lại log của các node để xem sau
+            if (!Boolean.getBoolean("bench.keep")) {
+                deleteRecursively(dataDir);
+            }
             System.out.flush();
             // các thread nền của benchmark không tự dừng
             Runtime.getRuntime().halt(0);
@@ -165,6 +178,10 @@ public class ClusterBenchmark {
             var client = pool.get(index.getAndIncrement());
             return () -> operation.apply(client);
         });
+    }
+
+    private static int[] ints(String property, String fallback) {
+        return java.util.Arrays.stream(System.getProperty(property, fallback).split(",")).mapToInt(Integer::parseInt).toArray();
     }
 
     private static void printHeader() {

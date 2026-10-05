@@ -13,6 +13,9 @@ import java.util.concurrent.TimeUnit;
 public class ThreadedRuntime implements RaftRuntime {
     private final ScheduledExecutorService timers = Executors.newScheduledThreadPool(2);
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    // thread riêng cho việc đĩa không nằm trên đường trả lời client (đọc log cũ cho một follower tụt xa, xoá phần log đã
+    // compact), để chúng không làm các lần fsync của lệnh mới phải chờ
+    private final ExecutorService reads = Executors.newSingleThreadExecutor();
     private final Random random = new Random();
 
     @Override
@@ -41,6 +44,15 @@ public class ThreadedRuntime implements RaftRuntime {
         }
     }
 
+    @Override
+    public void executeRead(Runnable task) {
+        try {
+            reads.execute(() -> run(task));
+        } catch (RejectedExecutionException e) {
+            // đã shutdown
+        }
+    }
+
     private void run(Runnable task) {
         try {
             task.run();
@@ -59,5 +71,6 @@ public class ThreadedRuntime implements RaftRuntime {
         timers.shutdownNow();
         // task ghi đĩa đã xếp hàng vẫn được chạy nốt
         io.shutdown();
+        reads.shutdownNow();
     }
 }

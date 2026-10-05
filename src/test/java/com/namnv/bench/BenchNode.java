@@ -25,7 +25,10 @@ public class BenchNode {
                 .raftMetaUri(folder).logUri(folder).snapshotUri(folder)
                 .electionTimeoutMinMs(1000).electionTimeoutMaxMs(2000).heartbeatIntervalMs(100)
                 .clientTimeoutMs(10_000)
-                .snapshotIntervalEntries(200_000)
+                .snapshotIntervalEntries(Long.getLong("bench.snapshotInterval", 200_000))
+                .commitIndexFlushIntervalMs(Integer.getInteger("bench.commitFlushMs", 1000))
+                .logSync(!"false".equals(System.getProperty("bench.logSync")))
+                .logPreallocate(!"false".equals(System.getProperty("bench.logPreallocate")))
                 .stateMachine(machine)
                 .raftConfig(RaftConfig.builder().self(id).peers(peers).build())
                 .build(), new SocketRpcClient(2000));

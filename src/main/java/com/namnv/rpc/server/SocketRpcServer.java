@@ -1,6 +1,7 @@
 package com.namnv.rpc.server;
 
 import com.namnv.rpc.ClientService;
+import com.namnv.rpc.FrameWriter;
 import com.namnv.rpc.RaftServerService;
 import com.namnv.rpc.RpcCodec;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
@@ -30,12 +31,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantLock;
 
 @Slf4j
 public class SocketRpcServer {
     // kết nối im lặng quá lâu thì đóng, client sẽ tự kết nối lại
     private static final int IDLE_TIMEOUT_MS = 60_000;
+    // đủ lớn để nhiều message nhỏ đi chung một lần ghi/đọc socket
+    private static final int BUFFER_BYTES = 1 << 16;
 
     private final int port;
     private final RaftServerService raftServerService;
@@ -128,9 +130,8 @@ public class SocketRpcServer {
 
     private class ClientHandler implements Runnable {
         private final Socket socket;
-        // các response được ghi từ nhiều thread, mỗi lần một khung trọn vẹn
-        private final ReentrantLock writeLock = new ReentrantLock();
-        private DataOutputStream out;
+        // các response đến từ nhiều thread được xếp hàng và ghi ra socket theo từng đợt
+        private FrameWriter writer;
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
@@ -143,14 +144,21 @@ public class SocketRpcServer {
                 // đặt timeout trước khi đọc: với TLS, lần đọc đầu tiên còn gồm cả handshake
                 socket.setSoTimeout(IDLE_TIMEOUT_MS);
                 socket.setTcpNoDelay(true);
-                DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-                out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+                DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), BUFFER_BYTES));
+                writer = new FrameWriter(new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), BUFFER_BYTES)),
+                        executor, e -> close());
 
-                // mỗi request được xử lý ở thread riêng và trả lời theo id của nó, nên một request chậm
-                // (ví dụ ReadIndex đang chờ leader xác nhận) không chặn các request khác trên cùng kết nối
+                // Request được trả lời theo id của nó, nên một request chậm không chặn các request khác trên cùng kết nối.
+                // Yêu cầu của client và ReadIndex chỉ đăng ký việc rồi trả về ngay, nên được xử lý luôn trên thread đọc;
+                // tạo một thread cho mỗi yêu cầu như vậy tốn hơn chính việc xử lý nó. Các RPC còn lại có thể chờ đĩa
+                // (AppendEntries, RequestVote, InstallSnapshot) nên mỗi cái chạy ở thread riêng.
                 while (running.get()) {
                     var frame = RpcCodec.read(in);
-                    executor.submit(() -> handle(frame));
+                    if (answersLater(frame.message())) {
+                        handle(frame);
+                    } else {
+                        executor.submit(() -> handle(frame));
+                    }
                 }
             } catch (EOFException | SocketTimeoutException e) {
                 // client đóng kết nối hoặc kết nối idle
@@ -175,15 +183,14 @@ public class SocketRpcServer {
                     pending = clientService.handleClientRead(read);
                 }
                 if (pending != null) {
-                    // Async: future này được hoàn tất bởi thread của Raft ngay lúc lệnh được apply, khi nó còn đang giữ
-                    // lock của node. Ghi response ra socket ngay tại đó sẽ bắt cả node chờ từng lần ghi mạng.
-                    pending.whenCompleteAsync((response, error) -> {
+                    // callback chạy trên thread của node đang lần lượt báo kết quả; respond chỉ xếp response vào hàng ghi
+                    pending.whenComplete((response, error) -> {
                         if (error == null) {
                             respond(frame.requestId(), response);
                         } else {
                             close();
                         }
-                    }, executor);
+                    });
                 } else {
                     respond(frame.requestId(), handleCommandRequest(frame.message()));
                 }
@@ -196,15 +203,13 @@ public class SocketRpcServer {
             }
         }
 
+        private boolean answersLater(Object request) {
+            return request instanceof ReadIndexRequest
+                    || (clientService != null && (request instanceof ClientWriteRequest || request instanceof ClientReadRequest));
+        }
+
         private void respond(long requestId, Object response) {
-            writeLock.lock();
-            try {
-                RpcCodec.write(out, requestId, response);
-            } catch (IOException e) {
-                close();
-            } finally {
-                writeLock.unlock();
-            }
+            writer.send(requestId, response);
         }
 
         private void close() {

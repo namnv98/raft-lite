@@ -43,18 +43,18 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.Supplier;
-import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 @Slf4j
@@ -72,7 +72,7 @@ public class RaftNode implements RaftServerService {
     private volatile NodeState state;
     private volatile boolean stopped;
 
-    private String leaderId;
+    private volatile String leaderId;
     private LeaderState leaderState;
 
     private final ElectionTimer electionTimer;
@@ -80,13 +80,20 @@ public class RaftNode implements RaftServerService {
 
     private final StateMachine stateMachine;
 
-    private final Lock lock = new ReentrantLock();
+    private final ReentrantLock lock = new ReentrantLock();
+    // Kết quả của các future trả cho người gọi. Chúng được quyết định khi node đang giữ lock nhưng chỉ được báo sau khi
+    // nhả lock, theo đúng thứ tự: callback người gọi gắn vào future (ghi mạng, tính toán) không được chặn cả node.
+    private final ConcurrentLinkedQueue<Runnable> completions = new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean completing = new AtomicBoolean();
 
     // cấu hình ban đầu, chỉ dùng khi log và snapshot chưa có config entry nào
     private final ConfigurationEntry initialConf;
     // cấu hình đang có hiệu lực = config entry mới nhất trong log (kể cả chưa commit)
     private volatile ConfigurationEntry conf;
     private long confIndex;
+    // peers() của cấu hình peersOf
+    private ConfigurationEntry peersOf;
+    private List<String> peers = List.of();
 
     // tăng mỗi lần election timeout hoặc nghe được leader, để bỏ qua pre-vote response của vòng cũ
     private long electionEpoch;
@@ -95,7 +102,7 @@ public class RaftNode implements RaftServerService {
     private boolean hadContact;
 
     // lệnh đang chờ commit, theo thứ tự index (cũng là thứ tự hết hạn)
-    private final LinkedHashMap<Long, PendingCommand> pendingFutures = new LinkedHashMap<>();
+    private final ArrayDeque<PendingCommand> pendingFutures = new ArrayDeque<>();
     // các yêu cầu đọc đang chờ leader xác nhận lại quyền và apply tới readIndex
     private final ArrayDeque<PendingRead> pendingReads = new ArrayDeque<>();
     // các yêu cầu đọc đã có readIndex, đang chờ state machine của node này apply tới đó
@@ -121,6 +128,9 @@ public class RaftNode implements RaftServerService {
     private boolean loadingSnapshot;
     private boolean commitIndexFlushScheduled;
     private boolean logSyncQueued;
+    // follower: các lần đọc chưa được hỏi readIndex, và nhóm đang chờ leader trả lời (null nếu không có request nào đang bay)
+    private List<QueuedRead> queuedReads = new ArrayList<>();
+    private ReadIndexBatch readIndexBatch;
     // snapshot đang nhận dần từ leader; trong lúc đó cờ snapshotting cũng được bật
     private IncomingSnapshot incomingSnapshot;
 
@@ -155,7 +165,7 @@ public class RaftNode implements RaftServerService {
             electionTimer.start();
             runtime.schedule(this::housekeeping, housekeepingIntervalMs());
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -176,15 +186,55 @@ public class RaftNode implements RaftServerService {
                 waiter.onFailure().accept(new NotLeaderException(nodeId, null));
             }
             appliedWaiters.clear();
+            sendReadIndex(); // node đã dừng: báo lỗi cho các lần đọc còn xếp hàng
+            if (readIndexBatch != null) {
+                readIndexBatch.fail(new NotLeaderException(nodeId, null));
+                readIndexBatch = null;
+            }
             try {
                 persistent.flush();
+                persistent.getLogStore().flush(); // với logSync = false: tắt bình thường thì không để lại gì chưa xuống đĩa
             } catch (Exception e) {
                 log.error("Node {} failed to flush state on shutdown", nodeId, e);
             }
             persistent.getLogStore().close();
         } finally {
-            lock.unlock();
+            unlock();
         }
+    }
+
+    private void unlock() {
+        lock.unlock();
+        if (!lock.isHeldByCurrentThread()) {
+            runCompletions();
+        }
+    }
+
+    // mỗi lúc một thread báo kết quả, để các future hoàn tất theo đúng thứ tự được quyết định
+    private void runCompletions() {
+        while (!completions.isEmpty() && completing.compareAndSet(false, true)) {
+            try {
+                Runnable completion;
+                while ((completion = completions.poll()) != null) {
+                    try {
+                        completion.run();
+                    } catch (Throwable t) {
+                        log.error("Node {} failed to report a result", nodeId, t);
+                    }
+                }
+            } finally {
+                completing.set(false);
+            }
+        }
+    }
+
+    // gọi khi đang giữ lock: future được hoàn tất ngay sau khi lock được nhả
+    private <T> void complete(CompletableFuture<T> future, T value) {
+        completions.add(() -> future.complete(value));
+    }
+
+    private void fail(CompletableFuture<?> future, Throwable cause) {
+        completions.add(() -> future.completeExceptionally(cause));
     }
 
     // RPC tới node chưa start hoặc đã tắt bị coi như lỗi mạng
@@ -208,8 +258,8 @@ public class RaftNode implements RaftServerService {
     }
 
     private void failPendingFutures() {
-        for (PendingCommand pending : pendingFutures.values()) {
-            pending.future().complete(false);
+        for (PendingCommand pending : pendingFutures) {
+            complete(pending.future(), false);
         }
         pendingFutures.clear();
         var notLeader = new NotLeaderException(nodeId, leaderId);
@@ -234,9 +284,10 @@ public class RaftNode implements RaftServerService {
      * Lệnh được apply nhiều nhất một lần dù được gửi bao nhiêu lần.
      * Client có thể gửi nhiều lệnh cùng lúc mà không cần chờ lệnh trước.
      * <p>
-     * Future được hoàn tất bởi thread của Raft khi nó đang giữ lock của node. Việc gắn vào future bằng
-     * {@code thenApply}/{@code whenComplete} vì thế phải thật nhẹ; việc nặng hơn (ghi mạng, ghi đĩa) nên dùng các
-     * biến thể {@code ...Async} để chạy ở thread khác.
+     * Future được hoàn tất bởi một thread của Raft sau khi nó đã nhả lock của node, nên callback gắn vào bằng
+     * {@code thenApply}/{@code whenComplete} không chặn node. Các future được hoàn tất lần lượt theo thứ tự commit,
+     * vì vậy một callback chậm vẫn làm kết quả của các lệnh sau nó đến trễ; việc nặng (ghi mạng, ghi đĩa) nên dùng
+     * các biến thể {@code ...Async}.
      */
     public CompletableFuture<Boolean> appendClientCommand(String clientId, long sequence, byte[] command) {
         lock.lock();
@@ -256,7 +307,7 @@ public class RaftNode implements RaftServerService {
             long nextIndex = persistent.getLogStore().lastIndex() + 1;
             return appendAndTrack(new LogEntry(nextIndex, persistent.getCurrentTerm(), command, clientId, sequence));
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -271,13 +322,13 @@ public class RaftNode implements RaftServerService {
         }
         commandsAccepted++;
         CompletableFuture<Boolean> future = new CompletableFuture<>();
-        pendingFutures.put(entry.getIndex(), new PendingCommand(future, deadline()));
+        pendingFutures.addLast(new PendingCommand(entry.getIndex(), future, deadline()));
         // replicate log đến followers
         broadcast();
         return future;
     }
 
-    private record PendingCommand(CompletableFuture<Boolean> future, long deadlineNanos) {
+    private record PendingCommand(long index, CompletableFuture<Boolean> future, long deadlineNanos) {
     }
 
     private long deadline() {
@@ -297,17 +348,18 @@ public class RaftNode implements RaftServerService {
             }
             var now = runtime.nanoTime();
             // cả hai hàng đều xếp theo thứ tự đến, nên phần tử đầu luôn hết hạn sớm nhất
-            var commands = pendingFutures.values().iterator();
-            while (commands.hasNext()) {
-                var pending = commands.next();
-                if (pending.deadlineNanos() - now > 0) {
-                    break;
-                }
-                commands.remove();
-                pending.future().complete(false); // timeout → fail client
+            while (!pendingFutures.isEmpty() && pendingFutures.peekFirst().deadlineNanos() - now <= 0) {
+                complete(pendingFutures.pollFirst().future(), false); // timeout → fail client
             }
             while (!pendingReads.isEmpty() && pendingReads.peekFirst().deadlineNanos() - now <= 0) {
                 pendingReads.pollFirst().fail(new TimeoutException("Read was not confirmed by a quorum in time"));
+            }
+            if (readIndexBatch != null && readIndexBatch.deadlineNanos() - now <= 0) {
+                // leader không trả lời: không để các lần đọc đến sau chờ mãi sau request này
+                var expired = readIndexBatch;
+                readIndexBatch = null;
+                expired.fail(new TimeoutException("Leader did not answer ReadIndex in time"));
+                sendReadIndex();
             }
             var waiters = appliedWaiters.iterator();
             while (waiters.hasNext()) {
@@ -319,7 +371,7 @@ public class RaftNode implements RaftServerService {
                 }
             }
         } finally {
-            lock.unlock();
+            unlock();
         }
         runtime.schedule(this::housekeeping, housekeepingIntervalMs());
     }
@@ -346,7 +398,7 @@ public class RaftNode implements RaftServerService {
             var index = persistent.getLogStore().lastIndex() + 1;
             return appendAndTrack(LogEntry.newSessionClose(index, persistent.getCurrentTerm(), clientId));
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -360,7 +412,7 @@ public class RaftNode implements RaftServerService {
                     electionsStarted, timesElectedLeader, commandsAccepted, commandsRejected, duplicateCommands,
                     readsServed, snapshotsCreated, snapshotsInstalled);
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -381,42 +433,93 @@ public class RaftNode implements RaftServerService {
      */
     public <T> CompletableFuture<T> read(Supplier<T> query) {
         var future = new CompletableFuture<T>();
+        // query chạy trong lock, kết quả của nó được báo sau khi nhả lock
         Runnable runQuery = () -> {
             try {
                 readsServed++;
-                future.complete(query.get());
+                complete(future, query.get());
             } catch (Throwable t) {
-                future.completeExceptionally(t);
+                fail(future, t);
             }
         };
+        Consumer<Throwable> onFailure = cause -> fail(future, cause);
         lock.lock();
         try {
             if (stopped || state == null) {
-                future.completeExceptionally(new NotLeaderException(nodeId, leaderId));
+                onFailure.accept(new NotLeaderException(nodeId, leaderId));
             } else if (state == NodeState.LEADER) {
-                confirmLeadership(readIndex -> awaitApplied(readIndex, runQuery, future::completeExceptionally),
-                        future::completeExceptionally);
+                confirmLeadership(readIndex -> awaitApplied(readIndex, runQuery, onFailure), onFailure);
             } else if (leaderId == null || leaderId.equals(nodeId)) {
-                future.completeExceptionally(new NotLeaderException(nodeId, null));
+                onFailure.accept(new NotLeaderException(nodeId, null));
             } else {
-                var leader = leaderId;
-                rpcProcessor.readIndex(leader, new ReadIndexRequest(nodeId)).whenComplete((response, error) -> {
-                    lock.lock();
-                    try {
-                        if (stopped || response == null || !response.success) {
-                            var hint = response != null && !nodeId.equals(response.leaderId) ? response.leaderId : null;
-                            future.completeExceptionally(new NotLeaderException(nodeId, hint));
-                        } else {
-                            awaitApplied(response.readIndex, runQuery, future::completeExceptionally);
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                });
+                queuedReads.add(new QueuedRead(runQuery, onFailure));
+                if (readIndexBatch == null) {
+                    sendReadIndex();
+                }
             }
             return future;
         } finally {
-            lock.unlock();
+            unlock();
+        }
+    }
+
+    // một lần đọc trên follower đang chờ được hỏi readIndex
+    private record QueuedRead(Runnable run, Consumer<Throwable> onFailure) {
+    }
+
+    // các lần đọc đi chung một ReadIndex đang chờ leader trả lời
+    private record ReadIndexBatch(List<QueuedRead> reads, long deadlineNanos) {
+        void fail(Throwable cause) {
+            for (QueuedRead read : reads) {
+                read.onFailure().accept(cause);
+            }
+        }
+    }
+
+    /**
+     * Follower hỏi leader readIndex cho mọi lần đọc đang chờ bằng một request duy nhất. Lần đọc đến trong lúc request
+     * đang bay phải chờ request kế tiếp: readIndex chỉ đúng cho những lần đọc bắt đầu trước khi request được gửi.
+     * Nhờ gom lại, số request tới leader không tăng theo số lần đọc đồng thời.
+     */
+    private void sendReadIndex() {
+        if (queuedReads.isEmpty()) {
+            return;
+        }
+        var batch = new ReadIndexBatch(queuedReads, deadline());
+        queuedReads = new ArrayList<>();
+        if (stopped) {
+            batch.fail(new NotLeaderException(nodeId, null));
+        } else if (state == NodeState.LEADER) {
+            // vừa được bầu trong lúc các lần đọc này còn chờ
+            confirmLeadership(readIndex -> awaitApplied(readIndex, batch), batch::fail);
+        } else if (leaderId == null || leaderId.equals(nodeId)) {
+            batch.fail(new NotLeaderException(nodeId, null));
+        } else {
+            readIndexBatch = batch;
+            rpcProcessor.readIndex(leaderId, new ReadIndexRequest(nodeId)).whenComplete((response, error) -> {
+                lock.lock();
+                try {
+                    if (readIndexBatch != batch) {
+                        return; // đã quá hạn và được báo lỗi
+                    }
+                    readIndexBatch = null;
+                    if (stopped || response == null || !response.success) {
+                        var hint = response != null && !nodeId.equals(response.leaderId) ? response.leaderId : null;
+                        batch.fail(new NotLeaderException(nodeId, hint));
+                    } else {
+                        awaitApplied(response.readIndex, batch);
+                    }
+                    sendReadIndex();
+                } finally {
+                    unlock();
+                }
+            });
+        }
+    }
+
+    private void awaitApplied(long readIndex, ReadIndexBatch batch) {
+        for (QueuedRead read : batch.reads()) {
+            awaitApplied(readIndex, read.run(), read.onFailure());
         }
     }
 
@@ -429,12 +532,12 @@ public class RaftNode implements RaftServerService {
             if (state != NodeState.LEADER) {
                 future.complete(new ReadIndexResponse(false, 0, leaderId));
             } else {
-                confirmLeadership(readIndex -> future.complete(new ReadIndexResponse(true, readIndex, nodeId)),
-                        error -> future.complete(new ReadIndexResponse(false, 0, null)));
+                confirmLeadership(readIndex -> complete(future, new ReadIndexResponse(true, readIndex, nodeId)),
+                        error -> complete(future, new ReadIndexResponse(false, 0, null)));
             }
             return future;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -492,12 +595,7 @@ public class RaftNode implements RaftServerService {
         }
         var applied = volatileState.getLastApplied();
         var ready = new ArrayList<AppliedWaiter>();
-        for (AppliedWaiter waiter : appliedWaiters) {
-            if (waiter.readIndex() <= applied) {
-                ready.add(waiter);
-            }
-        }
-        appliedWaiters.removeAll(ready);
+        appliedWaiters.removeIf(waiter -> waiter.readIndex() <= applied && ready.add(waiter));
         for (AppliedWaiter waiter : ready) {
             waiter.run().run();
         }
@@ -525,7 +623,7 @@ public class RaftNode implements RaftServerService {
             newNodes.add(newNodeId);
             return changePeers(newNodes);
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -542,7 +640,7 @@ public class RaftNode implements RaftServerService {
             }
             return changePeers(newNodes);
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -583,7 +681,7 @@ public class RaftNode implements RaftServerService {
             }
             return true;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -659,7 +757,7 @@ public class RaftNode implements RaftServerService {
     // leader tự gỡ mình: trao quyền cho follower có log đầy đủ nhất thay vì để cluster chờ election timeout
     private void handOverLeadership() {
         var matchIndex = leaderState.getMatchIndex();
-        var candidates = peers();
+        var candidates = new ArrayList<>(peers());
         candidates.sort(Comparator.comparingLong((String peer) -> matchIndex.getOrDefault(peer, 0L)).reversed());
         var term = persistent.getCurrentTerm();
         log.info("Leader {} is no longer in configuration <{}>, step down.", nodeId, conf);
@@ -688,7 +786,7 @@ public class RaftNode implements RaftServerService {
                     transferLeadership(candidates, position + 1, term);
                 }
             } finally {
-                lock.unlock();
+                unlock();
             }
         });
     }
@@ -779,14 +877,23 @@ public class RaftNode implements RaftServerService {
         }
     }
 
+    // danh sách chỉ đọc, được dựng lại khi cấu hình đổi: nó được hỏi cho từng lệnh của client
     private List<String> peers() {
-        var peers = new ArrayList<>(conf.allNodes());
-        peers.remove(nodeId);
+        var current = conf;
+        if (peersOf != current) {
+            var others = new ArrayList<>(current.allNodes());
+            others.remove(nodeId);
+            peers = List.copyOf(others);
+            peersOf = current;
+        }
         return peers;
     }
 
     // mọi node leader cần gửi log: thành viên hiện tại, node đang rời đi và node mới đang bắt kịp
-    private Set<String> replicationTargets() {
+    private Collection<String> replicationTargets() {
+        if (leaderState.getDeparting().isEmpty() && leaderState.getCatchingUp().isEmpty()) {
+            return peers();
+        }
         Set<String> targets = new LinkedHashSet<>(peers());
         targets.addAll(leaderState.getDeparting().keySet());
         targets.addAll(leaderState.getCatchingUp());
@@ -872,7 +979,7 @@ public class RaftNode implements RaftServerService {
                 log.error("Node {} failed to create snapshot", nodeId, e);
             }
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -899,10 +1006,23 @@ public class RaftNode implements RaftServerService {
             snapshotsCreated++;
             if (!stopped) {
                 persistent.getLogStore().truncatePrefix(meta.getLastIncludedIndex() + 1);
+                cleanupLog();
             }
         } finally {
-            lock.unlock();
+            unlock();
         }
+    }
+
+    // Xoá file của phần log vừa được compact ở thread nền. Làm ngay trong lock thì cả node đứng hàng chục mili giây mỗi lần
+    // snapshot, và mọi node của cluster snapshot ở cùng một index nên chúng đứng cùng lúc.
+    private void cleanupLog() {
+        runtime.executeRead(() -> {
+            try {
+                persistent.getLogStore().cleanup();
+            } catch (Exception e) {
+                log.error("Node {} failed to delete compacted log segments", nodeId, e);
+            }
+        });
     }
 
     private void endSnapshotting() {
@@ -910,7 +1030,7 @@ public class RaftNode implements RaftServerService {
         try {
             snapshotting = false;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -998,7 +1118,7 @@ public class RaftNode implements RaftServerService {
             try {
                 abortIncomingSnapshot();
             } finally {
-                lock.unlock();
+                unlock();
             }
             return snapshotResponse(false);
         }
@@ -1017,7 +1137,7 @@ public class RaftNode implements RaftServerService {
             // đã đủ mọi mẩu: phần còn lại vẫn giữ cờ snapshotting cho tới khi cài xong
             incomingSnapshot = null;
         } finally {
-            lock.unlock();
+            unlock();
         }
 
         var meta = new SnapshotMeta(index, req.getLastIncludedTerm(), req.getConf(), req.getFiles(), req.getSessions());
@@ -1074,7 +1194,7 @@ public class RaftNode implements RaftServerService {
             incomingSnapshot.busy = true;
             return null;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1108,7 +1228,7 @@ public class RaftNode implements RaftServerService {
             loadingSnapshot = !stopped && snapshotIndex > volatileState.getCommitIndex();
             return loadingSnapshot;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1136,6 +1256,7 @@ public class RaftNode implements RaftServerService {
                 if (local != null && local.getTerm() == req.getLastIncludedTerm()) {
                     // log khớp với snapshot thì giữ lại phần phía sau
                     logStore.truncatePrefix(index + 1);
+                    cleanupLog();
                 } else {
                     logStore.reset(index, req.getLastIncludedTerm());
                 }
@@ -1145,6 +1266,7 @@ public class RaftNode implements RaftServerService {
             } else {
                 // state machine đã đi qua điểm này: chỉ cần bỏ phần log mà snapshot đã bao phủ
                 logStore.truncatePrefix(index + 1);
+                cleanupLog();
             }
             refreshConf();
             if (loaded) {
@@ -1160,7 +1282,7 @@ public class RaftNode implements RaftServerService {
             return loaded ? failStop("snapshot at index " + index + " was loaded but could not be installed")
                     : snapshotResponse(false);
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1204,7 +1326,7 @@ public class RaftNode implements RaftServerService {
             }
             return new PreVoteResponse(term, isLogUpToDate(request.lastLogTerm, request.lastLogIndex));
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1228,7 +1350,7 @@ public class RaftNode implements RaftServerService {
             }
             return response;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1254,7 +1376,7 @@ public class RaftNode implements RaftServerService {
             }
             return new RequestVoteResponse(persistent.getCurrentTerm(), voteGranted);
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1277,7 +1399,7 @@ public class RaftNode implements RaftServerService {
             becomeCandidate(); // bỏ qua pre-vote: leader hiện tại đã chủ động nhường
             return new TimeoutNowResponse(req.term, true);
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1306,7 +1428,7 @@ public class RaftNode implements RaftServerService {
             }
             return response;
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1333,7 +1455,7 @@ public class RaftNode implements RaftServerService {
                     return new AppendEntriesResponse(term, false, req.prevLogIndex - 1);
                 }
 
-                List<LogEntry> entries = req.entries != null ? req.entries : List.of();
+                List<LogEntry> entries = req.entries();
                 storeEntries(entries);
 
                 var lastNewIndex = req.prevLogIndex + entries.size();
@@ -1348,7 +1470,7 @@ public class RaftNode implements RaftServerService {
                 return new AppendEntriesResponse(term, false, volatileState.getCommitIndex());
             }
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1420,7 +1542,7 @@ public class RaftNode implements RaftServerService {
             }
             startPreVote();
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1444,7 +1566,7 @@ public class RaftNode implements RaftServerService {
                 try {
                     onPreVoteResponse(peer, response, epoch, term, granted);
                 } finally {
-                    lock.unlock();
+                    unlock();
                 }
             });
         }
@@ -1511,7 +1633,7 @@ public class RaftNode implements RaftServerService {
                     requestVotes(termStarted);
                 }
             } finally {
-                lock.unlock();
+                unlock();
             }
         });
     }
@@ -1533,7 +1655,7 @@ public class RaftNode implements RaftServerService {
                 try {
                     onVoteResponse(peer, resp, termStarted, granted);
                 } finally {
-                    lock.unlock();
+                    unlock();
                 }
             });
         }
@@ -1601,7 +1723,7 @@ public class RaftNode implements RaftServerService {
                 replicateTo(peer);
             }
         } finally {
-            lock.unlock();
+            unlock();
         }
     }
 
@@ -1650,7 +1772,7 @@ public class RaftNode implements RaftServerService {
                         }
                     }
                 } finally {
-                    lock.unlock();
+                    unlock();
                 }
             }
         });
@@ -1682,17 +1804,66 @@ public class RaftNode implements RaftServerService {
 
     // gửi mọi entry từ nextIdx, hoặc heartbeat rỗng nếu follower đã đủ log
     private void sendEntries(LeaderState ls, String peer, long nextIdx) {
+        var logStore = persistent.getLogStore();
         var prevIndex = nextIdx - 1;
         // phần còn lại (nếu có) được gửi tiếp ngay khi request này được trả lời
-        var entries = persistent.getLogStore().readFrom(nextIdx, nodeOptions.getMaxEntriesPerRequest());
-        var req = new AppendEntriesRequest(persistent.getCurrentTerm(), nodeId, prevIndex, termAt(prevIndex), entries, volatileState.getCommitIndex());
+        var maxEntries = nodeOptions.getMaxEntriesPerRequest();
+        // term của prevIndex cũng nằm trong log, trừ khi prevIndex chính là mốc của snapshot
+        var prevInLog = prevIndex > logStore.getBaseIndex();
+        var readStart = prevInLog ? prevIndex : nextIdx;
+        var readCount = prevInLog ? maxEntries + 1 : maxEntries;
+        if (logStore.isCached(readStart, readCount)) {
+            // log lưu sẵn entry dưới dạng khung thì gửi nguyên vùng byte đó, không dựng lại từng entry cho từng follower
+            var block = logStore.readBlock(nextIdx, maxEntries);
+            if (block != null) {
+                send(ls, peer, new AppendEntriesRequest(persistent.getCurrentTerm(), nodeId, prevIndex, termAt(prevIndex),
+                        block, volatileState.getCommitIndex()));
+            } else {
+                sendEntries(ls, peer, prevIndex, termAt(prevIndex), logStore.readFrom(nextIdx, maxEntries));
+            }
+            return;
+        }
+        // follower tụt xa hơn phần log còn trong bộ nhớ: đọc từ đĩa ở thread khác, node không phải chờ
+        var baseTerm = logStore.getBaseTerm();
+        runtime.executeRead(() -> {
+            List<LogEntry> read = null;
+            try {
+                read = logStore.readFrom(readStart, readCount);
+            } catch (Exception e) {
+                log.error("Leader {} failed to read log from index {} for {}", nodeId, readStart, peer, e);
+            }
+            lock.lock();
+            try {
+                // Chừng nào node còn là leader của đúng nhiệm kỳ đó thì log của nó chỉ dài thêm, nên phần vừa đọc vẫn đúng.
+                // Nếu snapshot vừa compact mất đoạn này thì bỏ, nhịp sau sẽ gửi snapshot.
+                if (read == null || read.isEmpty() || read.get(0).getIndex() != readStart || stopped || leaderState != ls) {
+                    ls.getInflight().remove(peer);
+                    return;
+                }
+                var prevTerm = prevInLog ? read.get(0).getTerm() : baseTerm;
+                sendEntries(ls, peer, prevIndex, prevTerm, prevInLog ? new ArrayList<>(read.subList(1, read.size())) : read);
+            } catch (Exception e) {
+                log.error("Leader {} failed to replicate to {}", nodeId, peer, e);
+                ls.getInflight().remove(peer);
+            } finally {
+                unlock();
+            }
+        });
+    }
+
+    private void sendEntries(LeaderState ls, String peer, long prevIndex, long prevTerm, List<LogEntry> entries) {
+        send(ls, peer, new AppendEntriesRequest(persistent.getCurrentTerm(), nodeId, prevIndex, prevTerm, entries,
+                volatileState.getCommitIndex()));
+    }
+
+    private void send(LeaderState ls, String peer, AppendEntriesRequest req) {
         var sentStamp = ls.nextStamp();
         rpcProcessor.appendEntries(peer, req).whenComplete((resp, error) -> {
             lock.lock();
             try {
                 onAppendEntriesResponse(ls, peer, req, resp, sentStamp);
             } finally {
-                lock.unlock();
+                unlock();
             }
         });
     }
@@ -1727,7 +1898,7 @@ public class RaftNode implements RaftServerService {
             return;
         }
 
-        match = Math.max(match, req.prevLogIndex + req.entries.size());
+        match = Math.max(match, req.prevLogIndex + req.entryCount());
         ls.getMatchIndex().put(peer, match);
         ls.getNextIndex().put(peer, match + 1);
         onLearnerProgress(ls, peer, match);
@@ -1781,7 +1952,7 @@ public class RaftNode implements RaftServerService {
                     try {
                         onInstallSnapshotResponse(ls, peer, req, resp, transfer, lastChunkOfFile);
                     } finally {
-                        lock.unlock();
+                        unlock();
                     }
                 });
             } catch (Exception e) {
@@ -1792,7 +1963,7 @@ public class RaftNode implements RaftServerService {
                     ls.getInflight().remove(peer);
                     ls.getSnapshotTransfers().remove(peer);
                 } finally {
-                    lock.unlock();
+                    unlock();
                 }
             }
         });
@@ -1890,9 +2061,10 @@ public class RaftNode implements RaftServerService {
                 applyCommand(logEntry);
             }
             volatileState.setLastApplied(idx);
-            var pending = pendingFutures.remove(idx);
-            if (pending != null) {
-                pending.future().complete(true);
+            // hàng chờ xếp theo index, và các entry được apply theo đúng thứ tự đó
+            while (!pendingFutures.isEmpty() && pendingFutures.peekFirst().index() <= idx) {
+                var pending = pendingFutures.pollFirst();
+                complete(pending.future(), pending.index() == idx);
             }
         }
         // commit index chỉ cập nhật trong bộ nhớ, ghi xuống đĩa sau theo nhịp ở thread IO
@@ -1922,7 +2094,7 @@ public class RaftNode implements RaftServerService {
             try {
                 commitIndexFlushScheduled = false;
             } finally {
-                lock.unlock();
+                unlock();
             }
             runIo(persistent::flush);
         }, interval);

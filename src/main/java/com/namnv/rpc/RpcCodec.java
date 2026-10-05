@@ -19,7 +19,9 @@ import com.namnv.rpc.model.response.PreVoteResponse;
 import com.namnv.rpc.model.response.ReadIndexResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
 import com.namnv.rpc.model.response.TimeoutNowResponse;
+import com.namnv.storage.binary.EntryFrame;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -71,18 +73,29 @@ public final class RpcCodec {
     }
 
     public static void write(DataOutputStream out, long requestId, Object message) throws IOException {
-        var body = new ByteArrayOutputStream();
-        int type = encode(new DataOutputStream(body), message);
-        if (body.size() + HEADER_BYTES > MAX_FRAME_BYTES) {
-            throw new IOException("RPC message of " + body.size() + " bytes exceeds the frame limit");
-        }
-        out.writeInt(body.size() + HEADER_BYTES);
-        out.writeLong(requestId);
-        out.writeByte(type);
-        body.writeTo(out);
+        writeFrame(out, requestId, message, new ByteArrayOutputStream());
         out.flush();
     }
 
+    /**
+     * Ghi một khung mà không flush, để người gọi gom nhiều khung vào một lần ghi ra socket.
+     * {@code scratch} là bộ đệm dùng lại giữa các lần gọi của cùng một thread, nội dung cũ của nó bị bỏ.
+     */
+    public static void writeFrame(DataOutputStream out, long requestId, Object message, ByteArrayOutputStream scratch)
+            throws IOException {
+        scratch.reset();
+        int type = encode(new DataOutputStream(scratch), message);
+        if (scratch.size() + HEADER_BYTES > MAX_FRAME_BYTES) {
+            throw new IOException("RPC message of " + scratch.size() + " bytes exceeds the frame limit");
+        }
+        out.writeInt(scratch.size() + HEADER_BYTES);
+        out.writeLong(requestId);
+        out.writeByte(type);
+        scratch.writeTo(out);
+    }
+
+    // Nội dung được giải mã thẳng từ stream: một lệnh lớn chỉ được chép một lần, từ socket vào mảng byte cuối cùng của nó.
+    // Khi khung sai định dạng, stream bị bỏ dở giữa khung nên người gọi phải đóng kết nối.
     public static Frame read(DataInputStream in) throws IOException {
         int length = in.readInt();
         if (length < HEADER_BYTES || length > MAX_FRAME_BYTES) {
@@ -90,9 +103,7 @@ public final class RpcCodec {
         }
         long requestId = in.readLong();
         int type = in.readUnsignedByte();
-        byte[] body = new byte[length - HEADER_BYTES];
-        in.readFully(body);
-        return new Frame(requestId, decode(type, body));
+        return new Frame(requestId, decode(type, new Reader(in, length - HEADER_BYTES)));
     }
 
     // ---------- mã hoá ----------
@@ -128,10 +139,16 @@ public final class RpcCodec {
             out.writeLong(m.prevLogIndex);
             out.writeLong(m.prevLogTerm);
             out.writeLong(m.leaderCommit);
-            List<LogEntry> entries = m.entries != null ? m.entries : List.of();
-            out.writeInt(entries.size());
-            for (LogEntry entry : entries) {
-                writeEntry(out, entry);
+            // các entry đi dưới dạng khung của file log: leader có sẵn block thì chỉ việc chép vùng byte đó ra
+            out.writeInt(m.entryCount());
+            if (m.block != null) {
+                byte[] frames = m.block.copy();
+                out.writeInt(frames.length);
+                out.write(frames);
+            } else {
+                ByteBuffer frames = EntryFrame.encodeAll(m.entries != null ? m.entries : List.of());
+                out.writeInt(frames.capacity());
+                out.write(frames.array(), 0, frames.capacity());
             }
             return APPEND_ENTRIES_REQUEST;
         }
@@ -251,21 +268,13 @@ public final class RpcCodec {
         }
     }
 
-    private static void writeEntry(DataOutputStream out, LogEntry entry) throws IOException {
-        out.writeLong(entry.getIndex());
-        out.writeLong(entry.getTerm());
-        out.writeBoolean(entry.isConfigurationEntry());
-        out.writeBoolean(entry.isSessionClose());
-        writeBytes(out, entry.getCommand());
-        writeConfiguration(out, entry.getConfiguration());
-        writeString(out, entry.getClientId());
-        out.writeLong(entry.getSequence());
-    }
-
     // ---------- giải mã ----------
 
     static Object decode(int type, byte[] body) throws IOException {
-        var in = new Reader(body);
+        return decode(type, new Reader(new DataInputStream(new ByteArrayInputStream(body)), body.length));
+    }
+
+    private static Object decode(int type, Reader in) throws IOException {
         try {
             Object message = switch (type) {
                 case PRE_VOTE_REQUEST -> new PreVoteRequest(in.readLong(), in.readString(), in.readLong(), in.readLong());
@@ -305,61 +314,70 @@ public final class RpcCodec {
         long prevLogTerm = in.readLong();
         long leaderCommit = in.readLong();
         int count = in.readCount();
-        List<LogEntry> entries = new ArrayList<>(count);
-        for (int i = 0; i < count; i++) {
-            LogEntry entry = new LogEntry();
-            entry.setIndex(in.readLong());
-            entry.setTerm(in.readLong());
-            entry.setConfigurationEntry(in.readBoolean());
-            entry.setSessionClose(in.readBoolean());
-            entry.setCommand(in.readBytes());
-            entry.setConfiguration(in.readConfiguration());
-            entry.setClientId(in.readString());
-            entry.setSequence(in.readLong());
-            entries.add(entry);
+        byte[] frames = in.readBytes();
+        if (frames == null) {
+            throw new IOException("AppendEntries without entry frames");
         }
+        List<LogEntry> entries = EntryFrame.readAll(ByteBuffer.wrap(frames), count);
         return new AppendEntriesRequest(term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit);
     }
 
-    // đọc từng trường và từ chối mọi độ dài lớn hơn số byte còn lại
+    // đọc từng trường và từ chối mọi độ dài lớn hơn số byte còn lại của khung
     private static final class Reader {
-        private final ByteBuffer buffer;
+        private final DataInputStream in;
+        private int remaining;
 
-        Reader(byte[] body) {
-            this.buffer = ByteBuffer.wrap(body);
+        Reader(DataInputStream in, int length) {
+            this.in = in;
+            this.remaining = length;
         }
 
         int remaining() {
-            return buffer.remaining();
+            return remaining;
         }
 
-        long readLong() {
-            return buffer.getLong();
+        private void take(int bytes) throws IOException {
+            if (bytes > remaining) {
+                throw new IOException("RPC message is shorter than its fields");
+            }
+            remaining -= bytes;
         }
 
-        boolean readBoolean() {
-            return buffer.get() != 0;
+        long readLong() throws IOException {
+            take(Long.BYTES);
+            return in.readLong();
+        }
+
+        int readInt() throws IOException {
+            take(Integer.BYTES);
+            return in.readInt();
+        }
+
+        boolean readBoolean() throws IOException {
+            take(1);
+            return in.readByte() != 0;
         }
 
         // số phần tử của một danh sách: mỗi phần tử chiếm ít nhất một byte nên không thể nhiều hơn số byte còn lại
         int readCount() throws IOException {
-            int count = buffer.getInt();
-            if (count < 0 || count > buffer.remaining()) {
+            int count = readInt();
+            if (count < 0 || count > remaining) {
                 throw new IOException("Invalid element count " + count);
             }
             return count;
         }
 
         byte[] readBytes() throws IOException {
-            int length = buffer.getInt();
+            int length = readInt();
             if (length == -1) {
                 return null;
             }
-            if (length < 0 || length > buffer.remaining()) {
+            if (length < 0 || length > remaining) {
                 throw new IOException("Invalid field length " + length);
             }
+            take(length);
             byte[] bytes = new byte[length];
-            buffer.get(bytes);
+            in.readFully(bytes);
             return bytes;
         }
 
@@ -386,11 +404,11 @@ public final class RpcCodec {
         }
 
         Map<String, ClientSession> readSessions() throws IOException {
-            int count = buffer.getInt();
+            int count = readInt();
             if (count == -1) {
                 return null;
             }
-            if (count < 0 || count > buffer.remaining()) {
+            if (count < 0 || count > remaining) {
                 throw new IOException("Invalid session count " + count);
             }
             Map<String, ClientSession> sessions = new HashMap<>();

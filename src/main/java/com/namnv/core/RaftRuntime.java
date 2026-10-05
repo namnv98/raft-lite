@@ -18,6 +18,13 @@ public interface RaftRuntime {
     // các task chạy lần lượt theo thứ tự gửi vào, ngoài lock của node
     void executeIo(Runnable task);
 
+    // việc đĩa không nằm trên đường trả lời client (đọc entry cũ của log cho một follower tụt xa, xoá phần log đã compact),
+    // ngoài lock của node; không cần xếp hàng chung với việc ghi
+    default void executeRead(Runnable task) {
+        executeIo(task);
+    }
+
+
     int nextInt(int bound);
 
     void shutdown();

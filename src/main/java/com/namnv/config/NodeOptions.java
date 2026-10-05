@@ -45,6 +45,35 @@ public class NodeOptions {
     @Builder.Default
     private int logCacheEntries = 16_384;
 
+    // kích thước mỗi file segment của log; một entry không được lớn hơn một segment
+    @Builder.Default
+    private int logSegmentBytes = 64 << 20;
+
+    /**
+     * true (mặc định): một entry chỉ được coi là bền vững, và node chỉ trả lời "đã lưu" cho leader hay tính mình vào
+     * quorum, sau khi log đã được ép xuống đĩa (fsync). Đây là giả định của Raft: node đã hứa thì sau khi khởi động
+     * lại vẫn còn entry đó.
+     * <p>
+     * false: làm như Aeron Cluster. Entry được coi là bền vững ngay khi đã ghi vào file (page cache của hệ điều hành);
+     * hệ điều hành tự ghi xuống đĩa sau. Độ trễ không còn phụ thuộc tốc độ fsync của ổ đĩa, đổi lại:
+     * <ul>
+     * <li>Tiến trình bị crash hay bị kill: không mất gì, dữ liệu đã nằm trong page cache.</li>
+     * <li>Máy mất điện hoặc kernel treo: node đó mất các entry cuối chưa kịp xuống đĩa dù đã trả lời "đã lưu". Chỉ một
+     * node như vậy cũng có thể làm mất lệnh đã commit (nó quên entry rồi cùng một node đang tụt lại bầu ra leader mới
+     * không có entry đó), và nếu đa số node cùng mất điện thì chắc chắn mất.</li>
+     * </ul>
+     * Chỉ nên tắt khi các node nằm trên những máy có nguồn điện độc lập và hệ thống chấp nhận rủi ro trên.
+     * Term và phiếu bầu (raft_meta.json) cùng snapshot vẫn luôn được fsync, vì chúng hiếm khi được ghi.
+     */
+    @Builder.Default
+    private boolean logSync = true;
+
+    // Cấp phát sẵn file segment kế tiếp ở thread nền (ghi đầy byte 0 rồi fsync). fsync trên file cấp phát sẵn nhanh hơn
+    // vài lần so với trên file thưa, vì filesystem không phải ghi nhận block mới cho mỗi lần fsync. Đổi lại mỗi segment
+    // được ghi hai lần, nên log chỉ làm việc này khi nó lớn chậm (dưới khoảng 40 MB/giây), và chỉ khi logSync = true.
+    @Builder.Default
+    private boolean logPreallocate = true;
+
     // commit index được ghi xuống đĩa nhiều nhất mỗi khoảng này một lần. Nó chỉ giúp lần khởi động sau apply lại
     // nhanh hơn chứ không cần cho tính đúng đắn, nên không đáng tốn một lần fsync cho mỗi lệnh; 0 là ghi sau mỗi lần commit
     @Builder.Default
