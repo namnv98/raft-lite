@@ -1,26 +1,36 @@
 package com.namnv.rpc.server;
 
 import com.namnv.rpc.RaftServerService;
+import com.namnv.rpc.RpcSerialization;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
+import com.namnv.rpc.model.request.TimeoutNowRequest;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @Slf4j
 public class SocketRpcServer {
+    // kết nối im lặng quá lâu thì đóng, client sẽ tự kết nối lại
+    private static final int IDLE_TIMEOUT_MS = 60_000;
+
     private final int port;
     private final RaftServerService raftServerService;
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final Set<Socket> clients = ConcurrentHashMap.newKeySet();
     private ServerSocket serverSocket;
     private ExecutorService executor;
 
@@ -49,6 +59,8 @@ public class SocketRpcServer {
                     }
                 });
             } catch (IOException e) {
+                running.set(false);
+                executor.shutdown();
                 throw new RuntimeException("Failed to start RPC server on port " + port, e);
             }
         }
@@ -62,6 +74,13 @@ public class SocketRpcServer {
                 }
             } catch (IOException e) {
                 log.error("Error closing server socket: " + e.getMessage());
+            }
+            for (Socket client : clients) {
+                try {
+                    client.close();
+                } catch (IOException e) {
+                    // Ignore close errors
+                }
             }
             if (executor != null) {
                 executor.shutdown();
@@ -79,19 +98,33 @@ public class SocketRpcServer {
 
         @Override
         public void run() {
-            try (ObjectInputStream in = new ObjectInputStream(socket.getInputStream()); ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream())) {
-
-                socket.setSoTimeout(5000); // 5 second timeout for RPC operations
-
-                Object request = in.readObject();
-                Object response = handleCommandRequest(request);
-
-                out.writeObject(response);
+            clients.add(socket);
+            try {
+                // đặt timeout trước khi tạo stream: constructor ObjectInputStream đã đọc header
+                socket.setSoTimeout(IDLE_TIMEOUT_MS);
+                socket.setTcpNoDelay(true);
+                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+                in.setObjectInputFilter(RpcSerialization.FILTER);
+                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
                 out.flush();
 
+                // một kết nối phục vụ nhiều request nối tiếp nhau
+                while (running.get()) {
+                    Object request = in.readObject();
+                    Object response = handleCommandRequest(request);
+
+                    out.writeObject(response);
+                    out.flush();
+                    out.reset();
+                }
+            } catch (EOFException | SocketTimeoutException e) {
+                // client đóng kết nối hoặc kết nối idle
             } catch (Exception e) {
-                log.error("Client handling error: " + e.getMessage());
+                if (running.get()) {
+                    log.error("Client handling error: " + e.getMessage());
+                }
             } finally {
+                clients.remove(socket);
                 try {
                     socket.close();
                 } catch (IOException e) {
@@ -113,7 +146,11 @@ public class SocketRpcServer {
             if (request instanceof InstallSnapshotRequest snapshotRequest) {
                 return raftServerService.handleInstallSnapshotRequest(snapshotRequest);
             }
-            return new RuntimeException("Unknown request type: " + request.getClass().getSimpleName());
+            if (request instanceof TimeoutNowRequest timeoutNowRequest) {
+                return raftServerService.handleTimeoutNowRequest(timeoutNowRequest);
+            }
+            // đóng kết nối thay vì gửi về một object mà client không cast được
+            throw new IllegalArgumentException("Unknown request type: " + request.getClass().getSimpleName());
         }
     }
 }

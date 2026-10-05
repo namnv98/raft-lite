@@ -26,13 +26,15 @@ public class ElectionTimer {
     }
 
     public synchronized void reset() {
-        if (current != null) current.cancel(true);
+        if (exec.isShutdown()) return;
+        // không interrupt: callback có thể đang ghi đĩa
+        if (current != null) current.cancel(false);
         int timeout = minTimeoutMs + rand.nextInt(maxTimeoutMs - minTimeoutMs + 1);
         current = exec.schedule(onTimeout, timeout, TimeUnit.MILLISECONDS);
     }
 
     public synchronized void stop() {
-        if (current != null) current.cancel(true);
+        if (current != null) current.cancel(false);
     }
 
     public synchronized void shutdown() {

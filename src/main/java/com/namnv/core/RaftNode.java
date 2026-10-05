@@ -1,44 +1,52 @@
 package com.namnv.core;
 
 import com.namnv.config.NodeOptions;
-import com.namnv.config.RaftConfig;
+import com.namnv.entity.ConfigurationEntry;
 import com.namnv.entity.LogEntry;
-import com.namnv.rpc.*;
-import com.namnv.rpc.client.InMemoryRpcClient;
+import com.namnv.rpc.RaftServerService;
 import com.namnv.rpc.client.RpcProcessor;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
+import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
-import com.namnv.rpc.server.SocketRpcServer;
+import com.namnv.rpc.model.response.TimeoutNowResponse;
 import com.namnv.state.LeaderState;
 import com.namnv.state.PersistentState;
 import com.namnv.state.VolatileState;
 import com.namnv.statemachine.StateMachine;
-import com.namnv.entity.ConfigurationEntry;
+import com.namnv.statemachine.snapshot.SnapshotMeta;
+import com.namnv.statemachine.snapshot.SnapshotReader;
 import com.namnv.statemachine.snapshot.SnapshotWriter;
+import com.namnv.storage.FileUtil;
 import com.namnv.timer.ElectionTimer;
 import com.namnv.timer.HeartbeatTimer;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
-
-import static java.util.Objects.isNull;
 
 @Slf4j
 @Getter
@@ -48,19 +56,20 @@ public class RaftNode implements RaftServerService {
         LEADER,
         CANDIDATE,
         FOLLOWER,
-        LEARNER,
     }
 
-    private final RaftConfig config;
+    private static final long CLIENT_TIMEOUT_MS = 5000;
 
+    private final NodeOptions nodeOptions;
     private final RpcProcessor rpcProcessor;
-    private final SocketRpcServer rpcServer;
 
     private final PersistentState persistent;
     private final VolatileState volatileState = new VolatileState();
 
     private final String nodeId;
+    // null cho tới khi start()
     private volatile NodeState state;
+    private volatile boolean stopped;
 
     private String leaderId;
     private LeaderState leaderState;
@@ -72,663 +81,119 @@ public class RaftNode implements RaftServerService {
 
     private final Lock lock = new ReentrantLock();
 
-    private final ConfigurationEntry conf;
+    // cấu hình ban đầu, chỉ dùng khi log và snapshot chưa có config entry nào
+    private final ConfigurationEntry initialConf;
+    // cấu hình đang có hiệu lực = config entry mới nhất trong log (kể cả chưa commit)
+    private volatile ConfigurationEntry conf;
+    private long confIndex;
+
+    // tăng mỗi lần election timeout hoặc nghe được leader, để bỏ qua pre-vote response của vòng cũ
+    private long electionEpoch;
+    // lần gần nhất nghe được leader hoặc vừa bỏ phiếu, dùng để từ chối pre-vote khi leader còn sống
+    private long lastContactNanos;
+    private boolean hadContact;
 
     private final Map<Long, CompletableFuture<Boolean>> pendingFutures = new HashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-    private final long CLIENT_TIMEOUT_MS = 5000;
+    // mọi thao tác ghi đĩa chạy ở đây, ngoài lock của node
+    private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
 
-    private final NodeOptions nodeOptions;
+    // đang tạo hoặc cài snapshot: thư mục temp của snapshot store chỉ dùng được cho một việc
+    private boolean snapshotting;
+    // state machine đang load snapshot ngoài lock, tạm hoãn apply
+    private boolean loadingSnapshot;
+
+    // node từng là thành viên; khi cấu hình không còn nó được commit thì node tự tắt
+    private boolean wasMember;
+    private boolean transferring;
+    private boolean removalHandled;
 
     public RaftNode(NodeOptions nodeOptions, RpcProcessor rpcProcessor) {
-        this.rpcServer = new SocketRpcServer(Integer.parseInt(nodeOptions.getRaftConfig().getSelf().split(":")[1]), this);
         this.rpcProcessor = rpcProcessor;
-
-        this.nodeId = nodeOptions.getRaftConfig().getSelf();
         this.nodeOptions = nodeOptions;
-        this.config = nodeOptions.getRaftConfig();
+        this.nodeId = nodeOptions.getRaftConfig().getSelf();
         this.persistent = new PersistentState(nodeOptions);
         this.stateMachine = nodeOptions.getStateMachine();
         this.electionTimer = new ElectionTimer(nodeOptions.getElectionTimeoutMinMs(), nodeOptions.getElectionTimeoutMaxMs(), this::onElectionTimeout);
-        this.heartbeatTimer = new HeartbeatTimer(nodeOptions.getHeartbeatIntervalMs(), this::sendHeartbeats);
-        this.conf = new ConfigurationEntry(nodeOptions.getRaftConfig().getPeers(), new ArrayList<>(), false);
+        this.heartbeatTimer = new HeartbeatTimer(nodeOptions.getHeartbeatIntervalMs(), this::onHeartbeatTick);
+        this.initialConf = new ConfigurationEntry(nodeOptions.getRaftConfig().getPeers());
+        refreshConf();
     }
+
+    // ---------- LIFECYCLE ----------
 
     public void start() {
-        if (rpcProcessor instanceof InMemoryRpcClient) {
-            ((InMemoryRpcClient) rpcProcessor).register(nodeId, this);
-        }
-        rpcServer.start();
-        restoreStateMachineFromSnapshot();
-        this.state = NodeState.FOLLOWER;
-        electionTimer.start();
-    }
-
-    public void onJoinPeerCluster(String newNodeId) {
         lock.lock();
         try {
-            if (state != RaftNode.NodeState.LEADER || leaderState == null) {
+            if (state != null || stopped) {
                 return;
             }
-            // Phase 1: joint configuration (old + new nodes)
-            var newNodes = new ArrayList<>(conf.getOldNodes());
-            newNodes.add(newNodeId);
-            this.conf.setNewNodes(newNodes);
-
-            var jointConfig = new ConfigurationEntry(conf.getOldNodes(), conf.getNewNodes(), true);
-
-            var nextIndex = persistent.getLogStore().lastIndex() + 1;
-            var jointEntry = LogEntry.newConfigurationEntry(nextIndex, persistent.getCurrentTerm(), jointConfig);
-            persistent.getLogStore().appendEntry(jointEntry);
-
-            if (!leaderState.getNextIndex().containsKey(newNodeId)) {
-                leaderState.getNextIndex().put(newNodeId, nextIndex);
-                leaderState.getMatchIndex().put(newNodeId, 0L);
-                replicateLogsForJoiningNode(newNodeId);
-            }
+            restoreStateMachine();
+            this.state = NodeState.FOLLOWER;
+            electionTimer.start();
         } finally {
             lock.unlock();
         }
     }
 
-    private void replicateLogsForJoiningNode(String nodeId) {
+    public void shutdown() {
         lock.lock();
         try {
-            if (state != NodeState.LEADER) {
+            if (stopped) {
                 return;
             }
-            var nextIdx = leaderState.getNextIndex().get(nodeId);
-            var entries = persistent.getLogStore().readFrom(nextIdx);
-            var prevIndex = nextIdx - 1;
-            if (isNull(persistent.getLogStore().get(prevIndex))) {
-                sendSnapshotToNode(nodeId);
-                return;
-            }
-            var prevTerm = prevIndex == 0 ? 0 : persistent.getLogStore().get(prevIndex).getTerm();
-
-            var req = new AppendEntriesRequest(
-                    persistent.getCurrentTerm(), this.nodeId, prevIndex, prevTerm, entries, volatileState.getCommitIndex()
-            );
-
-            rpcProcessor.appendEntries(nodeId, req).thenAccept(resp -> {
-                lock.lock();
-                try {
-                    if (resp.term > persistent.getCurrentTerm()) {
-                        becomeFollower(resp.term);
-                        return;
-                    }
-                    if (resp.success) {
-                        leaderState.getMatchIndex().put(nodeId, prevIndex + entries.size());
-                        leaderState.getNextIndex().put(nodeId, prevIndex + entries.size() + 1);
-                        maybeAdvanceCommitIndex();
-                        finalizeJoiningNodeIfCaughtUp(nodeId);
-                    } else {
-                        long ni = leaderState.getNextIndex().get(nodeId);
-                        if (ni > 1) {
-                            leaderState.getNextIndex().put(nodeId, ni - 1);
-                        }
-                        replicateLogsForJoiningNode(nodeId); // retry
-                    }
-                } finally {
-                    lock.unlock();
-                }
-            });
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private void sendSnapshotToNode(String nodeId) {
-        lock.lock();
-        try {
-            var req = new InstallSnapshotRequest(
-                    persistent.getCurrentTerm(),
-                    this.nodeId,
-                    persistent.getLogStore().getBaseIndex(),
-                    persistent.getLogStore().getBaseTerm(),
-                    nodeOptions.getSnapshotUri() + "/snapshot.data"
-            );
-
-            rpcProcessor.installSnapshot(nodeId, req).thenAccept(resp -> {
-                lock.lock();
-                try {
-                    if (resp.getTerm() > persistent.getCurrentTerm()) {
-                        becomeFollower(resp.getTerm());
-                        return;
-                    }
-                    // Sau khi snapshot áp dụng xong → cập nhật nextIndex và matchIndex
-                    leaderState.getNextIndex().put(nodeId, persistent.getLogStore().getBaseIndex() + 1);
-                    leaderState.getMatchIndex().put(nodeId, persistent.getLogStore().getBaseIndex());
-
-                    finalizeJoiningNodeIfCaughtUp(nodeId);
-
-                    sendLogs(nodeId, persistent.getLogStore().getBaseIndex() + 1, persistent.getLogStore().getBaseIndex(), persistent.getLogStore().getBaseTerm());
-
-                } finally {
-                    lock.unlock();
-                }
-            });
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private void sendLogs(String nodeId, long nextIdx, long prevIndex, long prevTerm) {
-        lock.lock();
-        try {
-            var entries = persistent.getLogStore().readFrom(nextIdx);
-            var req = new AppendEntriesRequest(persistent.getCurrentTerm(), this.nodeId, prevIndex, prevTerm, entries, volatileState.getCommitIndex());
-            rpcProcessor.appendEntries(nodeId, req).thenAccept(resp -> {
-                lock.lock();
-                try {
-                    if (resp.term > persistent.getCurrentTerm()) {
-                        becomeFollower(resp.term);
-                        return;
-                    }
-                    if (resp.success) {
-                        leaderState.getMatchIndex().put(nodeId, prevIndex + entries.size());
-                        leaderState.getNextIndex().put(nodeId, prevIndex + entries.size() + 1);
-                        maybeAdvanceCommitIndex();
-                        finalizeJoiningNodeIfCaughtUp(nodeId);
-                    } else {
-                        throw new RuntimeException();
-                    }
-                } finally {
-                    lock.unlock();
-                }
-            });
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private void finalizeJoiningNodeIfCaughtUp(String newNodeId) {
-        lock.lock();
-        try {
-            var matchIndex = leaderState.getMatchIndex().getOrDefault(newNodeId, 0L);
-            var lastIndex = persistent.getLogStore().lastIndex();
-
-            if (matchIndex >= lastIndex) {
-                // Phase 2: final configuration (joint=false)
-                this.conf.setOldNodes(conf.getNewNodes());
-                this.conf.setNewNodes(new ArrayList<>());
-
-                var finalConf = new ConfigurationEntry(this.conf.getOldNodes(), this.conf.getNewNodes(), false);
-                var idx = lastIndex + 1;
-                var finalEntry = LogEntry.newConfigurationEntry(idx, persistent.getCurrentTerm(), finalConf);
-
-                persistent.getLogStore().appendEntry(finalEntry);
-            }
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private void restoreStateMachineFromSnapshot() {
-        lock.lock();
-        try {
-            try {
-                if (persistent.getLastSnapshotIndex() > -1) {
-                    volatileState.setLastApplied(persistent.getLastSnapshotIndex());
-                    volatileState.setCommitIndex(persistent.getLastSnapshotIndex());
-                }
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-
-            // Apply các log sau snapshot
-            var lastApplied = volatileState.getLastApplied();
-            var commitIndex = persistent.getLastCommitIndex();
-            var log = persistent.getLogStore();
-
-            for (var i = lastApplied + 1; i <= commitIndex; i++) {
-                LogEntry logEntry = log.get(i);
-                if (logEntry != null) {
-                    stateMachine.onApply(nodeId, logEntry);
-                }
-                volatileState.setLastApplied(i);
-                volatileState.setCommitIndex(i);
-            }
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    public void createSnapshot() {
-        lock.lock();
-        try {
-            var commitIndex = volatileState.getCommitIndex();
-            var logStore = persistent.getLogStore();
-            stateMachine.onSnapshotSave(new SnapshotWriter(nodeOptions.getSnapshotUri(), new ArrayList<>()), status -> {
-                if (!status.isOk()) {
-                    log.error("Snapshot failed: {}", status);
-                    return;
-                }
-                persistent.setLastSnapshotTerm(persistent.getCurrentTerm());
-                persistent.setLastSnapshotIndex(commitIndex);
-                persistent.persist();
-                logStore.truncatePrefix(commitIndex + 1);
-            });
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    @Override
-    public PreVoteResponse handlePreVoteRequest(PreVoteRequest request) {
-        lock.lock();
-        try {
-            if (!conf.getOldNodes().contains(request.candidateId)) {
-                log.warn("Node {} ignore PreVoteRequest from {} as it is not in conf <{}>.", getNodeId(), request.candidateId, this.conf);
-                return new PreVoteResponse(persistent.getCurrentTerm(), false);
-            }
-            if (request.term < persistent.getCurrentTerm()) {
-                return new PreVoteResponse(persistent.getCurrentTerm(), false);
-            }
-
-            var lastLogIndex = persistent.getLogStore().lastIndex();
-            var lastLogTerm = persistent.getLogStore().lastTerm();
-
-            var upToDate = (request.lastLogTerm > lastLogTerm) ||
-                    (request.lastLogTerm == lastLogTerm && request.lastLogIndex >= lastLogIndex);
-
-            return new PreVoteResponse(persistent.getCurrentTerm(), upToDate);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    @Override
-    public InstallSnapshotResponse handleInstallSnapshotRequest(InstallSnapshotRequest req) {
-        lock.lock();
-        try {
-            if (req.getLastIncludedTerm() < persistent.getCurrentTerm()) {
-                return new InstallSnapshotResponse(persistent.getCurrentTerm());
-            }
-            volatileState.setCommitIndex(Math.max(volatileState.getCommitIndex(), req.getLastIncludedIndex()));
-            volatileState.setLastApplied(req.getLastIncludedIndex());
-
-            persistent.getLogStore().setBaseTerm(req.getLastIncludedTerm());
-            persistent.getLogStore().setBaseIndex(req.getLastIncludedIndex());
-            return new InstallSnapshotResponse(persistent.getCurrentTerm());
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    @Override
-    public RequestVoteResponse handleRequestVoteRequest(RequestVoteRequest req) {
-        lock.lock();
-        try {
-            if (!conf.getOldNodes().contains(req.candidateId)) {
-                return new RequestVoteResponse(persistent.getCurrentTerm(), false);
-            }
-            if (req.term < persistent.getCurrentTerm()) {
-                return new RequestVoteResponse(persistent.getCurrentTerm(), false);
-            }
-            if (req.term > persistent.getCurrentTerm()) {
-                becomeFollower(req.term);
-            }
-
-            var voteGranted = false;
-            var votedFor = persistent.getVotedFor();
-            var lastLogIndex = persistent.getLogStore().lastIndex();
-            var lastLogTerm = persistent.getLogStore().lastTerm();
-
-            var upToDate = (req.lastLogTerm > lastLogTerm) || (req.lastLogTerm == lastLogTerm && req.lastLogIndex >= lastLogIndex);
-
-            if ((votedFor == null || votedFor.equals(req.candidateId)) && upToDate) {
-                persistent.setVotedFor(req.candidateId);
-                voteGranted = true;
-                electionTimer.reset();
-            }
-            return new RequestVoteResponse(persistent.getCurrentTerm(), voteGranted);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    @Override
-    public AppendEntriesResponse handleAppendEntriesRequest(AppendEntriesRequest req) {
-        lock.lock();
-        try {
-            if (req.term < persistent.getCurrentTerm()) {
-                return new AppendEntriesResponse(persistent.getCurrentTerm(), false, req.prevLogIndex - 1);
-            }
-
-            handleHeartbeat(req.term, req.leaderId);
-
-            var log = persistent.getLogStore();
-            if (req.prevLogIndex > 0) {
-                LogEntry prev = log.get(req.prevLogIndex);
-                if (prev != null) {
-                    if (prev.getTerm() != req.prevLogTerm) {
-                        return new AppendEntriesResponse(persistent.getCurrentTerm(), false, req.prevLogIndex - 1);
-                    }
-                } else {
-                    // prev is not in local logs -> maybe truncated by snapshot
-                    long baseIndex = log.getBaseIndex();
-                    long baseTerm = log.getBaseTerm();
-
-                    if (baseIndex == 0) {
-                        return new AppendEntriesResponse(persistent.getCurrentTerm(), false, req.prevLogIndex - 1);
-                    } else if (req.prevLogIndex == baseIndex) {
-                        if (req.prevLogTerm != baseTerm) {
-                            return new AppendEntriesResponse(persistent.getCurrentTerm(), false, req.prevLogIndex - 1);
-                        }
-                    } else {
-                        // requested prevIndex < baseIndex OR > lastIndex -> cannot accept, ask leader to send snapshot
-                        return new AppendEntriesResponse(persistent.getCurrentTerm(), false, baseIndex);
-                    }
-                }
-            }
-
-            if (req.entries != null && !req.entries.isEmpty()) {
-                long start = req.entries.get(0).getIndex();
-                log.truncateSuffix(start);
-                for (LogEntry e : req.entries) {
-                    log.appendEntry(e);
-                    if (e.isConfigurationEntry()) {
-                        ConfigurationEntry newConf = e.getConfiguration();
-                        if (newConf.isJoint()) {
-                            conf.setOldNodes(newConf.getOldNodes());
-                            conf.setNewNodes(newConf.getNewNodes());
-                            conf.setJoint(true);
-                        } else {
-                            conf.setOldNodes(newConf.getOldNodes());
-                            conf.setNewNodes(newConf.getNewNodes());
-                            conf.setJoint(false);
-                        }
-                    }
-                }
-            }
-            if (req.leaderCommit > volatileState.getCommitIndex()) {
-                long newCommit = Math.min(req.leaderCommit, log.lastIndex());
-                volatileState.setCommitIndex(newCommit);
-                applyCommitted();
-            }
-            return new AppendEntriesResponse(persistent.getCurrentTerm(), true, log.lastIndex());
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            lock.unlock();
-        }
-        return null;
-    }
-
-    private void handleHeartbeat(long term, String leaderId) {
-        lock.lock();
-        try {
-            if (term < persistent.getCurrentTerm()) {
-                return;
-            }
-            if (state == NodeState.CANDIDATE) {
-                if (term >= persistent.getCurrentTerm()) {
-                    becomeFollower(term); // luôn step-down khi nhận leader heartbeat
-                }
-            }
-            if (term > persistent.getCurrentTerm()) {
-                if (state == NodeState.LEADER) {
-                    log.info("Leader " + nodeId + " step down");
-                }
-                becomeFollower(term);
-            }
-            this.leaderId = leaderId;
-            electionTimer.reset();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private void onElectionTimeout() {
-        lock.lock();
-        try {
-            if (state == NodeState.LEADER) {
-                return;
-            }
-            var granted = new AtomicInteger(1); // vote cho chính mình
-            var majority = (conf.getOldNodes().size() / 2) + 1;
-            var lastIndex = persistent.getLogStore().lastIndex();
-            var lastTerm = persistent.getLogStore().lastTerm();
-
-            for (var peer : conf.getOldNodes()) {
-                if (peer.equals(nodeId)) {
-                    continue;
-                }
-                var req = new PreVoteRequest(persistent.getCurrentTerm(), nodeId, lastIndex, lastTerm);
-                rpcProcessor.preVote(peer, req).thenAccept(response -> {
-                    lock.lock();
-                    try {
-                        if (state != NodeState.FOLLOWER && state != NodeState.CANDIDATE) {
-                            return;
-                        }
-
-                        if (response.term > persistent.getCurrentTerm()) {
-                            becomeFollower(response.term);
-                            return;
-                        }
-
-                        log.info("Node {} received PreVoteResponse from {}, term={}, granted={}.", getNodeId(), peer, response.term, response.voteGranted);
-
-                        if (response.voteGranted) {
-                            int g = granted.incrementAndGet();
-                            if (g >= majority && state == NodeState.FOLLOWER) {
-                                becomeCandidate(); // chỉ bầu cử nếu majority pre-vote thành công
-                            }
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                });
-            }
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private void becomeFollower(long term) {
-        var changedTerm = false;
-        // Cập nhật term nếu term mới lớn hơn
-        if (term > persistent.getCurrentTerm()) {
-            persistent.setCurrentTerm(term);
-            persistent.setVotedFor(null);
-            persistent.persist();
-            changedTerm = true;
-        }
-        log.info(nodeId + " current state " + state + " becomes FOLLOWER at term " + persistent.getCurrentTerm());
-        // Dù term bằng currentTerm, nếu node không phải follower thì vẫn step-down
-        if (state != NodeState.FOLLOWER || changedTerm) {
+            stopped = true;
             state = NodeState.FOLLOWER;
             leaderState = null;
-            leaderId = null;
-            heartbeatTimer.stop();
-            // Learner node sẽ không trigger election timer
-            electionTimer.reset();
-            // Hủy tất cả pending client futures
-            for (CompletableFuture<Boolean> future : pendingFutures.values()) {
-                future.complete(false);
+            electionTimer.shutdown();
+            heartbeatTimer.shutdown();
+            scheduler.shutdownNow();
+            ioExecutor.shutdown();
+            failPendingFutures();
+            try {
+                persistent.flush();
+            } catch (Exception e) {
+                log.error("Node {} failed to flush state on shutdown", nodeId, e);
             }
-            pendingFutures.clear();
-        }
-    }
-
-    private void becomeCandidate() {
-        if (state == NodeState.LEADER) {
-            return; // tránh race khi heartbeat tới đúng lúc
-        }
-        state = NodeState.CANDIDATE;
-        persistent.setCurrentTerm(persistent.getCurrentTerm() + 1);
-        persistent.setVotedFor(nodeId);
-        electionTimer.reset();
-
-        var termStarted = persistent.getCurrentTerm();
-        var granted = new AtomicInteger(1);
-        var majority = (conf.getOldNodes().size() / 2) + 1;
-
-        var lastIndex = persistent.getLogStore().lastIndex();
-        var lastTerm = persistent.getLogStore().lastTerm();
-
-        for (String peer : conf.getOldNodes()) {
-            if (peer.equals(nodeId)) {
-                continue;
-            }
-            RequestVoteRequest req = new RequestVoteRequest(termStarted, nodeId, lastIndex, lastTerm);
-            rpcProcessor.requestVote(peer, req).thenAccept(resp -> {
-                lock.lock();
-                try {
-                    if (state != NodeState.CANDIDATE) return;
-                    if (resp.term > persistent.getCurrentTerm()) {
-                        becomeFollower(resp.term);
-                        return;
-                    }
-                    if (persistent.getCurrentTerm() != termStarted) {
-                        return;
-                    }
-                    if (resp.voteGranted) {
-                        int g = granted.incrementAndGet();
-                        if (g >= majority && state == NodeState.CANDIDATE) {
-                            becomeLeader();
-                        }
-                    }
-                } finally {
-                    lock.unlock();
-                }
-            });
-        }
-    }
-
-    private void becomeLeader() {
-        state = NodeState.LEADER;
-        leaderState = new LeaderState(conf.getOldNodes(), persistent.getLogStore().lastIndex() + 1);
-        leaderId = nodeId;
-        heartbeatTimer.start();
-        sendHeartbeats();
-        log.info("Leader " + nodeId + " elected at term " + persistent.getCurrentTerm());
-    }
-
-    private void sendHeartbeats() {
-        lock.lock();
-        try {
-            if (state != NodeState.LEADER) {
-                return;
-            }
-            var term = persistent.getCurrentTerm();
-            var leaderCommit = volatileState.getCommitIndex();
-
-            for (String peer : conf.getOldNodes()) {
-                if (peer.equals(nodeId)) {
-                    continue;
-                }
-                replicateLogsToFollower(peer, term, leaderCommit);
-            }
+            persistent.getLogStore().close();
         } finally {
             lock.unlock();
         }
     }
 
-    private void replicateLogsToFollower(String followerId, long term, long leaderCommit) {
-        lock.lock();
-        try {
-            if (state != NodeState.LEADER) {
-                return;
-            }
-            var log = persistent.getLogStore();
-            var nextIdx = leaderState.getNextIndex().getOrDefault(followerId, 1L);
-            var lastIndex = persistent.getLogStore().lastIndex();
-            if (nextIdx > lastIndex + 1) nextIdx = lastIndex + 1;
-
-            var prevIndex = nextIdx - 1;
-            var prevTerm = prevIndex == 0 ? 0 : (log.get(prevIndex) != null ? log.get(prevIndex).getTerm() : 0);
-
-            // Chỉ replicate batch logs, hoặc heartbeat rỗng nếu không có log mới
-            List<LogEntry> entries = nextIdx <= lastIndex ? log.readFrom(nextIdx) : List.of();
-
-            var req = new AppendEntriesRequest(term, nodeId, prevIndex, prevTerm, entries, leaderCommit);
-            rpcProcessor.appendEntries(followerId, req).thenAccept(resp -> {
-                lock.lock();
-                try {
-                    if (resp.term > persistent.getCurrentTerm()) {
-                        becomeFollower(resp.term);
-                        return;
-                    }
-                    if (resp.success) {
-                        if (!entries.isEmpty()) {
-                            var match = resp.matchIndex;
-                            var prevMatch = leaderState.getMatchIndex().getOrDefault(followerId, 0L);
-                            leaderState.getMatchIndex().put(followerId, Math.max(prevMatch, match));
-                            leaderState.getNextIndex().put(followerId, match + 1);
-                            maybeAdvanceCommitIndex();
-                        }
-                    } else {
-                        // Giảm nextIndex an toàn, tránh giảm quá mức
-                        var ni = leaderState.getNextIndex().getOrDefault(followerId, 1L);
-                        var decrement = Math.max(1, (ni - 1) / 2);
-                        leaderState.getNextIndex().put(followerId, Math.max(1, ni - decrement));
-                        if (state == NodeState.LEADER) {
-                            replicateLogsToFollower(followerId, term, leaderCommit);
-                        }
-                    }
-                } finally {
-                    lock.unlock();
-                }
-            });
-        } finally {
-            lock.unlock();
+    // RPC tới node chưa start hoặc đã tắt bị coi như lỗi mạng
+    private void ensureRunning() {
+        if (state == null || stopped) {
+            throw new IllegalStateException("Node " + nodeId + " is not running");
         }
     }
 
-    private void maybeAdvanceCommitIndex() {
-        var N = persistent.getLogStore().lastIndex();
-        var currentCommit = volatileState.getCommitIndex();
-        for (var candidate = currentCommit + 1; candidate <= N; candidate++) {
-            var count = 1;
-            for (var peer : conf.getOldNodes()) {
-                if (peer.equals(nodeId)) {
-                    continue;
-                }
-                var m = leaderState.getMatchIndex().get(peer);
-                if (m != null && m >= candidate) {
-                    count++;
-                }
-            }
-            var majority = (conf.getOldNodes().size() / 2) + 1;
-            if (count >= majority) {
-                LogEntry e = persistent.getLogStore().get(candidate);
-                if (e != null && e.getTerm() == persistent.getCurrentTerm()) {
-                    volatileState.setCommitIndex(candidate);
-                    applyCommitted();
-                }
-            }
+    private void runIo(Runnable task) {
+        if (stopped) {
+            return;
         }
+        ioExecutor.execute(() -> {
+            try {
+                task.run();
+            } catch (Exception e) {
+                log.error("Node {} disk operation failed", nodeId, e);
+            }
+        });
     }
 
-    private void applyCommitted() {
-        var lastApplied = volatileState.getLastApplied();
-        var commitIndex = volatileState.getCommitIndex();
-        var log = persistent.getLogStore();
-        for (long idx = lastApplied + 1; idx <= commitIndex; idx++) {
-            LogEntry logEntry = log.get(idx);
-            if (logEntry != null) {
-                stateMachine.onApply(nodeId, logEntry);
-            }
-            volatileState.setLastApplied(idx);
-            CompletableFuture<Boolean> future = pendingFutures.remove(idx);
-            if (future != null) {
-                future.complete(true);
-            }
+    private void failPendingFutures() {
+        for (CompletableFuture<Boolean> future : pendingFutures.values()) {
+            future.complete(false);
         }
-        // persist commitIndex
-        persistent.setLastCommitIndex(commitIndex);
+        pendingFutures.clear();
     }
+
+    // ---------- CLIENT ----------
 
     public CompletableFuture<Boolean> appendClientCommand(byte[] command) {
         lock.lock();
         try {
-            if (state != NodeState.LEADER) {
+            if (stopped || state != NodeState.LEADER) {
                 return CompletableFuture.completedFuture(false);
             }
             long nextIndex = persistent.getLogStore().lastIndex() + 1;
@@ -740,19 +205,1144 @@ public class RaftNode implements RaftServerService {
             scheduler.schedule(() -> {
                 lock.lock();
                 try {
-                    CompletableFuture<Boolean> f = pendingFutures.remove(nextIndex);
-                    if (f != null && !f.isDone()) {
-                        f.complete(false); // timeout → fail client
+                    // chỉ gỡ đúng future này: index có thể đã được dùng lại ở nhiệm kỳ sau
+                    if (pendingFutures.remove(nextIndex, future)) {
+                        future.complete(false); // timeout → fail client
                     }
                 } finally {
                     lock.unlock();
                 }
             }, CLIENT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             // replicate log đến followers
-            sendHeartbeats();
+            broadcast();
             return future;
         } finally {
             lock.unlock();
         }
+    }
+
+    // ---------- MEMBERSHIP ----------
+
+    /**
+     * Thêm node mới bằng joint consensus: ghi C(old,new), khi entry đó commit thì leader tự ghi tiếp C(new).
+     */
+    public boolean onJoinPeerCluster(String newNodeId) {
+        lock.lock();
+        try {
+            if (conf.contains(newNodeId)) {
+                return false;
+            }
+            var newNodes = new ArrayList<>(conf.getOldNodes());
+            newNodes.add(newNodeId);
+            return changePeers(newNodes);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Gỡ node khỏi cluster, cũng qua joint consensus. Leader có thể tự gỡ chính mình:
+     * nó điều phối tới khi C(new) commit rồi trao quyền và step-down.
+     */
+    public boolean onLeavePeerCluster(String removedNodeId) {
+        lock.lock();
+        try {
+            var newNodes = new ArrayList<>(conf.getOldNodes());
+            if (!newNodes.remove(removedNodeId) || newNodes.isEmpty()) {
+                return false;
+            }
+            return changePeers(newNodes);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean changePeers(List<String> newNodes) {
+        if (stopped || state != NodeState.LEADER) {
+            return false;
+        }
+        // mỗi lần chỉ một thay đổi cấu hình, và cấu hình hiện tại phải commit xong
+        if (conf.isJoint() || confIndex > volatileState.getCommitIndex()) {
+            log.warn("Node {} rejects change to {}: configuration change in progress <{}>.", nodeId, newNodes, conf);
+            return false;
+        }
+        appendConfiguration(new ConfigurationEntry(conf.getOldNodes(), newNodes, true));
+        return true;
+    }
+
+    private void appendConfiguration(ConfigurationEntry newConf) {
+        var logStore = persistent.getLogStore();
+        var index = logStore.lastIndex() + 1;
+        logStore.appendEntry(LogEntry.newConfigurationEntry(index, persistent.getCurrentTerm(), newConf));
+        refreshConf();
+        for (var peer : peers()) {
+            leaderState.addPeer(peer, index);
+        }
+        log.info("Leader {} appended configuration <{}> at index {}.", nodeId, newConf, index);
+        broadcast();
+    }
+
+    // gọi sau mỗi lần commit: đẩy thay đổi cấu hình sang bước kế tiếp
+    private void onConfCommitted() {
+        if (state != NodeState.LEADER || confIndex > volatileState.getCommitIndex()) {
+            return;
+        }
+        if (conf.isJoint()) {
+            finalizeJointConf();
+        } else if (!conf.contains(nodeId)) {
+            handOverLeadership();
+        }
+    }
+
+    // C(old,new) đã commit: ghi tiếp C(new)
+    private void finalizeJointConf() {
+        // node bị gỡ vẫn được gửi log tới khi nhận xong C(new), để nó biết mình đã rời cluster
+        var finalIndex = persistent.getLogStore().lastIndex() + 1;
+        for (var node : conf.getOldNodes()) {
+            if (!conf.getNewNodes().contains(node) && !node.equals(nodeId)) {
+                addDeparting(node, finalIndex);
+            }
+        }
+        appendConfiguration(new ConfigurationEntry(conf.getNewNodes()));
+    }
+
+    // leader tự gỡ mình: trao quyền cho follower có log đầy đủ nhất thay vì để cluster chờ election timeout
+    private void handOverLeadership() {
+        var matchIndex = leaderState.getMatchIndex();
+        var candidates = peers();
+        candidates.sort(Comparator.comparingLong((String peer) -> matchIndex.getOrDefault(peer, 0L)).reversed());
+        var term = persistent.getCurrentTerm();
+        log.info("Leader {} is no longer in configuration <{}>, step down.", nodeId, conf);
+        becomeFollower(term);
+        transferring = true;
+        transferLeadership(candidates, 0, term);
+    }
+
+    // thử lần lượt từng follower tới khi một node nhận lời bầu cử ngay, hoặc cluster đã sang term mới
+    private void transferLeadership(List<String> candidates, int position, long term) {
+        if (position >= candidates.size()) {
+            transferring = false;
+            maybeShutdownRemoved();
+            return;
+        }
+        var target = candidates.get(position);
+        log.info("Node {} asks {} to take over leadership.", nodeId, target);
+        rpcProcessor.timeoutNow(target, new TimeoutNowRequest(term, nodeId)).whenComplete((resp, error) -> {
+            lock.lock();
+            try {
+                var accepted = resp != null && resp.success;
+                if (accepted || stopped || persistent.getCurrentTerm() != term) {
+                    transferring = false;
+                    maybeShutdownRemoved();
+                } else {
+                    transferLeadership(candidates, position + 1, term);
+                }
+            } finally {
+                lock.unlock();
+            }
+        });
+    }
+
+    private void addDeparting(String node, long finalConfIndex) {
+        // node đã chết hẳn thì không gửi mãi: bỏ sau một khoảng thời gian
+        var deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(nodeOptions.getDepartingTimeoutMs());
+        leaderState.getDeparting().put(node, finalConfIndex);
+        leaderState.getDepartingDeadline().put(node, deadline);
+    }
+
+    private void removeDeparting(LeaderState ls, String node) {
+        ls.getDeparting().remove(node);
+        ls.getDepartingDeadline().remove(node);
+    }
+
+    // leader trước có thể chết khi node bị gỡ chưa kịp nhận C(new): leader mới suy lại từ joint config ngay trước đó trong log
+    private void restoreDepartingNodes() {
+        var previousConfIndex = confIndexAt(confIndex - 1);
+        if (conf.isJoint() || previousConfIndex == 0) {
+            return;
+        }
+        var previous = persistent.getLogStore().get(previousConfIndex).getConfiguration();
+        if (!previous.isJoint()) {
+            return;
+        }
+        for (var node : previous.getOldNodes()) {
+            if (!conf.contains(node) && !node.equals(nodeId)) {
+                addDeparting(node, confIndex);
+            }
+        }
+    }
+
+    private void expireDepartingNodes() {
+        var now = System.nanoTime();
+        var deadlines = leaderState.getDepartingDeadline();
+        for (var node : new ArrayList<>(deadlines.keySet())) {
+            if (now - deadlines.get(node) > 0) {
+                removeDeparting(leaderState, node);
+            }
+        }
+    }
+
+    /**
+     * Node đã bị gỡ và cấu hình đó đã commit thì không còn việc gì để làm: tự shutdown.
+     * Node mới chưa từng là thành viên (đang chờ được thêm vào) thì không tính.
+     */
+    private void maybeShutdownRemoved() {
+        if (removalHandled || transferring || stopped || !wasMember || state == NodeState.LEADER) {
+            return;
+        }
+        if (conf.isJoint() || conf.contains(nodeId) || confIndex > volatileState.getCommitIndex()) {
+            return;
+        }
+        removalHandled = true;
+        if (nodeOptions.isShutdownOnRemoved()) {
+            log.info("Node {} was removed from the cluster <{}>, shutting down.", nodeId, conf);
+            runIo(this::shutdown);
+        } else {
+            // vẫn chạy nhưng đứng yên: onElectionTimeout bỏ qua node không thuộc cấu hình
+            log.info("Node {} was removed from the cluster <{}>.", nodeId, conf);
+        }
+    }
+
+    // config entry mới nhất có index <= upTo; nếu đã bị compact thì lấy config lưu kèm snapshot
+    private ConfigurationEntry confAt(long upTo) {
+        var index = confIndexAt(upTo);
+        if (index > 0) {
+            return persistent.getLogStore().get(index).getConfiguration();
+        }
+        var snapshotConf = persistent.getSnapshotConf();
+        return snapshotConf != null ? snapshotConf : initialConf;
+    }
+
+    // 0 nếu trong log không còn config entry nào <= upTo
+    private long confIndexAt(long upTo) {
+        var logStore = persistent.getLogStore();
+        for (var i = Math.min(upTo, logStore.lastIndex()); i > logStore.getBaseIndex(); i--) {
+            if (logStore.get(i).isConfigurationEntry()) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    private void refreshConf() {
+        var lastIndex = persistent.getLogStore().lastIndex();
+        var index = confIndexAt(lastIndex);
+        this.conf = confAt(lastIndex);
+        this.confIndex = index > 0 ? index : (persistent.getSnapshotConf() != null ? persistent.getLastSnapshotIndex() : 0);
+        if (conf.contains(nodeId)) {
+            wasMember = true;
+        }
+    }
+
+    private List<String> peers() {
+        var peers = new ArrayList<>(conf.allNodes());
+        peers.remove(nodeId);
+        return peers;
+    }
+
+    // mọi node leader cần gửi log: thành viên hiện tại và node đang rời đi
+    private Set<String> replicationTargets() {
+        Set<String> targets = new LinkedHashSet<>(peers());
+        targets.addAll(leaderState.getDeparting().keySet());
+        return targets;
+    }
+
+    // tập phiếu ban đầu của một lần đếm quorum: node luôn tính chính nó
+    private Set<String> selfOnly() {
+        Set<String> nodes = new HashSet<>();
+        nodes.add(nodeId);
+        return nodes;
+    }
+
+    // ---------- SNAPSHOT ----------
+
+    private void restoreStateMachine() {
+        var snapshotStore = persistent.getSnapshotStore();
+        var meta = snapshotStore.getMeta();
+        if (meta != null) {
+            if (!stateMachine.onSnapshotLoad(new SnapshotReader(snapshotStore.currentPath()))) {
+                throw new IllegalStateException("Node " + nodeId + " failed to load snapshot at index " + meta.getLastIncludedIndex());
+            }
+            volatileState.setLastApplied(meta.getLastIncludedIndex());
+            volatileState.setCommitIndex(meta.getLastIncludedIndex());
+        }
+
+        // Apply các log sau snapshot
+        var commitIndex = Math.min(persistent.getLastCommitIndex(), persistent.getLogStore().lastIndex());
+        if (commitIndex > volatileState.getCommitIndex()) {
+            volatileState.setCommitIndex(commitIndex);
+            applyCommitted();
+        }
+    }
+
+    /**
+     * Bắt đầu tạo snapshot tại lastApplied. Hàm trả về ngay; snapshot được commit và log được compact
+     * sau đó ở ioExecutor.
+     */
+    public void createSnapshot() {
+        lock.lock();
+        try {
+            if (stopped || snapshotting) {
+                return;
+            }
+            var snapshotStore = persistent.getSnapshotStore();
+            var snapshotIndex = volatileState.getLastApplied();
+            if (snapshotIndex <= persistent.getLogStore().getBaseIndex()) {
+                return;
+            }
+            var meta = new SnapshotMeta(snapshotIndex, termAt(snapshotIndex), confAt(snapshotIndex), new ArrayList<>());
+            snapshotting = true;
+            try {
+                // state machine ghi vào thư mục temp, chỉ khi commit() mới thay thế snapshot hiện tại
+                var writer = new SnapshotWriter(snapshotStore.prepareTemp(), meta.getFiles());
+                stateMachine.onSnapshotSave(writer, status -> {
+                    if (status.isOk()) {
+                        runIo(() -> finishSnapshot(meta));
+                    } else {
+                        log.error("Snapshot failed: {}", status.getMsg());
+                        endSnapshotting();
+                    }
+                });
+            } catch (Exception e) {
+                snapshotting = false;
+                log.error("Node {} failed to create snapshot", nodeId, e);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // chạy ở ioExecutor: ghi meta + rename ngoài lock, sau đó mới bỏ phần log đã nằm trong snapshot
+    private void finishSnapshot(SnapshotMeta meta) {
+        try {
+            persistent.getSnapshotStore().commit(meta);
+        } catch (IOException e) {
+            endSnapshotting();
+            throw new UncheckedIOException(e);
+        }
+        lock.lock();
+        try {
+            snapshotting = false;
+            if (!stopped) {
+                persistent.getLogStore().truncatePrefix(meta.getLastIncludedIndex() + 1);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void endSnapshotting() {
+        lock.lock();
+        try {
+            snapshotting = false;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public InstallSnapshotResponse handleInstallSnapshotRequest(InstallSnapshotRequest req) {
+        var response = installSnapshot(req);
+        try {
+            persistent.syncVote();
+        } catch (Exception e) {
+            log.error("Node {} failed to persist term", nodeId, e);
+            return snapshotResponse(false);
+        }
+        return response;
+    }
+
+    private InstallSnapshotResponse snapshotResponse(boolean success) {
+        return new InstallSnapshotResponse(persistent.getCurrentTerm(), success);
+    }
+
+    /**
+     * Cài snapshot theo từng bước, chỉ giữ lock ở các bước đổi state trong bộ nhớ:
+     * nhận request (lock) → ghi file vào temp → state machine load từ temp → commit snapshot → cập nhật log và index (lock).
+     * Load trước rồi mới commit: nếu load hỏng thì snapshot và log cũ trên đĩa còn nguyên để restart dựng lại.
+     */
+    private InstallSnapshotResponse installSnapshot(InstallSnapshotRequest req) {
+        var rejected = acceptSnapshot(req);
+        if (rejected != null) {
+            return rejected;
+        }
+
+        var index = req.getLastIncludedIndex();
+        var snapshotStore = persistent.getSnapshotStore();
+        String tempPath;
+        SnapshotMeta meta;
+        try {
+            tempPath = snapshotStore.prepareTemp();
+            meta = writeSnapshotFiles(req, tempPath);
+        } catch (Exception e) {
+            log.error("Node {} failed to store snapshot", nodeId, e);
+            endSnapshotting();
+            return snapshotResponse(false);
+        }
+
+        var needLoad = beginSnapshotLoad(index);
+        if (needLoad && !loadSnapshot(tempPath)) {
+            // không kiểm chứng được state machine còn nguyên hay không, nên false cũng dừng như exception
+            return failStop("state machine could not load snapshot at index " + index);
+        }
+        try {
+            // snapshot chỉ chứa dữ liệu đã commit nên lưu lại luôn an toàn, kể cả khi term đổi trong lúc ghi
+            snapshotStore.commit(meta);
+        } catch (Exception e) {
+            log.error("Node {} failed to commit snapshot", nodeId, e);
+            if (needLoad) {
+                return failStop("snapshot at index " + index + " was loaded but could not be saved");
+            }
+            endSnapshotting();
+            return snapshotResponse(false);
+        }
+        return finishInstallSnapshot(req, needLoad);
+    }
+
+    // trả về response nếu request kết thúc ngay tại đây, null nếu cần cài snapshot
+    private InstallSnapshotResponse acceptSnapshot(InstallSnapshotRequest req) {
+        lock.lock();
+        try {
+            ensureRunning();
+            if (req.getTerm() < persistent.getCurrentTerm()) {
+                return snapshotResponse(false);
+            }
+            handleHeartbeat(req.getTerm(), req.getLeaderId());
+
+            if (req.getLastIncludedIndex() <= volatileState.getCommitIndex()) {
+                // đã có sẵn toàn bộ dữ liệu của snapshot này
+                return snapshotResponse(true);
+            }
+            if (snapshotting) {
+                return snapshotResponse(false); // thư mục temp đang được dùng
+            }
+            snapshotting = true;
+            return null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private SnapshotMeta writeSnapshotFiles(InstallSnapshotRequest req, String folder) throws IOException {
+        var files = new ArrayList<String>();
+        for (var file : req.getFiles().entrySet()) {
+            var name = file.getKey();
+            if (name.contains("/") || name.contains("\\") || name.equals("..")) {
+                throw new IOException("Illegal snapshot file name: " + name);
+            }
+            FileUtil.atomicWrite(Path.of(folder, name), file.getValue());
+            files.add(name);
+        }
+        return new SnapshotMeta(req.getLastIncludedIndex(), req.getLastIncludedTerm(), req.getConf(), files);
+    }
+
+    // hoãn applyCommitted để không có onApply nào chen vào lúc state machine load ngoài lock.
+    // Trả về false nếu trong lúc ghi file node đã tự commit qua điểm này, khi đó không cần load nữa.
+    private boolean beginSnapshotLoad(long snapshotIndex) {
+        lock.lock();
+        try {
+            loadingSnapshot = !stopped && snapshotIndex > volatileState.getCommitIndex();
+            return loadingSnapshot;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean loadSnapshot(String path) {
+        try {
+            return stateMachine.onSnapshotLoad(new SnapshotReader(path));
+        } catch (Exception e) {
+            log.error("Node {} failed to load snapshot", nodeId, e);
+            return false;
+        }
+    }
+
+    private InstallSnapshotResponse finishInstallSnapshot(InstallSnapshotRequest req, boolean loaded) {
+        var index = req.getLastIncludedIndex();
+        lock.lock();
+        try {
+            snapshotting = false;
+            loadingSnapshot = false;
+            if (stopped) {
+                return snapshotResponse(false);
+            }
+            var logStore = persistent.getLogStore();
+            if (loaded) {
+                var local = logStore.get(index);
+                if (local != null && local.getTerm() == req.getLastIncludedTerm()) {
+                    // log khớp với snapshot thì giữ lại phần phía sau
+                    logStore.truncatePrefix(index + 1);
+                } else {
+                    logStore.reset(index, req.getLastIncludedTerm());
+                }
+                volatileState.setLastApplied(index);
+                volatileState.setCommitIndex(Math.max(volatileState.getCommitIndex(), index));
+            } else {
+                // state machine đã đi qua điểm này: chỉ cần bỏ phần log mà snapshot đã bao phủ
+                logStore.truncatePrefix(index + 1);
+            }
+            refreshConf();
+            if (loaded) {
+                log.info("Node {} installed snapshot at index {} from {}.", nodeId, index, req.getLeaderId());
+                // apply các entry được commit trong lúc load, đồng thời lưu commit index
+                applyCommitted();
+            }
+            return snapshotResponse(true);
+        } catch (Exception e) {
+            log.error("Node {} failed to install snapshot", nodeId, e);
+            // state machine đã mang state mới mà log/index chưa theo kịp thì không chạy tiếp được
+            return loaded ? failStop("snapshot at index " + index + " was loaded but could not be installed")
+                    : snapshotResponse(false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // state machine trong bộ nhớ không còn đáng tin: dừng hẳn, restart sẽ dựng lại từ snapshot và log trên đĩa
+    private InstallSnapshotResponse failStop(String reason) {
+        log.error("Node {} stops: {}.", nodeId, reason);
+        shutdown();
+        return snapshotResponse(false);
+    }
+
+    // ---------- RPC HANDLERS ----------
+
+    @Override
+    public PreVoteResponse handlePreVoteRequest(PreVoteRequest request) {
+        lock.lock();
+        try {
+            ensureRunning();
+            var term = persistent.getCurrentTerm();
+            if (!conf.contains(request.candidateId)) {
+                log.warn("Node {} ignore PreVoteRequest from {} as it is not in conf <{}>.", getNodeId(), request.candidateId, this.conf);
+                return new PreVoteResponse(term, false);
+            }
+            if (request.term < term) {
+                return new PreVoteResponse(term, false);
+            }
+            // leader còn sống (hoặc vừa bỏ phiếu cho ai đó) thì không tiếp tay cho một cuộc bầu cử mới
+            if (state == NodeState.LEADER || hasRecentContact()) {
+                return new PreVoteResponse(term, false);
+            }
+            return new PreVoteResponse(term, isLogUpToDate(request.lastLogTerm, request.lastLogIndex));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public RequestVoteResponse handleRequestVoteRequest(RequestVoteRequest req) {
+        var response = vote(req);
+        // term và phiếu bầu phải nằm trên đĩa trước khi trả lời, ghi ngoài lock
+        try {
+            persistent.syncVote();
+        } catch (Exception e) {
+            log.error("Node {} failed to persist vote", nodeId, e);
+            return new RequestVoteResponse(response.term, false);
+        }
+        if (!response.voteGranted) {
+            return response;
+        }
+        lock.lock();
+        try {
+            if (stopped || persistent.getCurrentTerm() != response.term) {
+                return new RequestVoteResponse(persistent.getCurrentTerm(), false);
+            }
+            return response;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // quyết định phiếu bầu trong bộ nhớ, chưa ghi đĩa
+    private RequestVoteResponse vote(RequestVoteRequest req) {
+        lock.lock();
+        try {
+            ensureRunning();
+            if (!conf.contains(req.candidateId) || req.term < persistent.getCurrentTerm()) {
+                return new RequestVoteResponse(persistent.getCurrentTerm(), false);
+            }
+            if (req.term > persistent.getCurrentTerm()) {
+                becomeFollower(req.term);
+            }
+
+            var votedFor = persistent.getVotedFor();
+            var voteGranted = (votedFor == null || votedFor.equals(req.candidateId))
+                    && isLogUpToDate(req.lastLogTerm, req.lastLogIndex);
+            if (voteGranted) {
+                persistent.setVotedFor(req.candidateId);
+                markContact();
+                electionTimer.reset();
+            }
+            return new RequestVoteResponse(persistent.getCurrentTerm(), voteGranted);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // log của candidate có mới ít nhất bằng log của node này không
+    private boolean isLogUpToDate(long candidateLastTerm, long candidateLastIndex) {
+        var lastTerm = persistent.getLogStore().lastTerm();
+        var lastIndex = persistent.getLogStore().lastIndex();
+        return candidateLastTerm > lastTerm || (candidateLastTerm == lastTerm && candidateLastIndex >= lastIndex);
+    }
+
+    @Override
+    public TimeoutNowResponse handleTimeoutNowRequest(TimeoutNowRequest req) {
+        lock.lock();
+        try {
+            ensureRunning();
+            if (req.term != persistent.getCurrentTerm() || state == NodeState.LEADER || !conf.contains(nodeId)) {
+                return new TimeoutNowResponse(persistent.getCurrentTerm(), false);
+            }
+            log.info("Node {} starts election on request of leader {}.", nodeId, req.leaderId);
+            becomeCandidate(); // bỏ qua pre-vote: leader hiện tại đã chủ động nhường
+            return new TimeoutNowResponse(req.term, true);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public AppendEntriesResponse handleAppendEntriesRequest(AppendEntriesRequest req) {
+        var response = appendToLog(req);
+        if (!response.success) {
+            return response;
+        }
+        // fsync ngoài lock: node vẫn xử lý RPC khác trong lúc chờ đĩa, và chỉ ack khi entry đã bền vững
+        try {
+            persistent.getLogStore().sync();
+            persistent.syncVote();
+        } catch (Exception e) {
+            log.error("Node {} failed to sync log", nodeId, e);
+            return new AppendEntriesResponse(response.term, false, 0);
+        }
+        lock.lock();
+        try {
+            // trong lúc chờ đĩa node có thể đã sang term khác và log bị leader mới ghi đè.
+            // Node vừa tự tắt vì bị gỡ vẫn ack lần cuối để leader biết nó đã nhận cấu hình và thôi gửi;
+            // ack đó không được tính vào quorum nào vì node không còn trong cấu hình.
+            if ((stopped && !removalHandled) || persistent.getCurrentTerm() != response.term) {
+                return new AppendEntriesResponse(persistent.getCurrentTerm(), false, 0);
+            }
+            return response;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // kiểm tra và append vào log nhưng chưa fsync
+    private AppendEntriesResponse appendToLog(AppendEntriesRequest req) {
+        lock.lock();
+        try {
+            ensureRunning();
+            if (req.term < persistent.getCurrentTerm()) {
+                return new AppendEntriesResponse(persistent.getCurrentTerm(), false, 0);
+            }
+
+            handleHeartbeat(req.term, req.leaderId);
+
+            var term = persistent.getCurrentTerm();
+            var logStore = persistent.getLogStore();
+            try {
+                // matchIndex khi thất bại là gợi ý để leader lùi nextIndex nhanh
+                if (req.prevLogIndex > logStore.lastIndex()) {
+                    return new AppendEntriesResponse(term, false, logStore.lastIndex());
+                }
+                // prevLogIndex < baseIndex: phần đó nằm trong snapshot, đã commit nên chắc chắn khớp
+                if (req.prevLogIndex >= logStore.getBaseIndex() && termAt(req.prevLogIndex) != req.prevLogTerm) {
+                    return new AppendEntriesResponse(term, false, req.prevLogIndex - 1);
+                }
+
+                List<LogEntry> entries = req.entries != null ? req.entries : List.of();
+                storeEntries(entries);
+
+                var lastNewIndex = req.prevLogIndex + entries.size();
+                var newCommit = Math.min(req.leaderCommit, lastNewIndex);
+                if (newCommit > volatileState.getCommitIndex()) {
+                    volatileState.setCommitIndex(newCommit);
+                    applyCommitted();
+                }
+                return new AppendEntriesResponse(term, true, lastNewIndex);
+            } catch (Exception e) {
+                log.error("Node {} failed to append entries", nodeId, e);
+                return new AppendEntriesResponse(term, false, volatileState.getCommitIndex());
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // ghi các entry leader gửi vào log: bỏ qua entry đã có, chỉ truncate khi thực sự conflict term
+    private void storeEntries(List<LogEntry> entries) {
+        var logStore = persistent.getLogStore();
+        var toAppend = new ArrayList<LogEntry>();
+        var confChanged = false;
+        for (LogEntry e : entries) {
+            if (e.getIndex() <= logStore.getBaseIndex()) {
+                continue;
+            }
+            if (toAppend.isEmpty()) {
+                var existing = logStore.get(e.getIndex());
+                if (existing != null) {
+                    if (existing.getTerm() == e.getTerm()) {
+                        // đã có sẵn (RPC cũ hoặc gửi trùng), không được truncate
+                        continue;
+                    }
+                    if (e.getIndex() <= volatileState.getCommitIndex()) {
+                        throw new IllegalStateException("Conflict at committed index " + e.getIndex());
+                    }
+                    confChanged |= confIndex >= e.getIndex();
+                    logStore.truncateSuffix(e.getIndex());
+                }
+            }
+            toAppend.add(e);
+            confChanged |= e.isConfigurationEntry();
+        }
+        logStore.appendEntries(toAppend);
+        if (confChanged) {
+            refreshConf();
+        }
+    }
+
+    // mọi RPC hợp lệ từ leader: chấp nhận leader đó và hoãn bầu cử
+    private void handleHeartbeat(long term, String leaderId) {
+        if (term > persistent.getCurrentTerm() || state != NodeState.FOLLOWER) {
+            becomeFollower(term); // luôn step-down khi nhận leader heartbeat
+        }
+        this.leaderId = leaderId;
+        electionEpoch++;
+        markContact();
+        electionTimer.reset();
+    }
+
+    private void markContact() {
+        hadContact = true;
+        lastContactNanos = System.nanoTime();
+    }
+
+    private boolean hasRecentContact() {
+        return hadContact && System.nanoTime() - lastContactNanos
+                < TimeUnit.MILLISECONDS.toNanos(nodeOptions.getElectionTimeoutMinMs());
+    }
+
+    // ---------- ELECTION ----------
+
+    private void onElectionTimeout() {
+        lock.lock();
+        try {
+            if (stopped || state == NodeState.LEADER) {
+                return;
+            }
+            // luôn hẹn lại timer, nếu không một vòng bầu cử thất bại sẽ không bao giờ được thử lại
+            electionTimer.reset();
+            if (!conf.contains(nodeId)) {
+                return; // chưa thuộc cluster (đang chờ được thêm) hoặc đã bị gỡ
+            }
+            startPreVote();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // hỏi trước xem có thắng được không, để một node bị cô lập không làm tăng term của cả cluster
+    private void startPreVote() {
+        var epoch = ++electionEpoch;
+        var term = persistent.getCurrentTerm();
+        var granted = selfOnly();
+        if (conf.hasQuorum(granted)) {
+            becomeCandidate(); // cluster một node
+            return;
+        }
+        var logStore = persistent.getLogStore();
+        var req = new PreVoteRequest(term, nodeId, logStore.lastIndex(), logStore.lastTerm());
+        for (var peer : peers()) {
+            rpcProcessor.preVote(peer, req).whenComplete((response, error) -> {
+                if (response == null) {
+                    return;
+                }
+                lock.lock();
+                try {
+                    onPreVoteResponse(peer, response, epoch, term, granted);
+                } finally {
+                    lock.unlock();
+                }
+            });
+        }
+    }
+
+    private void onPreVoteResponse(String peer, PreVoteResponse response, long epoch, long term, Set<String> granted) {
+        if (stopped || state == NodeState.LEADER) {
+            return;
+        }
+        if (response.term > persistent.getCurrentTerm()) {
+            becomeFollower(response.term);
+            return;
+        }
+        // response của vòng pre-vote cũ
+        if (electionEpoch != epoch || persistent.getCurrentTerm() != term) {
+            return;
+        }
+        log.info("Node {} received PreVoteResponse from {}, term={}, granted={}.", getNodeId(), peer, response.term, response.voteGranted);
+        // candidate thua vòng trước cũng phải được bầu lại, không chỉ follower
+        if (response.voteGranted && granted.add(peer) && conf.hasQuorum(granted)) {
+            becomeCandidate();
+        }
+    }
+
+    private void becomeFollower(long term) {
+        var changedTerm = false;
+        // Cập nhật term nếu term mới lớn hơn
+        if (term > persistent.getCurrentTerm()) {
+            persistent.setTermAndVote(term, null);
+            runIo(persistent::syncVote);
+            changedTerm = true;
+        }
+        // Dù term bằng currentTerm, nếu node không phải follower thì vẫn step-down
+        if (state != NodeState.FOLLOWER || changedTerm) {
+            log.info(nodeId + " current state " + state + " becomes FOLLOWER at term " + persistent.getCurrentTerm());
+            state = NodeState.FOLLOWER;
+            leaderState = null;
+            leaderId = null;
+            heartbeatTimer.stop();
+            electionTimer.reset();
+            failPendingFutures();
+        }
+    }
+
+    private void becomeCandidate() {
+        if (state == NodeState.LEADER) {
+            return; // tránh race khi heartbeat tới đúng lúc
+        }
+        state = NodeState.CANDIDATE;
+        leaderId = null;
+        persistent.setTermAndVote(persistent.getCurrentTerm() + 1, nodeId);
+        // đang tự ứng cử thì không ủng hộ pre-vote của node khác
+        markContact();
+        electionTimer.reset();
+
+        var termStarted = persistent.getCurrentTerm();
+        // phiếu tự bầu phải nằm trên đĩa trước khi được tính hay gửi đi
+        runIo(() -> {
+            persistent.syncVote();
+            lock.lock();
+            try {
+                if (!stopped && state == NodeState.CANDIDATE && persistent.getCurrentTerm() == termStarted) {
+                    requestVotes(termStarted);
+                }
+            } finally {
+                lock.unlock();
+            }
+        });
+    }
+
+    private void requestVotes(long termStarted) {
+        var granted = selfOnly();
+        if (conf.hasQuorum(granted)) {
+            becomeLeader(); // cluster một node
+            return;
+        }
+        var logStore = persistent.getLogStore();
+        var req = new RequestVoteRequest(termStarted, nodeId, logStore.lastIndex(), logStore.lastTerm());
+        for (String peer : peers()) {
+            rpcProcessor.requestVote(peer, req).whenComplete((resp, error) -> {
+                if (resp == null) {
+                    return;
+                }
+                lock.lock();
+                try {
+                    onVoteResponse(peer, resp, termStarted, granted);
+                } finally {
+                    lock.unlock();
+                }
+            });
+        }
+    }
+
+    private void onVoteResponse(String peer, RequestVoteResponse resp, long termStarted, Set<String> granted) {
+        if (stopped) {
+            return;
+        }
+        if (resp.term > persistent.getCurrentTerm()) {
+            becomeFollower(resp.term);
+            return;
+        }
+        if (state != NodeState.CANDIDATE || persistent.getCurrentTerm() != termStarted) {
+            return;
+        }
+        if (resp.voteGranted && granted.add(peer) && conf.hasQuorum(granted)) {
+            becomeLeader();
+        }
+    }
+
+    private void becomeLeader() {
+        var logStore = persistent.getLogStore();
+        state = NodeState.LEADER;
+        leaderId = nodeId;
+        leaderState = new LeaderState(peers(), logStore.lastIndex() + 1);
+        electionTimer.stop();
+        restoreDepartingNodes();
+        // no-op của term mới: entry của term cũ chỉ được commit gián tiếp qua entry của term hiện tại
+        logStore.appendEntry(new LogEntry(logStore.lastIndex() + 1, persistent.getCurrentTerm(), null));
+        log.info("Leader " + nodeId + " elected at term " + persistent.getCurrentTerm());
+        heartbeatTimer.start();
+        broadcast();
+    }
+
+    // ---------- REPLICATION ----------
+
+    private void onHeartbeatTick() {
+        lock.lock();
+        try {
+            if (stopped || state != NodeState.LEADER) {
+                return;
+            }
+            // check quorum: leader bị cô lập phải tự step-down thay vì giữ vai trò mãi
+            if (!hasContactWithQuorum()) {
+                log.warn("Leader {} lost contact with quorum, step down.", nodeId);
+                becomeFollower(persistent.getCurrentTerm());
+                return;
+            }
+            expireDepartingNodes();
+            for (String peer : replicationTargets()) {
+                replicateTo(peer);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean hasContactWithQuorum() {
+        var now = System.nanoTime();
+        var timeoutNanos = TimeUnit.MILLISECONDS.toNanos(nodeOptions.getElectionTimeoutMaxMs());
+        var alive = selfOnly();
+        for (var ack : leaderState.getLastAck().entrySet()) {
+            if (now - ack.getValue() < timeoutNanos) {
+                alive.add(ack.getKey());
+            }
+        }
+        return conf.hasQuorum(alive);
+    }
+
+    // gọi sau khi leader append: gửi cho follower song song với việc fsync log của chính mình
+    private void broadcast() {
+        for (String peer : replicationTargets()) {
+            replicateTo(peer);
+        }
+        runIo(() -> {
+            persistent.getLogStore().sync();
+            lock.lock();
+            try {
+                if (!stopped) {
+                    maybeAdvanceCommitIndex(); // leader chỉ tự tính mình vào quorum khi entry đã nằm trên đĩa
+                }
+            } finally {
+                lock.unlock();
+            }
+        });
+    }
+
+    private void replicateTo(String peer) {
+        if (state != NodeState.LEADER) {
+            return;
+        }
+        var ls = leaderState;
+        if (!ls.getInflight().add(peer)) {
+            return; // RPC trước chưa trả lời, khi nó xong sẽ gửi tiếp phần còn thiếu
+        }
+        try {
+            var logStore = persistent.getLogStore();
+            var lastIndex = logStore.lastIndex();
+            var nextIdx = Math.min(ls.getNextIndex().getOrDefault(peer, lastIndex + 1), lastIndex + 1);
+            if (nextIdx <= logStore.getBaseIndex()) {
+                // phần follower cần đã bị compact vào snapshot
+                sendSnapshot(ls, peer);
+            } else {
+                sendEntries(ls, peer, nextIdx);
+            }
+        } catch (Exception e) {
+            log.error("Leader {} failed to replicate to {}", nodeId, peer, e);
+            ls.getInflight().remove(peer);
+        }
+    }
+
+    // gửi mọi entry từ nextIdx, hoặc heartbeat rỗng nếu follower đã đủ log
+    private void sendEntries(LeaderState ls, String peer, long nextIdx) {
+        var prevIndex = nextIdx - 1;
+        var entries = persistent.getLogStore().readFrom(nextIdx);
+        var req = new AppendEntriesRequest(persistent.getCurrentTerm(), nodeId, prevIndex, termAt(prevIndex), entries, volatileState.getCommitIndex());
+        rpcProcessor.appendEntries(peer, req).whenComplete((resp, error) -> {
+            lock.lock();
+            try {
+                onAppendEntriesResponse(ls, peer, req, resp);
+            } finally {
+                lock.unlock();
+            }
+        });
+    }
+
+    private void onAppendEntriesResponse(LeaderState ls, String peer, AppendEntriesRequest req, AppendEntriesResponse resp) {
+        ls.getInflight().remove(peer);
+        if (resp == null || !isCurrentLeader(ls, resp.term)) {
+            return;
+        }
+        ls.getLastAck().put(peer, System.nanoTime());
+        var match = ls.getMatchIndex().getOrDefault(peer, 0L);
+        if (!resp.success) {
+            // lùi theo gợi ý của follower, không bao giờ lùi quá phần đã match
+            var sentNext = req.prevLogIndex + 1;
+            var next = Math.max(match + 1, Math.min(sentNext - 1, resp.matchIndex + 1));
+            ls.getNextIndex().put(peer, next);
+            if (next < sentNext) {
+                replicateTo(peer);
+            }
+            return;
+        }
+
+        match = Math.max(match, req.prevLogIndex + req.entries.size());
+        ls.getMatchIndex().put(peer, match);
+        ls.getNextIndex().put(peer, match + 1);
+        // node bị gỡ cần cả C(new) lẫn commit index phủ tới nó thì mới biết chắc mình đã rời cluster
+        var needed = ls.getDeparting().get(peer);
+        if (needed != null && match >= needed && req.leaderCommit >= needed) {
+            removeDeparting(ls, peer);
+        }
+        maybeAdvanceCommitIndex();
+        // commit có thể vừa khiến node step-down, hoặc leader đã append thêm trong lúc chờ
+        if (leaderState == ls && match < persistent.getLogStore().lastIndex() && replicationTargets().contains(peer)) {
+            replicateTo(peer);
+        }
+    }
+
+    private void sendSnapshot(LeaderState ls, String peer) {
+        var snapshotStore = persistent.getSnapshotStore();
+        var meta = snapshotStore.getMeta();
+        var path = snapshotStore.currentPath();
+        var term = persistent.getCurrentTerm();
+        // đọc file snapshot ở ioExecutor, ngoài lock
+        runIo(() -> {
+            try {
+                Map<String, byte[]> files = new HashMap<>();
+                for (var name : meta.getFiles()) {
+                    files.put(name, Files.readAllBytes(Path.of(path, name)));
+                }
+                var req = new InstallSnapshotRequest(term, nodeId, meta.getLastIncludedIndex(),
+                        meta.getLastIncludedTerm(), meta.getConf(), files);
+                rpcProcessor.installSnapshot(peer, req).whenComplete((resp, error) -> {
+                    lock.lock();
+                    try {
+                        onInstallSnapshotResponse(ls, peer, req, resp);
+                    } finally {
+                        lock.unlock();
+                    }
+                });
+            } catch (Exception e) {
+                log.error("Leader {} failed to send snapshot to {}", nodeId, peer, e);
+                lock.lock();
+                try {
+                    ls.getInflight().remove(peer);
+                } finally {
+                    lock.unlock();
+                }
+            }
+        });
+    }
+
+    private void onInstallSnapshotResponse(LeaderState ls, String peer, InstallSnapshotRequest req, InstallSnapshotResponse resp) {
+        ls.getInflight().remove(peer);
+        if (resp == null || !isCurrentLeader(ls, resp.getTerm())) {
+            return;
+        }
+        ls.getLastAck().put(peer, System.nanoTime());
+        if (!resp.isSuccess()) {
+            return; // heartbeat sau sẽ gửi lại
+        }
+        var match = Math.max(ls.getMatchIndex().getOrDefault(peer, 0L), req.getLastIncludedIndex());
+        ls.getMatchIndex().put(peer, match);
+        ls.getNextIndex().put(peer, match + 1);
+        maybeAdvanceCommitIndex();
+        if (leaderState == ls) {
+            replicateTo(peer); // gửi tiếp phần log sau snapshot
+        }
+    }
+
+    // response chỉ còn giá trị nếu node vẫn là leader của đúng nhiệm kỳ đã gửi request.
+    // Thấy term cao hơn thì step-down luôn tại đây.
+    private boolean isCurrentLeader(LeaderState ls, long responseTerm) {
+        if (stopped) {
+            return false;
+        }
+        if (responseTerm > persistent.getCurrentTerm()) {
+            becomeFollower(responseTerm);
+            return false;
+        }
+        return leaderState == ls;
+    }
+
+    // ---------- COMMIT & APPLY ----------
+
+    // -1 nếu index không còn trong log (đã compact, hoặc chưa tới)
+    private long termAt(long index) {
+        var logStore = persistent.getLogStore();
+        if (index == logStore.getBaseIndex()) {
+            return logStore.getBaseTerm();
+        }
+        var entry = logStore.get(index);
+        return entry == null ? -1 : entry.getTerm();
+    }
+
+    private void maybeAdvanceCommitIndex() {
+        if (state != NodeState.LEADER) {
+            return;
+        }
+        var logStore = persistent.getLogStore();
+        var durableIndex = logStore.durableIndex();
+        var currentCommit = volatileState.getCommitIndex();
+        for (var candidate = logStore.lastIndex(); candidate > currentCommit; candidate--) {
+            if (termAt(candidate) != persistent.getCurrentTerm()) {
+                break; // chỉ commit trực tiếp entry của term hiện tại
+            }
+            Set<String> matched = new HashSet<>();
+            // leader chỉ tính chính nó khi entry đã nằm trên đĩa
+            if (durableIndex >= candidate) {
+                matched.add(nodeId);
+            }
+            for (var match : leaderState.getMatchIndex().entrySet()) {
+                if (match.getValue() >= candidate) {
+                    matched.add(match.getKey());
+                }
+            }
+            if (conf.hasQuorum(matched)) {
+                volatileState.setCommitIndex(candidate);
+                applyCommitted();
+                break;
+            }
+        }
+    }
+
+    private void applyCommitted() {
+        if (loadingSnapshot) {
+            return; // sẽ apply sau khi snapshot load xong
+        }
+        var lastApplied = volatileState.getLastApplied();
+        var commitIndex = volatileState.getCommitIndex();
+        var logStore = persistent.getLogStore();
+        for (long idx = lastApplied + 1; idx <= commitIndex; idx++) {
+            LogEntry logEntry = logStore.get(idx);
+            // no-op và config entry không thuộc về state machine
+            if (logEntry != null && !logEntry.isConfigurationEntry() && logEntry.getCommand() != null) {
+                stateMachine.onApply(nodeId, logEntry);
+            }
+            volatileState.setLastApplied(idx);
+            CompletableFuture<Boolean> future = pendingFutures.remove(idx);
+            if (future != null) {
+                future.complete(true);
+            }
+        }
+        // commit index chỉ cập nhật trong bộ nhớ, ghi xuống đĩa sau ở ioExecutor
+        persistent.setLastCommitIndex(commitIndex);
+        runIo(persistent::flush);
+        onConfCommitted();
+        maybeShutdownRemoved();
     }
 }

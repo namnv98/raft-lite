@@ -1,10 +1,12 @@
 package com.namnv.rpc.model.request;
 
+import com.namnv.entity.ConfigurationEntry;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 
 import java.io.Serial;
 import java.io.Serializable;
+import java.util.Map;
 
 @Data
 @AllArgsConstructor
@@ -15,5 +17,6 @@ public class InstallSnapshotRequest implements Serializable {
     private String leaderId;          // leader nodeId
     private long lastIncludedIndex;   // snapshot lastIncludedIndex
     private long lastIncludedTerm;    // snapshot lastIncludedTerm
-    private String path;      // serialized snapshot
+    private ConfigurationEntry conf;  // cluster config tại lastIncludedIndex
+    private Map<String, byte[]> files; // tên file snapshot -> nội dung
 }

@@ -14,4 +14,5 @@ public class InstallSnapshotResponse implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
     private long term;
+    private boolean success;
 }

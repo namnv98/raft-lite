@@ -4,10 +4,12 @@ import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
+import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
+import com.namnv.rpc.model.response.TimeoutNowResponse;
 
 public interface RaftServerService {
     RequestVoteResponse handleRequestVoteRequest(RequestVoteRequest req);
@@ -17,4 +19,6 @@ public interface RaftServerService {
     PreVoteResponse handlePreVoteRequest(PreVoteRequest req);
 
     InstallSnapshotResponse handleInstallSnapshotRequest(InstallSnapshotRequest req);
+
+    TimeoutNowResponse handleTimeoutNowRequest(TimeoutNowRequest req);
 }

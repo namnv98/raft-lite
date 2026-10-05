@@ -4,6 +4,7 @@ import com.namnv.config.NodeOptions;
 import com.namnv.config.RaftConfig;
 import com.namnv.core.RaftNode;
 import com.namnv.rpc.client.SocketRpcClient;
+import com.namnv.rpc.server.SocketRpcServer;
 import com.namnv.rpc.client.RpcProcessor;
 import org.apache.commons.io.FileUtils;
 
@@ -30,7 +31,7 @@ public class AppRaftSocket {
                     .electionTimeoutMinMs(200)
                     .electionTimeoutMaxMs(500)
                     .heartbeatIntervalMs(100)
-                    .stateMachine(new KeyValueStateMachine())
+                    .stateMachine(new ListStateMachine())
                     .raftConfig(RaftConfig.builder().self(nodes.get(i)).peers(nodes).build())
                     .build();
 
@@ -38,6 +39,7 @@ public class AppRaftSocket {
         }
 
         for (RaftNode n : clusters) {
+            startRpcServer(n);
             n.start();
         }
 
@@ -54,11 +56,12 @@ public class AppRaftSocket {
                 .electionTimeoutMinMs(300)
                 .electionTimeoutMaxMs(500)
                 .heartbeatIntervalMs(100)
-                .stateMachine(new KeyValueStateMachine())
+                .stateMachine(new ListStateMachine())
                 .raftConfig(RaftConfig.builder().self("localhost:8083").build())
                 .build();
 
         var raftNode = new RaftNode(nodeOptions, rpc);
+        startRpcServer(raftNode);
         raftNode.start();
         clusters.add(raftNode);
 
@@ -77,14 +80,23 @@ public class AppRaftSocket {
         TimeUnit.SECONDS.sleep(300000);
     }
 
-    private static RaftNode getLeader(List<RaftNode> clusters) {
-        while (true) {
+    // transport nằm ngoài RaftNode: node chỉ cần biết RpcProcessor để gửi và được gọi qua RaftServerService
+    private static void startRpcServer(RaftNode node) {
+        int port = Integer.parseInt(node.getNodeId().split(":")[1]);
+        new SocketRpcServer(port, node).start();
+    }
+
+    private static RaftNode getLeader(List<RaftNode> clusters) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
             for (RaftNode n : clusters) {
                 if (n.getState() == RaftNode.NodeState.LEADER) {
                     return n;
                 }
             }
+            TimeUnit.MILLISECONDS.sleep(50);
         }
+        throw new IllegalStateException("No leader elected after 10s");
     }
 }
 

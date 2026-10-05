@@ -6,7 +6,9 @@ import lombok.ToString;
 import java.io.Serial;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import static java.util.Objects.isNull;
 
@@ -41,9 +43,31 @@ public class ConfigurationEntry implements Serializable {
 
     // Final config constructor
     public ConfigurationEntry(List<String> nodes) {
-        this.oldNodes = new ArrayList<>();
-        this.newNodes = new ArrayList<>(nodes);
-        this.isJoint = false;
+        this(nodes, null, false);
+    }
+
+    // toàn bộ node tham gia (old + new khi joint)
+    public Set<String> allNodes() {
+        Set<String> all = new LinkedHashSet<>(oldNodes);
+        all.addAll(newNodes);
+        return all;
+    }
+
+    public boolean contains(String nodeId) {
+        return oldNodes.contains(nodeId) || newNodes.contains(nodeId);
+    }
+
+    // joint config cần majority ở cả cấu hình cũ lẫn cấu hình mới
+    public boolean hasQuorum(Set<String> granted) {
+        if (isJoint) {
+            return hasMajority(oldNodes, granted) && hasMajority(newNodes, granted);
+        }
+        return hasMajority(oldNodes, granted);
+    }
+
+    private static boolean hasMajority(List<String> nodes, Set<String> granted) {
+        long count = nodes.stream().filter(granted::contains).count();
+        return !nodes.isEmpty() && count >= nodes.size() / 2 + 1;
     }
 
     public boolean isJoint() {

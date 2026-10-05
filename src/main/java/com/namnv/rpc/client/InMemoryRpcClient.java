@@ -6,17 +6,21 @@ import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
 import com.namnv.rpc.model.request.RequestVoteRequest;
+import com.namnv.rpc.model.request.TimeoutNowRequest;
 import com.namnv.rpc.model.response.AppendEntriesResponse;
 import com.namnv.rpc.model.response.InstallSnapshotResponse;
 import com.namnv.rpc.model.response.PreVoteResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
+import com.namnv.rpc.model.response.TimeoutNowResponse;
 import lombok.Getter;
 import lombok.Setter;
 
+import java.io.IOException;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 
 @Setter
@@ -38,48 +42,38 @@ public class InMemoryRpcClient implements RpcProcessor {
         registry.remove(nodeId);
     }
 
-    @Override
-    public CompletableFuture<RequestVoteResponse> requestVote(String target, RequestVoteRequest request) {
-        if (!reachable.getOrDefault(request.candidateId, Set.of()).contains(target)) {
-            return CompletableFuture.completedFuture(new RequestVoteResponse(request.term, false));
-        }
+    // partition hoặc node chưa đăng ký thì RPC thất bại như lỗi mạng thật, không trả response giả
+    private <T> CompletableFuture<T> call(String from, String target, Function<RaftServerService, T> invoke) {
         RaftServerService h = registry.get(target);
-        if (h == null) return CompletableFuture.completedFuture(new RequestVoteResponse(request.term, false));
-        return CompletableFuture.supplyAsync(() -> h.handleRequestVoteRequest(request));
+        if (h == null || !reachable.getOrDefault(from, Set.of()).contains(target)) {
+            return CompletableFuture.failedFuture(new IOException(from + " cannot reach " + target));
+        }
+        return CompletableFuture.supplyAsync(() -> invoke.apply(h));
     }
 
+    @Override
+    public CompletableFuture<RequestVoteResponse> requestVote(String target, RequestVoteRequest request) {
+        return call(request.candidateId, target, h -> h.handleRequestVoteRequest(request));
+    }
 
     @Override
     public CompletableFuture<AppendEntriesResponse> appendEntries(String target, AppendEntriesRequest req) {
-        if (!reachable.getOrDefault(req.leaderId, Set.of()).contains(target)) {
-            return CompletableFuture.completedFuture(null);
-        }
-        RaftServerService h = registry.get(target);
-        if (h == null) return CompletableFuture.completedFuture(new AppendEntriesResponse(req.term, false, 0));
-        return CompletableFuture.supplyAsync(() -> h.handleAppendEntriesRequest(req));
+        return call(req.leaderId, target, h -> h.handleAppendEntriesRequest(req));
     }
 
     @Override
     public CompletableFuture<PreVoteResponse> preVote(String target, PreVoteRequest req) {
-        if (!reachable.getOrDefault(req.candidateId, Set.of()).contains(target)) {
-            return CompletableFuture.completedFuture(new PreVoteResponse(req.term, false));
-        }
-
-        RaftServerService h = registry.get(target);
-        if (h == null) {
-            return CompletableFuture.completedFuture(new PreVoteResponse(req.term, false));
-        }
-
-        return CompletableFuture.supplyAsync(() -> h.handlePreVoteRequest(req));
+        return call(req.candidateId, target, h -> h.handlePreVoteRequest(req));
     }
 
     @Override
     public CompletableFuture<InstallSnapshotResponse> installSnapshot(String target, InstallSnapshotRequest req) {
-        RaftServerService h = registry.get(target);
-        if (h == null) {
-            return CompletableFuture.completedFuture(new InstallSnapshotResponse());
-        }
-        return CompletableFuture.supplyAsync(() -> h.handleInstallSnapshotRequest(req));
+        return call(req.getLeaderId(), target, h -> h.handleInstallSnapshotRequest(req));
+    }
+
+    @Override
+    public CompletableFuture<TimeoutNowResponse> timeoutNow(String target, TimeoutNowRequest req) {
+        return call(req.leaderId, target, h -> h.handleTimeoutNowRequest(req));
     }
 
 }

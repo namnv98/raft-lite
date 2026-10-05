@@ -9,21 +9,30 @@ public interface LogStorage {
 
     long lastTerm();
 
+    // append chưa fsync: entry chỉ được tính là bền vững sau khi sync()
     void appendEntry(LogEntry entry);
+
+    void appendEntries(List<LogEntry> entries);
+
+    // fsync mọi entry đã append; gọi được ngoài lock của node, nhiều lời gọi đồng thời được gộp lại
+    void sync();
+
+    long durableIndex();
 
     List<LogEntry> readFrom(long startIndexInclusive);
 
     LogEntry get(long index);
 
-    void truncateSuffix(long lastIndexKept);
+    void truncateSuffix(long firstIndexRemoved);
 
     void truncatePrefix(long firstIndexKept);
+
+    // bỏ toàn bộ log, bắt đầu lại ngay sau snapshot
+    void reset(long baseIndex, long baseTerm);
 
     long getBaseIndex();
 
     long getBaseTerm();
 
-    void setBaseIndex(long baseIndex);
-
-    void setBaseTerm(long baseTerm);
+    void close();
 }

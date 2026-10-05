@@ -37,7 +37,7 @@ public class AppRaftInMem {
                     .electionTimeoutMinMs(300)
                     .electionTimeoutMaxMs(500)
                     .heartbeatIntervalMs(100)
-                    .stateMachine(new KeyValueStateMachine())
+                    .stateMachine(new ListStateMachine())
                     .raftConfig(RaftConfig.builder().self(nodes.get(i)).peers(nodes).build())
                     .build();
 
@@ -74,7 +74,7 @@ public class AppRaftInMem {
                 .electionTimeoutMinMs(300)
                 .electionTimeoutMaxMs(500)
                 .heartbeatIntervalMs(100)
-                .stateMachine(new KeyValueStateMachine())
+                .stateMachine(new ListStateMachine())
                 .raftConfig(RaftConfig.builder().self("D").build())
                 .build();
 
@@ -98,14 +98,17 @@ public class AppRaftInMem {
         TimeUnit.SECONDS.sleep(300000);
     }
 
-    private static RaftNode getLeader(List<RaftNode> clusters) {
-        while (true) {
+    private static RaftNode getLeader(List<RaftNode> clusters) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
             for (RaftNode n : clusters) {
                 if (n.getState() == RaftNode.NodeState.LEADER) {
                     return n;
                 }
             }
+            TimeUnit.MILLISECONDS.sleep(50);
         }
+        throw new IllegalStateException("No leader elected after 10s");
     }
 
     private static void partitionNode(String node, Map<String, Set<String>> network) {
