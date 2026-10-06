@@ -9,6 +9,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -61,7 +63,7 @@ class LedgerGatewayTest {
         http.close();
     }
 
-    private TransferBatcher startGateway(boolean batching) throws IOException {
+    private TransferBatcher startGateway(boolean batching) throws Exception {
         var client = new LedgerClient(servers, 20_000);
         var batcher = batching ? new TransferBatcher(client, 100, 2, 10_000) : null;
         var gateway = LedgerGateway.start(0, client, batcher);
@@ -132,6 +134,43 @@ class LedgerGatewayTest {
         var totals = get("/totals").body();
         assertEquals(3, totals.get("transfers").asLong());
         assertEquals(totals.get("debitsPosted").asLong(), totals.get("creditsPosted").asLong());
+    }
+
+    @Test
+    void pipelinedRequestsOnOneConnectionAreAnsweredInOrder() throws Exception {
+        startGateway(true);
+        assertEquals(201, post("/accounts", null, "{\"id\":1,\"ledger\":840}").status());
+        assertEquals(201, post("/accounts", null, "{\"id\":2,\"ledger\":840,\"flags\":1}").status());
+        int port = Integer.parseInt(base.substring(base.lastIndexOf(':') + 1));
+        try (var socket = new Socket("localhost", port)) {
+            // ba request liền nhau, không chờ trả lời: cái đầu cần cụm Raft (chậm), hai cái sau trả lời ngay trên cổng
+            // (404 và 400), nhưng trả lời vẫn phải về đúng thứ tự
+            String body = transfer(1, 2, 7);
+            String requests = "POST /transfers HTTP/1.1\r\nHost: x\r\nIdempotency-Key: pipelined\r\nContent-Length: "
+                    + body.length() + "\r\n\r\n" + body
+                    + "GET /nowhere HTTP/1.1\r\nHost: x\r\n\r\n"
+                    + "POST /transfers HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            socket.getOutputStream().write(requests.getBytes(StandardCharsets.US_ASCII));
+            String replies = new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
+            int first = replies.indexOf("HTTP/1.1 201");
+            int second = replies.indexOf("HTTP/1.1 404");
+            int third = replies.indexOf("HTTP/1.1 400");
+            assertTrue(first >= 0 && first < second && second < third, replies);
+        }
+        assertEquals(7, get("/accounts/2").body().get("creditsPosted").asLong());
+    }
+
+    @Test
+    void oversizedBodiesAreRefused() throws Exception {
+        startGateway(false);
+        var huge = "{\"pad\":\"" + "x".repeat(100_000) + "\"}";
+        var reply = http.send(HttpRequest.newBuilder(URI.create(base + "/transfers"))
+                .POST(HttpRequest.BodyPublishers.ofString(huge)).header("Idempotency-Key", "big").build(),
+                HttpResponse.BodyHandlers.discarding());
+        assertEquals(413, reply.statusCode());
+        assertEquals(400, post("/transfers", "strings", "{\"debitAccountId\":\"2\",\"creditAccountId\":3,\"amount\":1,\"ledger\":840}").status());
+        assertEquals(400, post("/transfers", "array", "[1,2]").status());
+        assertEquals(400, post("/transfers", "trailing", transfer(1, 2, 3) + " {}").status());
     }
 
     @Test

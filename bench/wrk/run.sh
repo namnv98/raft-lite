@@ -15,7 +15,8 @@
 # Biến môi trường:
 #   WRK=/đường/dẫn/wrk   THREADS=4 (thread của wrk)   DURATION=10 (giây mỗi lượt)   WARMUP=3 (giây khởi động mỗi cổng)
 #   FSYNC=true   SNAPSHOT_INTERVAL=2000000 (entry giữa hai snapshot)   MODES="http http-batch"
-#   MAX_BATCH=1000 MAX_INFLIGHT=4 (của cổng gom lô)   NODE_HEAP=2g   BUILD=1 (build lại)
+#   MAX_BATCH=1000 MAX_INFLIGHT=4 (của cổng gom lô)   EVENT_LOOPS (event loop Netty của cổng, mặc định 1/4 số CPU)
+#   NODE_HEAP=2g   BUILD=1 (build lại)
 #   WRK_CPUS=12-19 (ghim wrk vào các core này bằng taskset, ví dụ E-core, để bớt tranh CPU với cụm)
 #   KEEP=1 (giữ thư mục dữ liệu và log của node trong silkroad-raft-ledger/target/wrk-bench)
 set -euo pipefail
@@ -137,6 +138,7 @@ log "dựng cụm 3 node + 2 cổng (fsync $FSYNC, snapshot mỗi $SNAPSHOT_INTE
 java -Xmx2g \
     -Dgateway.modes=serve -Dgateway.serveSeconds=86400 \
     -Dgateway.maxBatch="${MAX_BATCH:-1000}" -Dgateway.maxInflight="${MAX_INFLIGHT:-4}" \
+    -Dgateway.eventLoops="${EVENT_LOOPS:-$(( $(nproc) / 4 > 0 ? $(nproc) / 4 : 1 ))}" \
     -Dledger.logSync="$FSYNC" -Dledger.snapshotInterval="$SNAPSHOT_INTERVAL" \
     -Dledger.nodeHeap="${NODE_HEAP:-2g}" -Dledger.keep="$([ "${KEEP:-0}" = 1 ] && echo true || echo false)" \
     -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" \

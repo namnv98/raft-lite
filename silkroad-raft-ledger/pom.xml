@@ -19,6 +19,9 @@
         <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-client</artifactId></dependency>
         <!-- lịch sử giao dịch cũ -->
         <dependency><groupId>org.rocksdb</groupId><artifactId>rocksdbjni</artifactId></dependency>
+        <!-- cổng HTTP (LedgerGateway); epoll native trên Linux, các nơi khác dùng NIO -->
+        <dependency><groupId>io.netty</groupId><artifactId>netty-codec-http</artifactId></dependency>
+        <dependency><groupId>io.netty</groupId><artifactId>netty-transport-native-epoll</artifactId><classifier>linux-x86_64</classifier></dependency>
         <!-- node và benchmark chạy thành tiến trình riêng: cần một backend log lúc chạy -->
         <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-slf4j2-impl</artifactId><scope>runtime</scope></dependency>
         <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId><scope>runtime</scope></dependency>

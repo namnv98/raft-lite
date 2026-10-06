@@ -65,6 +65,9 @@
             <!-- kho KV: LMDB cùng thiết kế B+tree trên mmap với bbolt của etcd; RocksDB là LSM-tree -->
             <dependency><groupId>org.lmdbjava</groupId><artifactId>lmdbjava</artifactId><version>0.9.3</version></dependency>
             <dependency><groupId>org.rocksdb</groupId><artifactId>rocksdbjni</artifactId><version>11.1.1</version></dependency>
+            <!-- cổng HTTP của sổ cái -->
+            <dependency><groupId>io.netty</groupId><artifactId>netty-codec-http</artifactId><version>4.1.138.Final</version></dependency>
+            <dependency><groupId>io.netty</groupId><artifactId>netty-transport-native-epoll</artifactId><version>4.1.138.Final</version><classifier>linux-x86_64</classifier></dependency>
             <!-- cluster tham chiếu trong benchmarks -->
             <dependency><groupId>com.alipay.sofa</groupId><artifactId>jraft-core</artifactId><version>1.4.0</version></dependency>
         </dependencies>

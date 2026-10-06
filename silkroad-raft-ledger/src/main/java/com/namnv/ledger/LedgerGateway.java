@@ -1,10 +1,39 @@
 package com.namnv.ledger;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpServer;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.ServerChannel;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.epoll.Epoll;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.epoll.EpollServerSocketChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaderValues;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.codec.http.HttpServerKeepAliveHandler;
+import io.netty.handler.codec.http.HttpUtil;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.util.AsciiString;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -12,15 +41,12 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.CompletionException;
 
 /**
  * Cổng HTTP/JSON trước sổ cái, kiểu API mà các hệ thống khác (app, core banking, đối tác) gọi tới. Bên trong, cổng nói
@@ -35,47 +61,56 @@ import java.util.concurrent.TimeoutException;
  * {@code EXISTS}.
  * <p>
  * Mã trả về: 201 ghi mới; 200 đã có từ lần gửi trước; 409 id đã dùng cho giao dịch khác; 422 bị từ chối theo quy tắc của
- * sổ (không đủ tiền, sai sổ...); 400 request sai; 404 không có; 503 không rõ kết quả (đổi leader, quá hạn, quá tải) — gửi
- * lại với cùng key.
+ * sổ (không đủ tiền, sai sổ...); 400 request sai; 404 không có; 413 body quá lớn; 503 không rõ kết quả (đổi leader, quá
+ * hạn, quá tải) — gửi lại với cùng key.
+ * <p>
+ * Chạy trên Netty (epoll trên Linux): vài event loop, không thread nào đứng chờ cụm Raft. Request được đọc ngay trên event
+ * loop (body bằng parser streaming của Jackson, không dựng object trung gian), lệnh đi tới cụm, và trả lời được ghi khi
+ * kết quả về, cũng trên event loop của kết nối. Client gửi nhiều request liền trên một kết nối (HTTP pipelining) nhận trả
+ * lời đúng thứ tự.
  * <pre>
  * java ... com.namnv.ledger.LedgerGateway cổng host1:port1,host2:port2,host3:port3
  * </pre>
  * -Dgateway.batch=false: gửi mỗi giao dịch một lệnh Raft, không gom. -Dgateway.maxBatch=1000 -Dgateway.maxInflight=4:
- * xem {@link TransferBatcher}.
+ * xem {@link TransferBatcher}. -Dgateway.eventLoops: số event loop (mặc định 1/4 số CPU).
  */
 @Slf4j
 public final class LedgerGateway implements AutoCloseable {
-    private static final ObjectMapper JSON = new ObjectMapper()
-            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-    private static final long WAIT_SECONDS = 30;
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final JsonFactory JSON_FACTORY = JSON.getFactory();
+    private static final int MAX_BODY_BYTES = 64 * 1024;
 
-    private final HttpServer server;
-    private final ExecutorService executor;
+    private static final AsciiString IDEMPOTENCY_KEY = AsciiString.cached("idempotency-key");
+    private static final AsciiString RETRY_AFTER = AsciiString.cached("retry-after");
+    private static final AsciiString ONE = AsciiString.cached("1");
+
+    // các trường của body, theo thứ tự trong mảng giá trị
+    private static final String[] TRANSFER_FIELDS = {"id", "debitAccountId", "creditAccountId", "amount", "ledger"};
+    private static final String[] ACCOUNT_FIELDS = {"id", "ledger", "flags"};
+
+    private final EventLoopGroup boss;
+    private final EventLoopGroup workers;
+    private Channel serverChannel;
     private final LedgerClient client;
     private final TransferBatcher batcher;
 
-    record TransferRequest(Long id, long debitAccountId, long creditAccountId, long amount, int ledger) {
-    }
-
-    record AccountRequest(long id, int ledger, int flags) {
-    }
-
-    record Answer(long id, LedgerResult result) {
-    }
-
     /** lỗi của request, trả về với mã {@code status} */
     private static final class HttpError extends Exception {
-        final int status;
+        final HttpResponseStatus status;
 
-        HttpError(int status, String message) {
+        HttpError(HttpResponseStatus status, String message) {
             super(message, null, false, false);
             this.status = status;
         }
     }
 
-    private LedgerGateway(HttpServer server, ExecutorService executor, LedgerClient client, TransferBatcher batcher) {
-        this.server = server;
-        this.executor = executor;
+    /** trả lời đã sẵn sàng: mã và body JSON */
+    private record Reply(HttpResponseStatus status, byte[] body) {
+    }
+
+    private LedgerGateway(EventLoopGroup boss, EventLoopGroup workers, LedgerClient client, TransferBatcher batcher) {
+        this.boss = boss;
+        this.workers = workers;
         this.client = client;
         this.batcher = batcher;
     }
@@ -84,146 +119,288 @@ public final class LedgerGateway implements AutoCloseable {
      * @param port    0 để chọn cổng trống
      * @param batcher gom giao dịch thành lô, hoặc null để gửi từng giao dịch một
      */
-    public static LedgerGateway start(int port, LedgerClient client, TransferBatcher batcher) throws IOException {
-        // mặc định HttpServer chỉ giữ 200 kết nối keep-alive rảnh và đóng những cái thừa trong khi client vẫn dùng lại
-        // chúng (lỗi "header parser received no bytes" khi có hàng trăm client). Được đọc một lần, khi HttpServer đầu tiên
-        // được tạo trong tiến trình.
-        if (System.getProperty("sun.net.httpserver.maxIdleConnections") == null) {
-            System.setProperty("sun.net.httpserver.maxIdleConnections", "10000");
+    public static LedgerGateway start(int port, LedgerClient client, TransferBatcher batcher) throws InterruptedException {
+        return start(port, client, batcher,
+                Integer.getInteger("gateway.eventLoops", Math.max(1, Runtime.getRuntime().availableProcessors() / 4)));
+    }
+
+    public static LedgerGateway start(int port, LedgerClient client, TransferBatcher batcher, int eventLoops)
+            throws InterruptedException {
+        boolean epoll = Epoll.isAvailable();
+        EventLoopGroup boss = epoll ? new EpollEventLoopGroup(1) : new NioEventLoopGroup(1);
+        EventLoopGroup workers = epoll ? new EpollEventLoopGroup(eventLoops) : new NioEventLoopGroup(eventLoops);
+        Class<? extends ServerChannel> channelType = epoll ? EpollServerSocketChannel.class : NioServerSocketChannel.class;
+        var gateway = new LedgerGateway(boss, workers, client, batcher);
+        try {
+            gateway.serverChannel = new ServerBootstrap()
+                    .group(boss, workers)
+                    .channel(channelType)
+                    .option(ChannelOption.SO_BACKLOG, 4096)
+                    .childOption(ChannelOption.TCP_NODELAY, true)
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) {
+                            ch.pipeline().addLast(
+                                    new HttpServerCodec(),
+                                    new HttpServerKeepAliveHandler(),
+                                    new HttpObjectAggregator(MAX_BODY_BYTES),
+                                    gateway.new Connection());
+                        }
+                    })
+                    .bind(port).sync().channel();
+            log.info("ledger gateway on port {} ({}, {} event loops, batching {})",
+                    gateway.port(), epoll ? "epoll" : "nio", eventLoops, batcher != null);
+            return gateway;
+        } catch (RuntimeException | InterruptedException e) {
+            boss.shutdownGracefully();
+            workers.shutdownGracefully();
+            throw e;
         }
-        var server = HttpServer.create(new InetSocketAddress(port), 4096);
-        // mỗi request một virtual thread: chờ kết quả từ cụm Raft không giữ thread hệ điều hành nào
-        var executor = Executors.newVirtualThreadPerTaskExecutor();
-        server.setExecutor(executor);
-        var gateway = new LedgerGateway(server, executor, client, batcher);
-        server.createContext("/transfers", gateway::handleTransfers);
-        server.createContext("/accounts", gateway::handleAccounts);
-        server.createContext("/totals", exchange -> gateway.handle(exchange, () -> {
-            requireMethod(exchange, "GET");
-            return Map.entry(200, client.totals().get(WAIT_SECONDS, TimeUnit.SECONDS));
-        }));
-        server.createContext("/stats", exchange -> gateway.handle(exchange, () -> {
-            long[] counters = batcher != null ? batcher.counters() : new long[2];
-            return Map.entry(200, Map.of("batching", batcher != null, "batches", counters[0], "transfers", counters[1]));
-        }));
-        server.start();
-        return gateway;
     }
 
     public int port() {
-        return server.getAddress().getPort();
+        return ((InetSocketAddress) serverChannel.localAddress()).getPort();
     }
 
-    private interface Action {
-        Map.Entry<Integer, Object> run() throws Exception;
-    }
+    /**
+     * Một kết nối. Mọi phương thức chạy trên event loop của kết nối; trả lời đi ra theo đúng thứ tự request đến.
+     */
+    private final class Connection extends SimpleChannelInboundHandler<FullHttpRequest> {
+        private final ArrayDeque<Slot> pending = new ArrayDeque<>();
+        private byte[] scratch = new byte[256];
 
-    private void handleTransfers(HttpExchange exchange) {
-        handle(exchange, () -> {
-            Long id = pathId(exchange, "/transfers");
-            if (id != null) {
-                requireMethod(exchange, "GET");
-                var found = client.lookupTransfers(List.of(id)).get(WAIT_SECONDS, TimeUnit.SECONDS).getFirst();
-                return found == null ? notFound(id) : Map.entry(200, found);
+        private static final class Slot {
+            boolean keepAlive;
+            Reply reply;
+        }
+
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
+            var slot = new Slot();
+            slot.keepAlive = HttpUtil.isKeepAlive(request);
+            pending.add(slot);
+            if (!request.decoderResult().isSuccess()) {
+                complete(ctx, slot, error(HttpResponseStatus.BAD_REQUEST, "malformed HTTP request"));
+                return;
             }
-            requireMethod(exchange, "POST");
-            var request = read(exchange, TransferRequest.class);
-            long transferId = request.id() != null ? request.id() : idFromKey(exchange.getRequestHeaders().getFirst("Idempotency-Key"));
-            var transfer = new LedgerTransfer(transferId, request.debitAccountId(), request.creditAccountId(),
-                    request.amount(), request.ledger());
+            CompletableFuture<Reply> reply;
+            try {
+                reply = route(request);
+            } catch (HttpError e) {
+                complete(ctx, slot, error(e.status, e.getMessage()));
+                return;
+            } catch (RuntimeException | IOException e) {
+                log.warn("gateway request failed", e);
+                complete(ctx, slot, error(HttpResponseStatus.INTERNAL_SERVER_ERROR, String.valueOf(e.getMessage())));
+                return;
+            }
+            reply.whenComplete((answer, failure) -> {
+                // kết quả từ cụm về trên thread của transport: chuyển sang event loop của kết nối để ghi
+                Reply done = failure == null ? answer : unknownOutcome(failure);
+                if (ctx.executor().inEventLoop()) {
+                    complete(ctx, slot, done);
+                } else {
+                    ctx.executor().execute(() -> complete(ctx, slot, done));
+                }
+            });
+        }
+
+        private void complete(ChannelHandlerContext ctx, Slot slot, Reply reply) {
+            slot.reply = reply;
+            boolean wrote = false;
+            while (!pending.isEmpty() && pending.peek().reply != null) {
+                Slot head = pending.poll();
+                ctx.write(response(ctx, head.reply, head.keepAlive));
+                wrote = true;
+            }
+            if (wrote) {
+                ctx.flush();
+            }
+        }
+
+        private FullHttpResponse response(ChannelHandlerContext ctx, Reply reply, boolean keepAlive) {
+            ByteBuf body = ctx.alloc().buffer(reply.body.length).writeBytes(reply.body);
+            var response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, reply.status, body);
+            response.headers()
+                    .set(HttpHeaderNames.CONTENT_TYPE, HttpHeaderValues.APPLICATION_JSON)
+                    .setInt(HttpHeaderNames.CONTENT_LENGTH, reply.body.length);
+            if (reply.status == HttpResponseStatus.SERVICE_UNAVAILABLE) {
+                response.headers().set(RETRY_AFTER, ONE);
+            }
+            HttpUtil.setKeepAlive(response, keepAlive);
+            return response;
+        }
+
+        private CompletableFuture<Reply> route(FullHttpRequest request) throws HttpError, IOException {
+            String uri = request.uri();
+            int query = uri.indexOf('?');
+            String path = query < 0 ? uri : uri.substring(0, query);
+            HttpMethod method = request.method();
+            if (path.equals("/transfers")) {
+                requireMethod(method, HttpMethod.POST);
+                return postTransfer(request);
+            }
+            if (path.startsWith("/transfers/")) {
+                requireMethod(method, HttpMethod.GET);
+                long id = pathId(path, "/transfers/");
+                return client.lookupTransfers(List.of(id)).thenApply(found -> found.getFirst() == null
+                        ? notFound(id) : json(HttpResponseStatus.OK, found.getFirst()));
+            }
+            if (path.equals("/accounts")) {
+                requireMethod(method, HttpMethod.POST);
+                long[] fields = parse(request.content(), ACCOUNT_FIELDS);
+                long id = fields[0];
+                var account = new LedgerAccount(id, (int) fields[1], (int) fields[2]);
+                return client.createAccounts(List.of(account)).thenApply(results -> answer(id, results.getFirst()));
+            }
+            if (path.startsWith("/accounts/")) {
+                requireMethod(method, HttpMethod.GET);
+                long id = pathId(path, "/accounts/");
+                return client.lookupAccounts(List.of(id)).thenApply(found -> found.getFirst() == null
+                        ? notFound(id) : json(HttpResponseStatus.OK, found.getFirst()));
+            }
+            if (path.equals("/totals")) {
+                requireMethod(method, HttpMethod.GET);
+                return client.totals().thenApply(totals -> json(HttpResponseStatus.OK, totals));
+            }
+            if (path.equals("/stats")) {
+                requireMethod(method, HttpMethod.GET);
+                long[] counters = batcher != null ? batcher.counters() : new long[2];
+                return CompletableFuture.completedFuture(json(HttpResponseStatus.OK,
+                        Map.of("batching", batcher != null, "batches", counters[0], "transfers", counters[1])));
+            }
+            throw new HttpError(HttpResponseStatus.NOT_FOUND, "no such resource: " + path);
+        }
+
+        // đường nóng: không dựng object trung gian cho body, trả lời được ghi tay
+        private CompletableFuture<Reply> postTransfer(FullHttpRequest request) throws HttpError, IOException {
+            long[] fields = parse(request.content(), TRANSFER_FIELDS);
+            long id;
+            if (present(fields, 0)) {
+                id = fields[0];
+            } else {
+                id = idFromKey(request.headers().get(IDEMPOTENCY_KEY));
+            }
+            var transfer = new LedgerTransfer(id, fields[1], fields[2], fields[3], (int) fields[4]);
             CompletableFuture<LedgerResult> result = batcher != null ? batcher.submit(transfer) : client.transfer(transfer);
-            return answer(transferId, result.get(WAIT_SECONDS, TimeUnit.SECONDS));
-        });
-    }
+            return result.thenApply(r -> answer(id, r));
+        }
 
-    private void handleAccounts(HttpExchange exchange) {
-        handle(exchange, () -> {
-            Long id = pathId(exchange, "/accounts");
-            if (id != null) {
-                requireMethod(exchange, "GET");
-                var found = client.lookupAccounts(List.of(id)).get(WAIT_SECONDS, TimeUnit.SECONDS).getFirst();
-                return found == null ? notFound(id) : Map.entry(200, found);
+        /**
+         * Đọc một object JSON phẳng chỉ có số (và null), lấy các trường {@code names}; trường lạ bị bỏ qua. Phần tử cuối
+         * của mảng trả về là bitmask các trường có mặt với giá trị khác null.
+         */
+        private long[] parse(ByteBuf content, String[] names) throws HttpError, IOException {
+            int length = content.readableBytes();
+            byte[] bytes;
+            int offset;
+            if (content.hasArray()) {
+                bytes = content.array();
+                offset = content.arrayOffset() + content.readerIndex();
+            } else {
+                if (scratch.length < length) {
+                    scratch = new byte[Math.max(length, scratch.length * 2)];
+                }
+                content.getBytes(content.readerIndex(), scratch, 0, length);
+                bytes = scratch;
+                offset = 0;
             }
-            requireMethod(exchange, "POST");
-            var request = read(exchange, AccountRequest.class);
-            var result = client.createAccounts(List.of(new LedgerAccount(request.id(), request.ledger(), request.flags())))
-                    .get(WAIT_SECONDS, TimeUnit.SECONDS).getFirst();
-            return answer(request.id(), result);
-        });
+            long[] values = new long[names.length + 1];
+            try (JsonParser parser = JSON_FACTORY.createParser(bytes, offset, length)) {
+                if (parser.nextToken() != JsonToken.START_OBJECT) {
+                    throw new HttpError(HttpResponseStatus.BAD_REQUEST, "malformed JSON: expected an object");
+                }
+                JsonToken token;
+                while ((token = parser.nextToken()) == JsonToken.FIELD_NAME) {
+                    String name = parser.currentName();
+                    JsonToken value = parser.nextToken();
+                    int field = indexOf(names, name);
+                    if (field < 0) {
+                        parser.skipChildren();
+                    } else if (value != JsonToken.VALUE_NULL) {
+                        if (value != JsonToken.VALUE_NUMBER_INT) {
+                            throw new HttpError(HttpResponseStatus.BAD_REQUEST, "\"" + name + "\" must be an integer");
+                        }
+                        values[field] = parser.getLongValue();
+                        values[names.length] |= 1L << field;
+                    }
+                }
+                if (token != JsonToken.END_OBJECT || parser.nextToken() != null) {
+                    throw new HttpError(HttpResponseStatus.BAD_REQUEST, "malformed JSON");
+                }
+            } catch (JsonProcessingException e) {
+                throw new HttpError(HttpResponseStatus.BAD_REQUEST, "malformed JSON: " + e.getOriginalMessage());
+            }
+            return values;
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            log.debug("gateway connection failed", cause);
+            ctx.close();
+        }
     }
 
-    private static Map.Entry<Integer, Object> answer(long id, LedgerResult result) {
-        int status = switch (result) {
-            case OK -> 201;
-            case EXISTS -> 200;
-            case EXISTS_WITH_DIFFERENT_FIELDS -> 409;
-            case MALFORMED -> 400;
-            default -> 422;
+    private static boolean present(long[] values, int field) {
+        return (values[values.length - 1] & (1L << field)) != 0;
+    }
+
+    private static int indexOf(String[] names, String name) {
+        for (int i = 0; i < names.length; i++) {
+            if (names[i].equals(name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static Reply answer(long id, LedgerResult result) {
+        HttpResponseStatus status = switch (result) {
+            case OK -> HttpResponseStatus.CREATED;
+            case EXISTS -> HttpResponseStatus.OK;
+            case EXISTS_WITH_DIFFERENT_FIELDS -> HttpResponseStatus.CONFLICT;
+            case MALFORMED -> HttpResponseStatus.BAD_REQUEST;
+            default -> HttpResponseStatus.UNPROCESSABLE_ENTITY;
         };
-        return Map.entry(status, new Answer(id, result));
+        // {"id":…,"result":"…"} ghi tay: đây là trả lời của mọi giao dịch
+        String body = "{\"id\":" + id + ",\"result\":\"" + result.name() + "\"}";
+        return new Reply(status, body.getBytes(StandardCharsets.US_ASCII));
     }
 
-    private static Map.Entry<Integer, Object> notFound(long id) {
-        return Map.entry(404, Map.of("id", id, "error", "not found"));
+    private static Reply notFound(long id) {
+        return json(HttpResponseStatus.NOT_FOUND, Map.of("id", id, "error", "not found"));
     }
 
-    private void handle(HttpExchange exchange, Action action) {
-        int status;
-        Object body;
+    private static Reply error(HttpResponseStatus status, String message) {
+        return json(status, Map.of("error", message));
+    }
+
+    private static Reply unknownOutcome(Throwable failure) {
+        Throwable cause = failure instanceof CompletionException && failure.getCause() != null ? failure.getCause() : failure;
+        // không rõ lệnh đã được ghi hay chưa: gửi lại với cùng Idempotency-Key là an toàn
+        return error(HttpResponseStatus.SERVICE_UNAVAILABLE,
+                "outcome unknown, retry with the same Idempotency-Key: " + cause.getMessage());
+    }
+
+    private static Reply json(HttpResponseStatus status, Object body) {
         try {
-            var outcome = action.run();
-            status = outcome.getKey();
-            body = outcome.getValue();
-        } catch (HttpError e) {
-            status = e.status;
-            body = Map.of("error", e.getMessage());
-        } catch (ExecutionException | TimeoutException e) {
-            // không rõ lệnh đã được ghi hay chưa: gửi lại với cùng Idempotency-Key là an toàn
-            status = 503;
-            body = Map.of("error", "outcome unknown, retry with the same Idempotency-Key: "
-                    + (e.getCause() != null ? e.getCause().getMessage() : "timed out"));
-        } catch (Exception e) {
-            log.warn("gateway request failed", e);
-            status = 500;
-            body = Map.of("error", String.valueOf(e.getMessage()));
-        }
-        try (exchange) {
-            byte[] bytes = JSON.writeValueAsBytes(body);
-            exchange.getResponseHeaders().set("Content-Type", "application/json");
-            if (status == 503) {
-                exchange.getResponseHeaders().set("Retry-After", "1");
-            }
-            exchange.sendResponseHeaders(status, bytes.length);
-            exchange.getResponseBody().write(bytes);
-        } catch (IOException e) {
-            log.debug("could not answer the client", e);
-        }
-    }
-
-    private static <T> T read(HttpExchange exchange, Class<T> type) throws IOException, HttpError {
-        try (var in = exchange.getRequestBody()) {
-            return JSON.readValue(in, type);
+            return new Reply(status, JSON.writeValueAsBytes(body));
         } catch (JsonProcessingException e) {
-            throw new HttpError(400, "malformed JSON: " + e.getOriginalMessage());
+            throw new IllegalStateException(e);
         }
     }
 
-    private static void requireMethod(HttpExchange exchange, String method) throws HttpError {
-        if (!exchange.getRequestMethod().equals(method)) {
-            throw new HttpError(405, exchange.getRequestMethod() + " is not allowed here");
+    private static void requireMethod(HttpMethod actual, HttpMethod expected) throws HttpError {
+        if (!actual.equals(expected)) {
+            throw new HttpError(HttpResponseStatus.METHOD_NOT_ALLOWED, actual + " is not allowed here");
         }
     }
 
-    /** id trong đường dẫn {@code prefix/{id}}, hoặc null nếu đường dẫn đúng là {@code prefix} */
-    private static Long pathId(HttpExchange exchange, String prefix) throws HttpError {
-        String path = exchange.getRequestURI().getPath();
-        if (path.equals(prefix) || path.equals(prefix + "/")) {
-            return null;
-        }
+    private static long pathId(String path, String prefix) throws HttpError {
         try {
-            return Long.parseLong(path.substring(prefix.length() + 1));
-        } catch (NumberFormatException | IndexOutOfBoundsException e) {
-            throw new HttpError(404, "no such resource: " + path);
+            return Long.parseLong(path.substring(prefix.length()));
+        } catch (NumberFormatException e) {
+            throw new HttpError(HttpResponseStatus.NOT_FOUND, "no such resource: " + path);
         }
     }
 
@@ -233,7 +410,7 @@ public final class LedgerGateway implements AutoCloseable {
      */
     static long idFromKey(String key) throws HttpError {
         if (key == null || key.isBlank()) {
-            throw new HttpError(400, "a transfer needs an \"id\" or an Idempotency-Key header");
+            throw new HttpError(HttpResponseStatus.BAD_REQUEST, "a transfer needs an \"id\" or an Idempotency-Key header");
         }
         try {
             byte[] hash = MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8));
@@ -250,8 +427,9 @@ public final class LedgerGateway implements AutoCloseable {
 
     @Override
     public void close() {
-        server.stop(0);
-        executor.close();
+        serverChannel.close().syncUninterruptibly();
+        boss.shutdownGracefully(0, 2, java.util.concurrent.TimeUnit.SECONDS).syncUninterruptibly();
+        workers.shutdownGracefully(0, 2, java.util.concurrent.TimeUnit.SECONDS).syncUninterruptibly();
         client.close();
     }
 
@@ -266,7 +444,6 @@ public final class LedgerGateway implements AutoCloseable {
                 Integer.getInteger("gateway.maxInflight", 4), Integer.getInteger("gateway.maxQueued", 100_000))
                 : null;
         var gateway = start(Integer.parseInt(args[0]), client, batcher);
-        log.info("ledger gateway listening on port {} (batching {})", gateway.port(), batcher != null);
         Runtime.getRuntime().addShutdownHook(new Thread(gateway::close));
         Thread.currentThread().join();
     }

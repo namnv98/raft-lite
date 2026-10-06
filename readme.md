@@ -390,7 +390,9 @@ GET  /accounts/{id}   GET /transfers/{id}   GET /totals   GET /stats
 - **Tự gom lô (`TransferBatcher`)**, kiểu Nagle không chờ theo thời gian: dưới `maxInflight` lô đang bay thì gửi ngay
   (tải thấp: độ trễ như gửi lẻ); đủ rồi thì request mới xếp hàng và đi chung lô kế tiếp, ngay khi một lô trả lời (tải cao:
   lô tự lớn, tới `maxBatch`). Mỗi giao dịch trong lô vẫn được kiểm tra và trả kết quả riêng.
-- `HttpServer` của JDK, mỗi request một virtual thread.
+- Chạy trên Netty (epoll trên Linux), `-Dgateway.eventLoops` event loop (mặc định 1/4 số CPU). Không thread nào đứng chờ
+  cụm Raft: request được đọc trên event loop (body bằng parser streaming của Jackson, không dựng object), trả lời được ghi
+  khi kết quả về. Nhiều request liền trên một kết nối (HTTP pipelining) nhận trả lời đúng thứ tự; body tối đa 64 KB (413).
 
 ```bash
 java -Dgateway.maxBatch=1000 -Dgateway.maxInflight=4 ... com.namnv.ledger.LedgerGateway 8080 host1:9001,host2:9001,host3:9001
@@ -421,58 +423,42 @@ mvn -q compile dependency:build-classpath -pl silkroad-raft-ledger -am -Dmdep.in
 java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.LedgerBenchmark
 ```
 
-`GatewayBenchmark` đo cùng một cụm 3 node với mỗi request một giao dịch, theo ba cách: nhị phân (`LedgerClient.transfer`),
-HTTP qua cổng không gom, và HTTP qua cổng có gom. Cổng là tiến trình thứ tư, client tạo tải ở tiến trình thứ năm (mỗi client
-một kết nối keep-alive). Cột CPU là số core mà client / cổng / 3 node dùng. Có fsync:
-
-| Cách gửi | Client | Giao dịch/s | p50 / p99 / max | Lô TB | CPU client / cổng / node |
-|---|---|---|---|---|---|
-| nhị phân, từng lệnh | 1 | ~1.400 | 0,63 / 1,3 / 6 ms | 1 | 0,3 / – / 1,6 |
-| nhị phân, từng lệnh | 512 | ~133.000–247.000 | 1,8–3,0 / 6–24 / 37–117 ms | 1 | 1,3–2,0 / – / 1,3–1,8 |
-| HTTP, từng lệnh | 512 | ~124.000 | 3,6 / 13 / 43 ms | 1 | 1,9 / – / 2,3 |
-| HTTP, gom lô | 1 | ~1.490 | 0,60 / 1,1 / 8 ms | 1,0 | 0,1 / 0,4 / 0,9 |
-| HTTP, gom lô | 64 | ~33.500 | 1,7 / 3,1 / 8 ms | 11 | 0,8 / 2,0 / 1,1 |
-| HTTP, gom lô | 512 | ~165.000 | 3,0 / 6,1 / 22 ms | 74 | 2,6 / 6,6 / 1,3 |
-
-Không fsync (thấy rõ chi phí của riêng tầng HTTP):
-
-| Cách gửi | Client | Giao dịch/s | p50 / p99 / max |
-|---|---|---|---|
-| nhị phân, từng lệnh | 1 / 64 / 512 | ~35.700 / 293.000 / 389.000 | 0,02 / 0,19 / 1,1 ms (p50) |
-| HTTP, từng lệnh | 1 / 64 / 512 | ~13.000 / 122.000 / 119.000 | 0,07 / 0,46 / 3,5 ms (p50); p99 ở 512: 17 ms |
-| HTTP, gom lô | 1 / 64 / 512 | ~12.600 / 133.000 / 185.000 | 0,07 / 0,45 / 2,6 ms (p50); p99 ở 512: 6,4 ms |
-
-- Tải thấp: gom lô không thêm độ trễ (1 client, lô 1,0). Tải cao: lô tự lớn tới 50–75 giao dịch, và cụm chỉ còn dùng
-  khoảng 1,2 core thay vì 2–3. Số giao dịch/s và p99 thì không hơn rõ rệt (xem phép đo bằng wrk bên dưới): bản thân Raft đã
-  gom các lệnh đồng thời vào cùng một lần fsync và một lần gửi, nên lợi ích chính của gom lô ở cổng là ít entry hơn (ít CPU,
-  ít byte trên mạng, snapshot thưa hơn), không phải nhanh hơn trên một máy.
-- Trần của đường HTTP là chính cổng: `HttpServer` của JDK tốn khoảng 40 µs CPU mỗi request (6–7 core ở 165–185k/s). Một
-  máy chủ HTTP nhanh hơn (Netty, Vert.x...) hay nhiều cổng song song nâng được trần này; cụm Raft phía sau vẫn còn dư. Client
-  HTTP của JDK cũng tốn CPU tới mức tự giới hạn phép đo (~55k/s, 5–6 core), nên benchmark dùng một client HTTP/1.1 tối giản.
-- Ổ NVMe của máy đo đôi lúc có pha fsync chậm: các lượt có fsync dao động (như dòng nhị phân 512 client ở trên), nên so sánh
-  nên chạy vài lần.
-
-```bash
-java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.GatewayBenchmark
-# -Dgateway.clients=1,64,512 -Dgateway.modes=binary,http,http-batch -Dledger.logSync=false
-```
-
 Đo bằng [wrk](https://github.com/wg/wrk) (client C, gần như không tốn CPU so với cổng): `bench/wrk/run.sh` là một file
-làm hết: tìm wrk (không có thì tự build), build project, dựng cụm và hai cổng (`GatewayBenchmark -Dgateway.modes=serve`),
-chạy wrk với script Lua nhúng sẵn (mỗi request một `Idempotency-Key` mới) rồi in bảng. 4 thread wrk, mỗi lượt 5 giây, `-Dledger.snapshotInterval=2000000`:
+làm hết: tìm wrk (không có thì tự build), build project, dựng cụm 3 node và hai cổng (từng lệnh / gom lô, bằng
+`GatewayBenchmark -Dgateway.modes=serve`), chạy wrk với script Lua nhúng sẵn (mỗi request là một `POST /transfers` với
+`Idempotency-Key` mới) rồi in bảng. 4 thread wrk, `-Dledger.snapshotInterval=2000000`, cổng 5 event loop.
 
-| Cổng | Kết nối | Có fsync: req/s | p50 / p99 | Không fsync: req/s | p50 / p99 |
+Không fsync (thấy rõ chi phí của riêng tầng HTTP), so với bản cổng trước đây chạy trên `HttpServer` của JDK:
+
+| Cổng | Kết nối | Netty: req/s | p50 / p99 | `HttpServer` JDK: req/s | p50 / p99 |
 |---|---|---|---|---|---|
-| từng lệnh | 1 | ~1.610 | 0,55 / 1,0 ms | ~16.500 | 51 / 149 µs |
-| từng lệnh | 64 | ~43.400 | 1,5 / 2,3 ms | ~171.000 | 0,28 / 2,3 ms |
-| từng lệnh | 512 | ~170.000 | 2,5 / 8 ms | ~193.000 | 2,1 / 6,6 ms |
-| gom lô | 1 | ~1.620 | 0,55 / 1,0 ms | ~16.000 | 53 / 143 µs |
-| gom lô | 64 | ~32.800 | 1,8 / 3,1 ms | ~165.000 | 0,28 / 2,0 ms |
-| gom lô (TB 74 / lô) | 512 | ~127.000–168.000 | 2,6–2,8 / 8–15 ms | ~196.000 | 2,1 / 19 ms |
+| từng lệnh | 1 | ~19.000 | 44 / 140 µs | ~16.500 | 51 / 149 µs |
+| từng lệnh | 64 | ~250.000 | 0,20 / 1,6 ms | ~171.000 | 0,28 / 2,3 ms |
+| từng lệnh | 512 | ~220.000–304.000 | 1,2 / 5,0 ms | ~193.000 | 2,1 / 6,6 ms |
+| từng lệnh | 2048 | ~273.000 | 4,6 / 12 ms | | |
+| gom lô | 1 | ~18.200 | 46 / 159 µs | ~16.000 | 53 / 143 µs |
+| gom lô | 64 | ~223.000 | 0,22 / 1,3 ms | ~165.000 | 0,28 / 2,0 ms |
+| gom lô | 512 | ~288.000 | 1,1 / 4,1 ms | ~196.000 | 2,1 / 19 ms |
 
-- Qua HTTP, một giao dịch có fsync mất khoảng 0,55 ms đầu-cuối, gần như toàn bộ là fsync; tầng HTTP + JSON thêm khoảng
-  30–50 µs.
-- Cả hai cổng chạm cùng một trần khoảng 190k req/s không fsync: đó là `HttpServer` của JDK, không phải cụm Raft.
+Có fsync (Netty; các lượt rơi vào pha fsync chậm của ổ đĩa, xem dưới, đã bỏ):
+
+| Cổng | Kết nối | req/s | p50 / p99 | Lô TB |
+|---|---|---|---|---|
+| từng lệnh | 1 | ~1.600 | 0,54 / 1,1 ms | 1 |
+| từng lệnh | 2048 | ~238.000 | 6,5 / 32 ms | 1 |
+| gom lô | 512 | ~226.000 | 2,1 / 6,0 ms | 75 |
+| gom lô | 2048 | ~291.000 | 6,0 / 12 ms | 143 |
+
+- Qua HTTP, một giao dịch có fsync mất khoảng 0,55 ms đầu-cuối, gần như toàn bộ là fsync; HTTP + JSON thêm khoảng 25–45 µs.
+- Cổng Netty tốn khoảng 18 µs CPU mỗi request (3,9 core ở 220k req/s); bản trên `HttpServer` của JDK tốn khoảng 46 µs
+  (8,8 core ở 190k) và là trần của cả đường HTTP. Giờ trần nằm ở các chỗ chỉ có một thread: thread NIO của `LedgerClient`
+  trong cổng (mọi lệnh tới cụm và mọi kết quả trở về) và thread xử lý của leader. Nhiều cổng song song (chúng không giữ
+  trạng thái gì, chống trùng nằm ở sổ cái) chia được phần đầu.
+- Gom lô ở cổng không làm nhanh hơn khi không fsync: Raft đã gom các lệnh đồng thời vào cùng một lần fsync và một lần gửi.
+  Có fsync và tải cao thì lô lớn (75–143) giữ p99 thấp hơn. Ở tải vừa, `maxInflight` nhỏ làm request chờ lô trước trả
+  lời: với 64 kết nối có fsync, `maxInflight=4` cho khoảng 33k req/s, `maxInflight=64` khoảng 44k (ngang không gom).
+- Ổ NVMe của máy đo (KIOXIA BG6, không DRAM) có những pha fsync chậm gấp 10 lần (p50 5 ms, max 170 ms, đo bằng một tiến
+  trình fsync độc lập) sau các lượt ghi nặng: các lượt có fsync dao động mạnh, nên so sánh cần chạy vài lần.
 - Snapshot đếm theo số entry: khi mỗi request là một entry, `snapshotInterval=100000` nghĩa là khoảng mỗi 100k giao dịch
   lại chụp một lần (58 MB mỗi node, phần lớn là bloom filter cỡ `expectedTransfers`), đủ để đĩa bận và làm chậm fsync
   của các lượt đo sau. Đặt khoảng snapshot theo lượng giao dịch thực tế mỗi entry.
@@ -480,7 +466,15 @@ chạy wrk với script Lua nhúng sẵn (mỗi request một `Idempotency-Key` 
 ```bash
 bench/wrk/run.sh                       # 1 64 512 kết nối, có fsync
 FSYNC=false DURATION=5 bench/wrk/run.sh 64 512 2048
-# các biến khác ở đầu file: WRK, THREADS, WARMUP, MODES, MAX_BATCH, MAX_INFLIGHT, WRK_CPUS (taskset), KEEP
+# các biến khác ở đầu file: WRK, THREADS, WARMUP, MODES, MAX_BATCH, MAX_INFLIGHT, EVENT_LOOPS, WRK_CPUS (taskset), KEEP
+```
+
+`GatewayBenchmark` (không cần wrk) đo cùng cụm theo ba cách — nhị phân (`LedgerClient.transfer`), HTTP từng lệnh, HTTP gom
+lô — với một client HTTP/1.1 tối giản trong Java, và in thêm CPU của client / cổng / node:
+
+```bash
+java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.GatewayBenchmark
+# -Dgateway.clients=1,64,512 -Dgateway.modes=binary,http,http-batch -Dledger.logSync=false
 ```
 
 ## Kiến trúc

@@ -306,6 +306,8 @@ public final class GatewayBenchmark {
                     "-Dgateway.batch=" + batching,
                     "-Dgateway.maxBatch=" + Integer.getInteger("gateway.maxBatch", 1000),
                     "-Dgateway.maxInflight=" + Integer.getInteger("gateway.maxInflight", 4),
+                    "-Dgateway.eventLoops=" + Integer.getInteger("gateway.eventLoops",
+                            Math.max(1, Runtime.getRuntime().availableProcessors() / 4)),
                     "-cp", System.getProperty("java.class.path"),
                     LedgerGateway.class.getName(), String.valueOf(port), String.join(",", cluster.servers))
                     .redirectErrorStream(true)
