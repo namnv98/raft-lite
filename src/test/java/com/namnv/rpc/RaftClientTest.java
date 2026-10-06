@@ -7,7 +7,10 @@ import com.namnv.core.NodeState;
 import com.namnv.core.RaftClientService;
 import com.namnv.core.RaftNode;
 import com.namnv.rpc.client.RaftClient;
+import com.namnv.core.ThreadedRuntime;
 import com.namnv.rpc.client.SocketRpcClient;
+import com.namnv.rpc.nio.NioRpcClient;
+import com.namnv.rpc.nio.NioRpcServer;
 import com.namnv.rpc.server.SocketRpcServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -38,7 +41,8 @@ class RaftClientTest {
     private final List<String> servers = new ArrayList<>();
     private final List<RaftNode> nodes = new ArrayList<>();
     private final List<ListStateMachine> machines = new ArrayList<>();
-    private final List<SocketRpcServer> rpcServers = new ArrayList<>();
+    // dừng cổng mạng của từng node
+    private final List<Runnable> rpcServers = new ArrayList<>();
     private final List<AutoCloseable> closeables = new ArrayList<>();
 
     @AfterEach
@@ -47,7 +51,7 @@ class RaftClientTest {
             closeable.close();
         }
         nodes.forEach(RaftNode::shutdown);
-        rpcServers.forEach(SocketRpcServer::stop);
+        rpcServers.forEach(Runnable::run);
     }
 
     private static int freePort() throws IOException {
@@ -63,9 +67,11 @@ class RaftClientTest {
         for (int i = 0; i < 3; i++) {
             var machine = new ListStateMachine();
             var folder = dataDir.resolve("node" + i).toString();
-            var transport = new SocketRpcClient(500);
+            var runtime = new ThreadedRuntime();
+            var transport = nio() ? new NioRpcClient(runtime.loop(), 500) : new SocketRpcClient(500);
             closeables.add(transport);
             var node = new RaftNode(NodeOptions.builder()
+                    .runtime(runtime)
                     .raftMetaUri(folder).logUri(folder).snapshotUri(folder)
                     .electionTimeoutMinMs(150).electionTimeoutMaxMs(300).heartbeatIntervalMs(50)
                     .stateMachine(machine)
@@ -74,17 +80,31 @@ class RaftClientTest {
             // câu hỏi duy nhất của ứng dụng mẫu: toàn bộ danh sách, mỗi lệnh một dòng
             var service = new RaftClientService(node,
                     query -> String.join("\n", machine.getStore()).getBytes(StandardCharsets.UTF_8));
-            var server = new SocketRpcServer(Integer.parseInt(servers.get(i).split(":")[1]), node, null, service);
-            server.start();
+            int port = Integer.parseInt(servers.get(i).split(":")[1]);
+            if (nio()) {
+                var server = new NioRpcServer(port, node, service, runtime.loop());
+                server.start();
+                rpcServers.add(server::stop);
+            } else {
+                var server = new SocketRpcServer(port, node, null, service);
+                server.start();
+                rpcServers.add(server::stop);
+            }
             nodes.add(node);
             machines.add(machine);
-            rpcServers.add(server);
             node.start();
         }
     }
 
+    // true: các node và client dùng transport NIO chạy trên vòng của node (NioRaftClientTest)
+    protected boolean nio() {
+        return false;
+    }
+
     private RaftClient client(String clientId) {
-        var client = new RaftClient(servers, clientId, 500, 15_000);
+        var client = nio()
+                ? new RaftClient(new NioRpcClient(500), servers, clientId, 15_000)
+                : new RaftClient(servers, clientId, 500, 15_000);
         closeables.add(client);
         return client;
     }
@@ -120,6 +140,27 @@ class RaftClientTest {
         // đọc nhất quán từ từng node, kể cả follower
         for (String server : servers) {
             assertEquals(expected, lines(client.readFrom(server, new byte[0]).get(20, TimeUnit.SECONDS)));
+        }
+    }
+
+    @Test
+    void largeCommandsCrossTheWireIntact() throws Exception {
+        startCluster();
+        var client = client("big");
+        // lớn hơn nhiều lần bộ đệm đọc/ghi của một kết nối, và nhiều lệnh như vậy đi chung một AppendEntries
+        var expected = new ArrayList<String>();
+        var pending = new ArrayList<CompletableFuture<Boolean>>();
+        for (int i = 0; i < 6; i++) {
+            var command = (i + ":" + "x".repeat(300_000 + i * 1000));
+            expected.add(command);
+            pending.add(client.write(command.getBytes(StandardCharsets.UTF_8)));
+        }
+        for (var write : pending) {
+            assertTrue(write.get(30, TimeUnit.SECONDS));
+        }
+        for (String server : servers) {
+            var seen = lines(client.readFrom(server, new byte[0]).get(20, TimeUnit.SECONDS));
+            assertEquals(expected.stream().sorted().toList(), seen.stream().sorted().toList());
         }
     }
 
@@ -164,7 +205,7 @@ class RaftClientTest {
             expected.add("during" + i);
             pending.add(client.write(("during" + i).getBytes(StandardCharsets.UTF_8)));
         }
-        rpcServers.get(leader).stop();
+        rpcServers.get(leader).run();
         nodes.get(leader).shutdown();
         for (int i = 0; i < 10; i++) {
             expected.add("after" + i);

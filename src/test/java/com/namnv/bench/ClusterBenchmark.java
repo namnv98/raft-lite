@@ -1,7 +1,11 @@
 package com.namnv.bench;
 
 import com.namnv.rpc.client.RaftClient;
+import com.namnv.agent.AgentLoop;
+import com.namnv.kv.KvCommands;
+import com.namnv.rpc.client.MessageTransport;
 import com.namnv.rpc.client.SocketRpcClient;
+import com.namnv.rpc.nio.NioRpcClient;
 
 import java.io.File;
 import java.io.IOException;
@@ -28,11 +32,29 @@ import java.util.stream.DoubleStream;
  * -Dbench.seconds=3: thời gian đo mỗi cấu hình. -Dbench.connections=16: số kết nối TCP mà các client dùng chung tới mỗi node.
  * -Dbench.logSync=false: các node không fsync log (NodeOptions.logSync).
  * -Dbench.logPreallocate=false: không cấp phát sẵn file segment (NodeOptions.logPreallocate).
+ * -Dbench.transport=socket: transport cũ thay cho NIO trên vòng của node. -Dbench.clientLoops=2: số vòng NIO phía client.
+ * -Draft.agent.idle=busy (truyền cho cả node qua -Dbench.nodeArgs): vòng không bao giờ ngủ, như BusySpinIdleStrategy.
  * -Dbench.payloads=128,4096, -Dbench.clients=1,32,512 và -Dbench.phases=write,read: chỉ đo một phần của bảng.
  */
 public class ClusterBenchmark {
 
     private static final int CONNECTIONS = Integer.getInteger("bench.connections", 16);
+    private static final String TRANSPORT = System.getProperty("bench.transport", "nio");
+    private static final int CLIENT_LOOPS = Integer.getInteger("bench.clientLoops", 2);
+    // -Dbench.kv=lmdb|rocksdb: các node chạy kho KV; ghi là put với key 8 byte tăng dần trong 1 triệu key và value
+    // dài payload byte, đọc là get một key, như công cụ benchmark của etcd (put --sequential-keys, range foo)
+    private static final String STORE = System.getProperty("bench.kv", "");
+    private static final boolean KV = !STORE.isEmpty() && !"false".equals(STORE);
+    private static final java.util.concurrent.atomic.AtomicLong NEXT_KEY = new java.util.concurrent.atomic.AtomicLong();
+    private static final byte[] READ_QUERY = KvCommands.get("foo".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+    private static byte[] writeCommand(byte[] payload) {
+        if (!KV) {
+            return payload;
+        }
+        var key = java.nio.ByteBuffer.allocate(Long.BYTES).putLong(NEXT_KEY.getAndIncrement() % 1_000_000).array();
+        return KvCommands.put(key, payload);
+    }
 
     public static void main(String[] args) throws Exception {
         Path dataDir = Path.of(args.length > 0 ? args[0] : "target/bench-cluster").toAbsolutePath();
@@ -51,8 +73,14 @@ public class ClusterBenchmark {
             // -Dbench.nodeArgs="...": tham số JVM thêm cho các tiến trình node; log GC của từng node luôn được ghi lại
             var command = new ArrayList<String>(List.of(java, "-Xlog:gc:file=" + dataDir.resolve("gc" + i + ".log")));
             command.add("-Dbench.logSync=" + System.getProperty("bench.logSync", "true"));
+            command.add("-Dbench.transport=" + TRANSPORT);
+            command.add("-Dbench.kv=" + STORE);
+            if (System.getProperty("bench.kvSync") != null) {
+                command.add("-Dbench.kvSync=" + System.getProperty("bench.kvSync"));
+            }
             command.add("-Dbench.logPreallocate=" + System.getProperty("bench.logPreallocate", "true"));
-            command.add("-Dbench.snapshotInterval=" + System.getProperty("bench.snapshotInterval", "200000"));
+            // snapshot của kho KV chép toàn bộ kho ra file, nên thưa hơn
+            command.add("-Dbench.snapshotInterval=" + System.getProperty("bench.snapshotInterval", KV ? "1000000" : "200000"));
             command.add("-Dbench.commitFlushMs=" + System.getProperty("bench.commitFlushMs", "1000"));
             var extra = System.getProperty("bench.nodeArgs", "").trim();
             if (!extra.isEmpty()) {
@@ -63,10 +91,15 @@ public class ClusterBenchmark {
             processes.add(new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(log).start());
         }
 
-        // mỗi transport là một bộ kết nối TCP riêng tới các node; các client chia nhau dùng
-        var transports = new ArrayList<SocketRpcClient>();
+        // mỗi transport là một bộ kết nối TCP riêng tới các node; các client chia nhau dùng.
+        // Với nio, các transport chia nhau CLIENT_LOOPS vòng (mỗi vòng một thread, như agent phía client của Aeron)
+        var loops = new ArrayList<AgentLoop>();
+        for (int i = 0; "nio".equals(TRANSPORT) && i < CLIENT_LOOPS; i++) {
+            loops.add(new AgentLoop("bench-client-" + i));
+        }
+        var transports = new ArrayList<MessageTransport>();
         for (int i = 0; i < CONNECTIONS; i++) {
-            transports.add(new SocketRpcClient(2000));
+            transports.add(loops.isEmpty() ? new SocketRpcClient(2000) : new NioRpcClient(loops.get(i % loops.size()), 2000));
         }
         var clientCounter = new AtomicInteger();
         Supplier<RaftClient> newClient = () -> {
@@ -79,7 +112,8 @@ public class ClusterBenchmark {
             probe.write(new byte[1]).get(60, TimeUnit.SECONDS);
             var pids = processes.stream().map(p -> String.valueOf(p.pid())).toList();
             System.out.println("# Raft Lite: 3 node là 3 tiến trình (pid " + String.join(", ", pids)
-                    + "), client ở tiến trình thứ tư, tất cả qua TCP trên loopback");
+                    + "), client ở tiến trình thứ tư, tất cả qua TCP trên loopback, transport " + TRANSPORT
+                    + ", idle " + System.getProperty("raft.agent.idle", "backoff") + (KV ? ", kho KV " + STORE + ", kvSync " + System.getProperty("bench.kvSync", "theo log") : ", state machine chỉ đếm"));
             System.out.println("# đo " + Integer.getInteger("bench.seconds", 3) + " giây mỗi cấu hình, "
                     + CONNECTIONS + " kết nối TCP dùng chung tới mỗi node, dữ liệu ở " + dataDir);
 
@@ -98,7 +132,7 @@ public class ClusterBenchmark {
                         pool.add(newClient.get());
                     }
                     // mỗi lời gọi của vòng đo thuộc về một client cố định, để sequence của nó tăng liền nhau
-                    var result = runPerClient(pool, client -> client.write(command));
+                    var result = runPerClient(pool, client -> client.write(writeCommand(command)));
                     printRow("ghi " + payload + "B, " + clients + " client", result);
                 }
             }
@@ -116,11 +150,12 @@ public class ClusterBenchmark {
                 for (int c = 0; c < clients; c++) {
                     pool.add(newClient.get());
                 }
-                printRow("đọc qua leader, " + clients + " client", runPerClient(pool, client -> client.readFrom(leader, new byte[0])));
-                printRow("đọc qua follower, " + clients + " client", runPerClient(pool, client -> client.readFrom(follower, new byte[0])));
+                byte[] query = KV ? READ_QUERY : new byte[0];
+                printRow("đọc qua leader, " + clients + " client", runPerClient(pool, client -> client.readFrom(leader, query)));
+                printRow("đọc qua follower, " + clients + " client", runPerClient(pool, client -> client.readFrom(follower, query)));
             }
         } finally {
-            transports.forEach(SocketRpcClient::close);
+            transports.forEach(MessageTransport::close);
             processes.forEach(Process::destroyForcibly);
             for (Process process : processes) {
                 process.waitFor(10, TimeUnit.SECONDS);

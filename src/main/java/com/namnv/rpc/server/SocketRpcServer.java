@@ -4,6 +4,7 @@ import com.namnv.rpc.ClientService;
 import com.namnv.rpc.FrameWriter;
 import com.namnv.rpc.RaftServerService;
 import com.namnv.rpc.RpcCodec;
+import com.namnv.rpc.RpcThreads;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.ClientReadRequest;
 import com.namnv.rpc.model.request.ClientWriteRequest;
@@ -73,7 +74,7 @@ public class SocketRpcServer {
 
     public void start() {
         if (running.compareAndSet(false, true)) {
-            executor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().factory());
+            executor = RpcThreads.newExecutor("raft-rpc-server-");
             try {
                 if (sslContext != null) {
                     var tlsSocket = (SSLServerSocket) sslContext.getServerSocketFactory().createServerSocket(port);
@@ -149,9 +150,9 @@ public class SocketRpcServer {
                         executor, e -> close());
 
                 // Request được trả lời theo id của nó, nên một request chậm không chặn các request khác trên cùng kết nối.
-                // Yêu cầu của client và ReadIndex chỉ đăng ký việc rồi trả về ngay, nên được xử lý luôn trên thread đọc;
-                // tạo một thread cho mỗi yêu cầu như vậy tốn hơn chính việc xử lý nó. Các RPC còn lại có thể chờ đĩa
-                // (AppendEntries, RequestVote, InstallSnapshot) nên mỗi cái chạy ở thread riêng.
+                // AppendEntries, ReadIndex và yêu cầu của client chỉ được chuyển cho thread của node rồi trả về ngay, nên
+                // được xử lý luôn trên thread đọc, theo đúng thứ tự đến. Các RPC hiếm còn lại có thể chờ đĩa
+                // (RequestVote, InstallSnapshot) nên mỗi cái chạy ở thread riêng.
                 while (running.get()) {
                     var frame = RpcCodec.read(in);
                     if (answersLater(frame.message())) {
@@ -175,7 +176,9 @@ public class SocketRpcServer {
             try {
                 // các yêu cầu chỉ có câu trả lời sau một lúc được trả lời bất đồng bộ, không giữ thread
                 CompletableFuture<?> pending = null;
-                if (frame.message() instanceof ReadIndexRequest readIndexRequest) {
+                if (frame.message() instanceof AppendEntriesRequest appendEntriesRequest) {
+                    pending = raftServerService.handleAppendEntriesAsync(appendEntriesRequest);
+                } else if (frame.message() instanceof ReadIndexRequest readIndexRequest) {
                     pending = raftServerService.handleReadIndexRequest(readIndexRequest);
                 } else if (clientService != null && frame.message() instanceof ClientWriteRequest write) {
                     pending = clientService.handleClientWrite(write);
@@ -204,7 +207,7 @@ public class SocketRpcServer {
         }
 
         private boolean answersLater(Object request) {
-            return request instanceof ReadIndexRequest
+            return request instanceof AppendEntriesRequest || request instanceof ReadIndexRequest
                     || (clientService != null && (request instanceof ClientWriteRequest || request instanceof ClientReadRequest));
         }
 
@@ -227,9 +230,6 @@ public class SocketRpcServer {
             }
             if (request instanceof PreVoteRequest preVoteRequest) {
                 return raftServerService.handlePreVoteRequest(preVoteRequest);
-            }
-            if (request instanceof AppendEntriesRequest appendEntriesRequest) {
-                return raftServerService.handleAppendEntriesRequest(appendEntriesRequest);
             }
             if (request instanceof InstallSnapshotRequest snapshotRequest) {
                 return raftServerService.handleInstallSnapshotRequest(snapshotRequest);

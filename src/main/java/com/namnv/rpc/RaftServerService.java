@@ -20,6 +20,14 @@ public interface RaftServerService {
 
     AppendEntriesResponse handleAppendEntriesRequest(AppendEntriesRequest req);
 
+    /**
+     * Như {@link #handleAppendEntriesRequest} nhưng không giữ thread của người gọi trong lúc chờ đĩa. Transport dùng bản này.
+     * Mặc định chạy bản đồng bộ ở một thread khác.
+     */
+    default CompletableFuture<AppendEntriesResponse> handleAppendEntriesAsync(AppendEntriesRequest req) {
+        return CompletableFuture.supplyAsync(() -> handleAppendEntriesRequest(req));
+    }
+
     PreVoteResponse handlePreVoteRequest(PreVoteRequest req);
 
     InstallSnapshotResponse handleInstallSnapshotRequest(InstallSnapshotRequest req);

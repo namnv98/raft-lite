@@ -28,7 +28,7 @@ public class RaftClient implements AutoCloseable {
     });
     private static final int RETRY_DELAY_MS = 20;
 
-    private final SocketRpcClient transport;
+    private final MessageTransport transport;
     private final boolean ownsTransport;
     private final List<String> servers;
     private final String clientId;
@@ -49,11 +49,11 @@ public class RaftClient implements AutoCloseable {
     }
 
     // nhiều RaftClient dùng chung một transport sẽ đi chung kết nối TCP tới mỗi node
-    public RaftClient(SocketRpcClient transport, List<String> servers, String clientId, long maxWaitMs) {
+    public RaftClient(MessageTransport transport, List<String> servers, String clientId, long maxWaitMs) {
         this(transport, false, servers, clientId, maxWaitMs);
     }
 
-    private RaftClient(SocketRpcClient transport, boolean ownsTransport, List<String> servers, String clientId, long maxWaitMs) {
+    private RaftClient(MessageTransport transport, boolean ownsTransport, List<String> servers, String clientId, long maxWaitMs) {
         this.transport = transport;
         this.ownsTransport = ownsTransport;
         this.servers = List.copyOf(servers);

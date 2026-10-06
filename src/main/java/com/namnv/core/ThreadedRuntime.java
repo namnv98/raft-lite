@@ -1,5 +1,6 @@
 package com.namnv.core;
 
+import com.namnv.agent.AgentLoop;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Random;
@@ -16,6 +17,8 @@ public class ThreadedRuntime implements RaftRuntime {
     // thread riêng cho việc đĩa không nằm trên đường trả lời client (đọc log cũ cho một follower tụt xa, xoá phần log đã
     // compact), để chúng không làm các lần fsync của lệnh mới phải chờ
     private final ExecutorService reads = Executors.newSingleThreadExecutor();
+    // thread xử lý của node (mô hình một thread cho mỗi node, như agent của Aeron); transport NIO cũng chạy trên vòng này
+    private final AgentLoop node = new AgentLoop("raft-node");
     private final Random random = new Random();
 
     @Override
@@ -53,6 +56,16 @@ public class ThreadedRuntime implements RaftRuntime {
         }
     }
 
+    /** Vòng của node, để NioRpcServer/NioRpcClient đọc ghi socket ngay trên thread của node */
+    public AgentLoop loop() {
+        return node;
+    }
+
+    @Override
+    public void executeNode(Runnable task) {
+        node.execute(task);
+    }
+
     private void run(Runnable task) {
         try {
             task.run();
@@ -72,5 +85,7 @@ public class ThreadedRuntime implements RaftRuntime {
         // task ghi đĩa đã xếp hàng vẫn được chạy nốt
         io.shutdown();
         reads.shutdownNow();
+        // sự kiện đã xếp hàng vẫn được xử lý nốt: chúng thấy node đã dừng và báo lỗi cho người đang chờ
+        node.close();
     }
 }

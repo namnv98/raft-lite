@@ -215,7 +215,8 @@ public class RaftBenchmark {
         }
         long[] sorted = Arrays.copyOf(samples, n);
         Arrays.sort(sorted);
-        return new Result(n, failures.get(), MEASURE_SECONDS,
+        // count đếm mọi thao tác xong trong thời gian đo; mẫu độ trễ chỉ giữ tối đa samples.length cái đầu
+        return new Result(count.get(), failures.get(), MEASURE_SECONDS,
                 n == 0 ? 0 : sorted[n / 2] / 1000, n == 0 ? 0 : sorted[(int) (n * 0.99)] / 1000,
                 n == 0 ? 0 : sorted[n - 1] / 1000);
     }

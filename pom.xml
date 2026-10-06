@@ -68,6 +68,20 @@
             <artifactId>commons-io</artifactId>
             <version>2.17.0</version>
         </dependency>
+        <!-- kho KV mẫu (com.namnv.kv): LMDB, cùng thiết kế B+tree trên mmap với bbolt của etcd. Không bắt buộc -->
+        <dependency>
+            <groupId>org.lmdbjava</groupId>
+            <artifactId>lmdbjava</artifactId>
+            <version>0.9.3</version>
+            <optional>true</optional>
+        </dependency>
+        <!-- kho KV mẫu trên RocksDB (LSM-tree). Không bắt buộc -->
+        <dependency>
+            <groupId>org.rocksdb</groupId>
+            <artifactId>rocksdbjni</artifactId>
+            <version>11.1.1</version>
+            <optional>true</optional>
+        </dependency>
 
         <!-- Lombok -->
         <dependency>

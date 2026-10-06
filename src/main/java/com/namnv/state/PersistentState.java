@@ -108,6 +108,11 @@ public class PersistentState {
      * Ghi term và votedFor xuống đĩa nếu chúng vừa đổi. Phải gọi xong trước khi một phiếu bầu
      * (kể cả phiếu tự bầu của candidate) được gửi đi hay được tính.
      */
+    // term/vote đã đổi mà chưa nằm trên đĩa
+    public synchronized boolean hasUnsyncedVote() {
+        return voteVersion != persistedVoteVersion;
+    }
+
     public void syncVote() {
         write(true);
     }

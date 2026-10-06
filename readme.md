@@ -216,7 +216,7 @@ node.shutdown();
 | `catchUpTimeoutMs` | `30000` | Node mới phải bắt kịp log trong thời gian này thì mới được đưa vào cấu hình |
 | `shutdownOnRemoved` | `true` | Node tự `shutdown()` khi bị gỡ khỏi cluster; `false` thì node chỉ đứng yên |
 | `departingTimeoutMs` | `10000` | Leader cố gửi cấu hình cuối cho node vừa bị gỡ trong bao lâu trước khi bỏ cuộc |
-| `runtime` | `null` | Nguồn thời gian, timer và thread ghi đĩa. `null` nghĩa là dùng thread và đồng hồ thật (`ThreadedRuntime`) |
+| `runtime` | `null` | Nguồn thời gian, timer, thread của node và thread ghi đĩa. `null` nghĩa là dùng thread và đồng hồ thật (`ThreadedRuntime`) |
 | `diskFaults` | không làm gì | Điểm chèn lỗi ghi đĩa, chỉ dùng trong test |
 
 ## Viết state machine
@@ -233,10 +233,51 @@ Cài đặt interface `StateMachine` (xem Javadoc trong mã nguồn; `ListStateM
 
 State machine phải tất định: cùng một chuỗi lệnh phải cho cùng một state trên mọi node.
 
+### Kho KV mẫu: LMDB và RocksDB
+
+`com.namnv.kv.LmdbKvStateMachine` là một state machine key-value thật, chạy trên LMDB (thư viện `lmdbjava`, khai báo
+`optional` trong `pom.xml`: muốn dùng thì tự thêm dependency). LMDB và bbolt (kho của etcd) cùng thiết kế B+tree
+copy-on-write trên mmap, và lớp này làm theo cách backend của etcd:
+
+- `onApply` chỉ ghi vào bộ đệm trong bộ nhớ, nên thread của node không bao giờ chờ đĩa.
+- Một thread backend ghi bộ đệm vào LMDB theo lô, mỗi 100 ms hoặc mỗi 10.000 lệnh, một transaction mỗi lô, có fsync
+  (giống batch-interval và batch-limit mặc định của etcd).
+- `get` xem bộ đệm trước rồi mới tới LMDB, nên luôn thấy mọi lệnh đã apply.
+- Snapshot chép toàn bộ kho ra một file ở thread riêng, từ một transaction đọc của LMDB cộng các lô chưa ghi tại đúng
+  thời điểm chụp.
+- Độ bền nằm ở Raft log: kho bị xoá mỗi lần khởi động rồi dựng lại từ snapshot và phần log sau nó.
+
+`com.namnv.kv.RocksDbKvStateMachine` dùng chung khung đó (`BufferedKvStateMachine`) nhưng chạy trên RocksDB (LSM-tree,
+`rocksdbjni`, cũng `optional`). Mỗi lô là một `WriteBatch`. `sync = false` (mặc định) tắt hẳn WAL của RocksDB, vì Raft log
+đã là WAL. Snapshot là một checkpoint, tạo đúng lúc mọi lệnh tới thời điểm chụp đã vào kho: các file SST chỉ được
+hard link sang thư mục snapshot, không chép, nên snapshot rẻ hơn hẳn bản LMDB (vốn chép toàn bộ kho).
+
+Đo với `ClusterBenchmark -Dbench.kv=...` (1 triệu key, value 128 byte, xem [Đo hiệu năng](#đo-hiệu-năng)):
+
+| | LMDB | RocksDB |
+|---|---|---|
+| ghi không fsync, tối đa | ~466.000 TPS, max 18–40 ms | ~530.000 TPS, max 6–16 ms |
+| ghi có fsync, tối đa | ~230.000–284.000 TPS, max tới ~240 ms | ~260.000–289.000 TPS, max tới ~76 ms |
+| đọc nhất quán, tối đa | ~700.000–770.000/s | ~600.000–680.000/s |
+| dung lượng kho | ~267 MB | ~83 MB (nén LZ4) |
+
+Phần lớn chênh lệch về ghi và độ trễ đuôi đến từ snapshot: bản LMDB chép khoảng 140 MB sau mỗi 1 triệu lệnh.
+
+```java
+var kv = new LmdbKvStateMachine(Path.of("data/kv"));
+var node = new RaftNode(NodeOptions.builder().stateMachine(kv) /* ... */ .build(), rpc);
+var clientService = new RaftClientService(node, kv::query);
+// phía client
+client.write(KvCommands.put(key, value));
+byte[] value = KvCommands.value(client.read(KvCommands.get(key)).get());
+```
+
 ## Kiến trúc
 
 ```
 com.namnv
+├── agent
+│   └── AgentLoop           vòng làm việc kiểu agent của Aeron: poll socket, chạy việc của node, ghi theo đợt, idle strategy
 ├── core
 │   ├── RaftNode            toàn bộ logic Raft của một node
 │   ├── RaftRuntime         đồng hồ, timer, thread ghi đĩa, nguồn ngẫu nhiên (tiêm được)
@@ -266,32 +307,42 @@ com.namnv
 │   ├── TlsContexts         tạo SSLContext từ keystore
 │   ├── client              RpcProcessor, InMemoryRpcClient, SocketRpcClient
 │   ├── server              SocketRpcServer
+│   ├── nio                 NioRpcClient, NioRpcServer: transport chạy trên vòng của node
 │   └── model               request/response của từng RPC
 ├── ListStateMachine        state machine mẫu: danh sách các lệnh đã apply
 └── AppRaftInMem, AppRaftSocket   hai demo
 ```
 
-### Luồng xử lý và lock
+### Luồng xử lý: một thread cho mỗi node
 
-Mỗi `RaftNode` có **một lock** bảo vệ toàn bộ state trong bộ nhớ. Mọi thứ đi vào node đều lấy lock này:
-RPC handler, callback của RPC gửi đi, timer, và lời gọi của client.
+Mỗi `RaftNode` có **một thread xử lý** (giống agent của Aeron). Mọi sự kiện của node đều được xếp vào một hàng và thread này
+xử lý lần lượt: lệnh ghi và đọc của client, AppendEntries và ReadIndex đến từ leader/follower, response của RPC gửi đi,
+timer, và việc đĩa đã xong. Thread transport chỉ xếp sự kiện vào hàng rồi đọc tiếp socket, không bao giờ đứng chờ node.
 
-Nguyên tắc: **không ghi đĩa khi đang giữ lock** trên các đường chạy thường xuyên. Việc ghi đĩa được tách thành hai bước:
+Thread của node lấy cả hàng trong một lượt: nhiều lệnh client đến cùng lúc được ghi vào log rồi gửi cho follower trong
+**một** AppendEntries. Hết việc, thread quay chờ thêm một lúc (`-Draft.agent.idle`, `-Draft.agent.spinMicros`; xem [Transport](#transport)) trước khi ngủ, vì
+đánh thức một thread đang ngủ tốn hàng chục micro giây.
 
-1. Trong lock: cập nhật bộ nhớ và ghi nối vào file (chưa fsync).
-2. Ngoài lock: fsync, rồi lấy lại lock để dùng kết quả.
+Lock của node vẫn còn, nhưng gần như không ai tranh: thread của node giữ nó trong mỗi lượt xử lý, còn các lời gọi hiếm
+(đổi thành viên, tạo snapshot, RequestVote/PreVote/InstallSnapshot/TimeoutNow, `metrics()`) và test lấy nó để chen vào an toàn.
 
-Leader đưa bước 2 sang thread IO của `RaftRuntime`; follower làm bước 2 ngay trên thread đang xử lý RPC, giữa hai lần lấy lock.
-Nhiều lệnh đến cùng lúc được gộp vào một lần fsync.
+Nguyên tắc: **thread của node không chờ đĩa**. Việc ghi đĩa được tách thành hai bước:
 
-Kết quả trả cho người gọi cũng nằm ngoài lock: future của `appendClientCommand` và `read` được hoàn tất sau khi node nhả lock,
-lần lượt theo thứ tự commit. Callback gắn vào future vì thế không chặn node và gọi ngược vào node được, nhưng một callback chậm
-vẫn làm kết quả của các lệnh sau nó đến trễ.
+1. Trên thread của node: cập nhật bộ nhớ và ghi nối vào file (chưa fsync).
+2. Trên thread IO của `RaftRuntime`: fsync, rồi chuyển kết quả về thread của node như một sự kiện.
+
+Cả leader lẫn follower gom mọi entry đến trong lúc đĩa đang bận vào một lần fsync. Follower chỉ trả lời AppendEntries
+sau khi lần fsync phủ entry đó xong. Với `logSync = false` bước 2 không còn gì phải chờ nên được làm luôn trên thread của node.
+
+Kết quả trả cho người gọi nằm ngoài lock: future của `appendClientCommand` và `read` được hoàn tất sau mỗi lượt xử lý,
+lần lượt theo thứ tự commit. Callback gắn vào future vì thế gọi ngược vào node được, nhưng một callback chậm
+vẫn làm kết quả của các lệnh sau nó đến trễ. Vì lệnh được ghi vào log trên thread của node, `appendClientCommand` trả về
+trước khi entry nằm trong log.
 
 ### `RaftRuntime`
 
 `RaftNode` không tự tạo thread hay đọc đồng hồ hệ thống; nó xin mọi thứ qua `RaftRuntime`:
-thời gian hiện tại, hẹn giờ, chạy việc ghi đĩa, và số ngẫu nhiên cho election timeout.
+thời gian hiện tại, hẹn giờ, thread xử lý của node, chạy việc ghi đĩa, và số ngẫu nhiên cho election timeout.
 Nhờ vậy test có thể thay bằng một runtime chạy trên một thread với thời gian ảo, và cả cluster chạy tất định theo một seed.
 
 ## Cách hoạt động
@@ -518,6 +569,29 @@ RpcProcessor rpc = new SocketRpcClient(1000, tls);
 new SocketRpcServer(8080, node, tls).start();
 ```
 
+- **`NioRpcClient` + `NioRpcServer`** (gói `rpc.nio`): cùng định dạng khung, nhưng chạy trên vòng của node
+  (`ThreadedRuntime.loop()`, một `AgentLoop`) theo cách Aeron làm: socket không chặn, và chính thread của node poll chúng
+  trong mỗi vòng làm việc (`selectNow`). Request đến được chuyển vào hàng sự kiện của node ngay trên thread đó, response
+  và request đi ra được gom lại và ghi ra socket một lần ở cuối vòng. Không có thread đọc hay thread ghi riêng, nên trên
+  đường đi của một lệnh không có lần đánh thức thread nào. Ở tải thấp, việc đánh thức thread chính là phần tốn nhất:
+  một client ghi tuần tự đạt khoảng 2,3 lần số lệnh/giây so với `SocketRpc*` (xem [Đo hiệu năng](#đo-hiệu-năng)).
+  RequestVote, PreVote, InstallSnapshot và TimeoutNow có thể chờ đĩa nên chạy ở thread riêng, vì thread của node
+  không bao giờ được chờ đĩa. Transport này chưa hỗ trợ TLS; cần TLS thì dùng `SocketRpc*`. Hai loại transport nói chuyện
+  được với nhau, nên client có thể dùng `SocketRpcClient` để gọi node chạy `NioRpcServer`.
+  - Idle strategy (`-Draft.agent.idle`): `backoff` (mặc định) quay chờ `-Draft.agent.spinMicros` (mặc định 50) rồi chặn
+    trong `select()`. Khi đang chặn, thread được đánh thức ngay lúc có dữ liệu mạng hoặc có việc mới, không ngủ mù 1 ms như
+    `BackoffIdleStrategy` của Aeron. `busy` thì không bao giờ ngủ, giống `BusySpinIdleStrategy`: độ trễ thấp nhất, nhưng
+    mỗi node chiếm trọn một CPU kể cả lúc rảnh.
+
+```java
+var runtime = new ThreadedRuntime();
+var node = new RaftNode(NodeOptions.builder().runtime(runtime) /* ... */ .build(),
+        new NioRpcClient(runtime.loop(), 1000));
+new NioRpcServer(8080, node, clientService, runtime.loop()).start();
+// phía client: một vòng riêng, dùng chung được cho nhiều RaftClient
+var client = new RaftClient(new NioRpcClient(1000), servers, "client-1", 15_000);
+```
+
 Muốn dùng transport khác (gRPC, Netty...), cài đặt `RpcProcessor` cho phía gửi và gọi các hàm `handle...Request` của node ở phía nhận.
 Một lời gọi thất bại chỉ cần làm future hoàn tất với exception; node tự gửi lại ở nhịp sau.
 
@@ -539,6 +613,8 @@ mvn test -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 | `RaftSimulationTest` | Cả cluster, mạng, đĩa, client và nemesis chạy trên một thread với thời gian ảo. Một seed luôn cho đúng một lịch sử, nên lỗi tìm ra thì chạy lại được y hệt. Có lượt 5 node, 7 node và một lượt dài nửa giờ ảo |
 | `RaftChaosTest` | Cùng kịch bản nhưng với thread và đồng hồ thật, để bắt lỗi tranh chấp giữa các thread. Seed ở đây không tái hiện chắc chắn |
 | `RaftClusterTest` | Test tất định cho từng hành vi và từng quy tắc an toàn, trên cluster in-memory |
+| `LmdbKvStateMachineTest`, `RocksDbKvStateMachineTest` | Cùng một bộ test cho mỗi kho KV: đọc thấy lệnh chưa vào LMDB, xoá, snapshot đúng thời điểm khi còn lô chưa ghi, nạp snapshot thay state cũ; cluster 3 node qua mạng, một follower tắt lâu rồi bật lại và nhận snapshot từ leader |
+| `RaftClientTest`, `NioRaftClientTest` | Client đi qua TCP tới cluster 3 node với từng loại transport: ghi/đọc, nhiều client, lệnh 300 KB, leader chết giữa chừng |
 | `SocketRpcTest` | Transport TCP: từng loại RPC, lời gọi đồng thời và lời gọi chậm trên cùng kết nối, nối lại, timeout, khung không hợp lệ, TLS, cluster qua socket thật |
 | `RpcCodecTest` | Mã hoá nhị phân: mọi loại message đi và về đúng từng byte, message bị cắt cụt hoặc thừa byte, 20.000 khung ngẫu nhiên |
 | `BinaryLogStorageTest` | Mọi loại entry, nhiều segment, cắt đầu/cắt đuôi, khung ghi dở, đuôi chưa sync sau một lỗ hổng, dữ liệu đã sync bị hỏng |
@@ -585,12 +661,33 @@ java -Dbench.logSync=false -cp "$CP" com.namnv.bench.ClusterBenchmark
 # chỉ đo một phần của bảng, ví dụ lệnh 4 KB với 512 client:
 java -Dbench.payloads=4096 -Dbench.clients=512 -Dbench.phases=write -cp "$CP" com.namnv.bench.ClusterBenchmark
 
+# transport cũ (thread đọc/ghi riêng) thay cho NIO trên vòng của node; hoặc vòng không bao giờ ngủ
+java -Dbench.transport=socket -cp "$CP" com.namnv.bench.ClusterBenchmark
+# các node chạy kho KV (put key 8 byte tăng dần, get một key), như công cụ benchmark của etcd;
+# -Dbench.kvSync=false: kho không fsync mỗi lô (RocksDB: tắt WAL) trong khi Raft log vẫn fsync
+java -Dbench.kv=lmdb -cp "$CP" com.namnv.bench.ClusterBenchmark
+java -Dbench.kv=rocksdb -cp "$CP" com.namnv.bench.ClusterBenchmark
+java -Draft.agent.idle=busy -Dbench.nodeArgs=-Draft.agent.idle=busy -cp "$CP" com.namnv.bench.ClusterBenchmark
+
+# Aeron Cluster theo cùng kịch bản, để so sánh: project riêng trong bench/aeron-cluster (xem README trong đó)
+
 # 3 node trong một tiến trình: so sánh transport, đĩa thật với tmpfs, và bộ mã hoá
 java -cp "$CP" com.namnv.bench.RaftBenchmark
 ```
 
-Kết quả phụ thuộc gần như hoàn toàn vào tốc độ fsync của ổ đĩa. Độ trễ đuôi cũng vậy: một số SSD có những đợt vài giây mà fsync chậm đi nhiều lần, và trong các đợt đó mọi lệnh ghi chậm theo. Trên một máy có ổ NVMe (fsync khoảng 1 ms),
-`ClusterBenchmark` cho khoảng 700 lệnh ghi/giây với một client và khoảng 60.000 lệnh ghi/giây với 512 client đồng thời.
+Khi có fsync, kết quả phụ thuộc gần như hoàn toàn vào tốc độ fsync của ổ đĩa. Độ trễ đuôi cũng vậy: một số SSD có những đợt
+vài giây mà fsync chậm đi nhiều lần, và trong các đợt đó mọi lệnh ghi chậm theo.
+
+`ClusterBenchmark` trên một máy i5-13500, ổ NVMe (fsync khoảng 1 ms), lệnh 128 byte, transport NIO, idle `backoff`:
+
+| | 1 client | 32 client | 512 client |
+|---|---|---|---|
+| ghi, có fsync | ~1.350 TPS, p50 0,76 ms | ~29.000 | ~250.000 |
+| ghi, không fsync | ~35.000 TPS, p50 21 µs | ~208.000 | ~620.000 |
+| đọc nhất quán qua leader | ~42.000/s, p50 19 µs | ~227.000 | ~675.000 |
+| đọc nhất quán qua follower | ~30.000/s, p50 28 µs | ~242.000 | ~690.000 |
+
+Với `SocketRpc*` thì ghi không fsync đạt khoảng 15.000 TPS (1 client), 226.000 (32 client) và 500.000 (512 client).
 
 ## Giới hạn đã biết
 

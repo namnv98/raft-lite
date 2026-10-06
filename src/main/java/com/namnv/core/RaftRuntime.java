@@ -25,6 +25,16 @@ public interface RaftRuntime {
     }
 
 
+    /**
+     * Thread xử lý của node: mọi sự kiện của node (lệnh client, response RPC, timer, việc đĩa đã xong) chạy lần lượt ở đây.
+     * Mặc định chạy ngay trên thread gọi, đúng cho runtime chỉ có một thread như bản mô phỏng trong test.
+     *
+     * @throws java.util.concurrent.RejectedExecutionException nếu runtime đã tắt
+     */
+    default void executeNode(Runnable task) {
+        task.run();
+    }
+
     int nextInt(int bound);
 
     void shutdown();

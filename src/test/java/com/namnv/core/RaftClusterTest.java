@@ -858,8 +858,11 @@ class RaftClusterTest {
         // chỉ còn leader và một follower: quorum buộc phải tính cả leader
         isolate(followers.get(1));
         runtimes.get(leader.getNodeId()).pauseIo();
+        var before = leader.getPersistent().getLogStore().lastIndex();
         var future = leader.appendClientCommand("2".getBytes(StandardCharsets.UTF_8));
-        var index = leader.getPersistent().getLogStore().lastIndex();
+        // lệnh được ghi vào log trên thread của node, không phải trong lời gọi
+        await("leader to append the entry", () -> leader.getPersistent().getLogStore().lastIndex() > before);
+        var index = before + 1;
         await("follower to store the entry", () -> matchIndex(leader, followers.get(0)) >= index);
 
         // follower đã có entry trên đĩa, nhưng leader chưa fsync nên chưa được commit
@@ -1478,6 +1481,8 @@ class RaftClusterTest {
             reads.add(follower.read(() -> List.copyOf(machines.get(id).getStore())));
         }
         // lần đọc đầu đã gửi một request; 49 lần còn lại chờ, không gửi thêm request nào
+        await("the first ReadIndex request", () -> rpc.readIndexCalls.get() > before);
+        TimeUnit.MILLISECONDS.sleep(100);
         assertEquals(before + 1, rpc.readIndexCalls.get());
         assertTrue(reads.stream().noneMatch(CompletableFuture::isDone));
 

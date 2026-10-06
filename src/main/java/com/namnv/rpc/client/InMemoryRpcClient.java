@@ -53,6 +53,15 @@ public class InMemoryRpcClient implements RpcProcessor {
         return CompletableFuture.supplyAsync(() -> invoke.apply(h));
     }
 
+    // RPC mà phía nhận trả lời bất đồng bộ
+    private <T> CompletableFuture<T> callAsync(String from, String target, Function<RaftServerService, CompletableFuture<T>> invoke) {
+        RaftServerService h = registry.get(target);
+        if (h == null || !reachable.getOrDefault(from, Set.of()).contains(target)) {
+            return CompletableFuture.failedFuture(new IOException(from + " cannot reach " + target));
+        }
+        return CompletableFuture.supplyAsync(() -> invoke.apply(h)).thenCompose(Function.identity());
+    }
+
     @Override
     public CompletableFuture<RequestVoteResponse> requestVote(String target, RequestVoteRequest request) {
         return call(request.candidateId, target, h -> h.handleRequestVoteRequest(request));
@@ -60,7 +69,7 @@ public class InMemoryRpcClient implements RpcProcessor {
 
     @Override
     public CompletableFuture<AppendEntriesResponse> appendEntries(String target, AppendEntriesRequest req) {
-        return call(req.leaderId, target, h -> h.handleAppendEntriesRequest(req));
+        return callAsync(req.leaderId, target, h -> h.handleAppendEntriesAsync(req));
     }
 
     @Override

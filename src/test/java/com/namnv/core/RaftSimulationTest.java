@@ -522,7 +522,7 @@ class RaftSimulationTest {
 
         @Override
         public CompletableFuture<AppendEntriesResponse> appendEntries(String target, AppendEntriesRequest req) {
-            return call(req.leaderId, target, h -> h.handleAppendEntriesRequest(req));
+            return callAsync(req.leaderId, target, h -> h.handleAppendEntriesAsync(req));
         }
 
         @Override

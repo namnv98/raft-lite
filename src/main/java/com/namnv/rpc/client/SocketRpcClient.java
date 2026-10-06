@@ -2,6 +2,7 @@ package com.namnv.rpc.client;
 
 import com.namnv.rpc.FrameWriter;
 import com.namnv.rpc.RpcCodec;
+import com.namnv.rpc.RpcThreads;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
@@ -37,7 +38,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * Transport TCP. Mỗi node đích một kết nối dùng lại; mọi lời gọi tới node đó đi chung kết nối này và không chờ nhau:
  * mỗi request mang một id, một thread đọc response về và trả cho đúng lời gọi theo id.
  */
-public class SocketRpcClient implements RpcProcessor, AutoCloseable {
+public class SocketRpcClient implements RpcProcessor, MessageTransport {
     // đủ lớn để nhiều message nhỏ đi chung một lần ghi/đọc socket
     private static final int BUFFER_BYTES = 1 << 16;
 
@@ -59,7 +60,7 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
     public SocketRpcClient(int timeoutMs, SSLContext sslContext) {
         this.timeoutMs = timeoutMs;
         this.sslContext = sslContext;
-        rpcExecutor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().factory());
+        rpcExecutor = RpcThreads.newExecutor("raft-rpc-client-");
     }
 
     @Override
@@ -99,6 +100,7 @@ public class SocketRpcClient implements RpcProcessor, AutoCloseable {
     /**
      * Gửi một message bất kỳ mà {@link RpcCodec} biết tới node ở {@code address} và chờ response kiểu {@code responseType}.
      */
+    @Override
     public <T> CompletableFuture<T> send(String address, Object request, Class<T> responseType) {
         var result = new CompletableFuture<Object>();
         // Người gọi (đang giữ lock của node) không bao giờ bị chặn bởi mạng: kết nối đã có thì request chỉ được xếp vào
