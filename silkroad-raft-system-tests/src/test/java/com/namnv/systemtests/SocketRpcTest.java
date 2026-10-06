@@ -151,6 +151,19 @@ class SocketRpcTest {
         servers.forEach(SocketRpcServer::stop);
     }
 
+    private static int freePortOutsideEphemeralRange() throws IOException {
+        var random = new java.util.Random();
+        for (int attempt = 0; attempt < 100; attempt++) {
+            int port = 20_000 + random.nextInt(12_000);
+            try (ServerSocket socket = new ServerSocket(port)) {
+                return port;
+            } catch (IOException taken) {
+                // thử cổng khác
+            }
+        }
+        throw new IOException("no free port below the ephemeral range");
+    }
+
     private static int freePort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
@@ -244,7 +257,9 @@ class SocketRpcTest {
     @Test
     void callFailsWhenNobodyListensAndRecoversWhenServerComesBack() throws Exception {
         var service = new EchoService();
-        var port = freePort();
+        // Cổng trống ngoài dải cổng tạm (32768-60999): kết nối tới một cổng trong dải đó khi chưa ai lắng nghe đôi khi được
+        // kernel cho chính cổng ấy làm cổng nguồn (TCP tự nối vào mình), và server không mở được cổng đó nữa
+        var port = freePortOutsideEphemeralRange();
         var address = "localhost:" + port;
         var rpc = client(500);
 

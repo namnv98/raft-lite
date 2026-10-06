@@ -233,6 +233,7 @@ public final class RpcCodec {
         if (message instanceof ClientWriteResponse m) {
             out.writeBoolean(m.success);
             writeString(out, m.leaderId);
+            writeBytes(out, m.result);
             return CLIENT_WRITE_RESPONSE;
         }
         if (message instanceof ClientReadRequest m) {
@@ -319,7 +320,7 @@ public final class RpcCodec {
                 case READ_INDEX_RESPONSE -> new ReadIndexResponse(in.readBoolean(), in.readLong(), in.readString());
                 case CLIENT_WRITE_REQUEST -> new ClientWriteRequest(in.readString(), in.readLong(), in.readBytes());
                 case CLIENT_WRITE_BATCH_REQUEST -> new ClientWriteRequest(in.readString(), in.readLong(), in.readBytes(), true);
-                case CLIENT_WRITE_RESPONSE -> new ClientWriteResponse(in.readBoolean(), in.readString());
+                case CLIENT_WRITE_RESPONSE -> new ClientWriteResponse(in.readBoolean(), in.readString(), in.readBytes());
                 case CLIENT_READ_REQUEST -> new ClientReadRequest(in.readBytes());
                 case CLIENT_READ_RESPONSE -> new ClientReadResponse(in.readBoolean(), in.readString(), in.readBytes());
                 default -> throw new IOException("Unknown RPC message type " + type);

@@ -80,9 +80,18 @@ public class SnapshotStore {
         return stored.meta;
     }
 
+    // đọc theo khối: file của snapshot có thể rất lớn (cả kho dữ liệu), không được nạp nguyên vào bộ nhớ
     private static long checksumOf(Path file) throws IOException {
-        byte[] data = Files.readAllBytes(file);
-        return Checksum.crc32(data, 0, data.length);
+        var crc = new java.util.zip.CRC32();
+        var buffer = java.nio.ByteBuffer.allocateDirect(1 << 20);
+        try (var channel = java.nio.channels.FileChannel.open(file, java.nio.file.StandardOpenOption.READ)) {
+            while (channel.read(buffer) >= 0) {
+                buffer.flip();
+                crc.update(buffer);
+                buffer.clear();
+            }
+        }
+        return crc.getValue();
     }
 
     private static long indexOf(Path snapshot) {

@@ -214,6 +214,7 @@ class RaftClusterTest {
     private int maxPendingCommands = 100_000;
     private int maxEntriesPerRequest = 1024;
     private int maxInflightAppends = 8;
+    private List<String> learners = List.of();
     private int logCacheEntries = 16_384;
     private long snapshotIntervalEntries = 0;
     private int catchUpTimeoutMs = 30_000;
@@ -262,7 +263,7 @@ class RaftClusterTest {
                 .snapshotIntervalEntries(snapshotIntervalEntries)
                 .catchUpTimeoutMs(catchUpTimeoutMs)
                 .snapshotChunkBytes(snapshotChunkBytes)
-                .raftConfig(RaftConfig.builder().self(id).peers(peers).build())
+                .raftConfig(RaftConfig.builder().self(id).peers(peers).learners(learners).build())
                 .build();
         var node = new RaftNode(options, rpc);
         nodes.put(id, node);
@@ -1282,6 +1283,98 @@ class RaftClusterTest {
         stopNode(follower);
         startNode(follower, List.of("A", "B", "C"));
         awaitStore(follower, expected);
+    }
+
+    // ---------- learner ----------
+
+    @Test
+    void learnerFollowsTheLogButNeverCountsTowardsQuorumOrLeads() throws Exception {
+        learners = List.of("L");
+        for (String id : List.of("A", "B", "C", "L")) {
+            connect(id);
+        }
+        for (String id : List.of("A", "B", "C")) {
+            startNode(id, List.of("A", "B", "C"));
+        }
+        var learner = startNode("L", List.of("A", "B", "C"));
+        var leader = awaitLeader();
+        assertTrue(!leader.getNodeId().equals("L"));
+        write(leader, "1", "2");
+        awaitStore("L", List.of("1", "2"));
+        // đọc nhất quán trên learner: hỏi leader readIndex như một follower
+        assertEquals(List.of("1", "2"), learner.read(machines.get("L")::getStore).get(5, TimeUnit.SECONDS));
+
+        // còn leader và learner thì không đủ đa số: lệnh không được commit dù learner vẫn nhận log
+        for (String id : others(leader.getNodeId(), "L")) {
+            isolate(id);
+        }
+        var pending = leader.appendClientCommand("3".getBytes(StandardCharsets.UTF_8));
+        TimeUnit.MILLISECONDS.sleep(400);
+        assertFalse(pending.isDone() && pending.getNow(false), "a learner must not complete a quorum");
+        assertEquals(List.of("1", "2"), machines.get("L").getStore());
+
+        // leader cũng bị cô lập: chỉ còn learner, nó không bao giờ tự ứng cử
+        isolate(leader.getNodeId());
+        TimeUnit.MILLISECONDS.sleep(1200);
+        assertEquals(0, learner.metrics().electionsStarted());
+        assertTrue(learner.getState() != NodeState.LEADER);
+    }
+
+    // ---------- kết quả của lệnh ----------
+
+    @Test
+    void submitReturnsWhatTheStateMachineAnswered() throws Exception {
+        // state machine trả về số lệnh nó đã có sau khi apply lệnh này
+        machineFactory = () -> new ListStateMachine() {
+            @Override
+            public byte[] onApplyWithResult(String node, LogEntry entry) {
+                onApply(node, entry);
+                return ("size=" + getStore().size()).getBytes(StandardCharsets.UTF_8);
+            }
+        };
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        assertEquals("size=1", new String(leader.submit(null, 0, "a".getBytes(StandardCharsets.UTF_8), false)
+                .get(5, TimeUnit.SECONDS), StandardCharsets.UTF_8));
+
+        // lô: kết quả của từng lệnh, đúng thứ tự
+        var results = new ArrayList<String>();
+        com.namnv.entity.CommandBatch.forEach(leader.submit(null, 0,
+                        com.namnv.entity.CommandBatch.encode(commands("b", "c")), true).get(5, TimeUnit.SECONDS),
+                r -> results.add(new String(r, StandardCharsets.UTF_8)));
+        assertEquals(List.of("size=2", "size=3"), results);
+
+        // follower không nhận lệnh: không rõ kết quả, không phải lỗi lập trình
+        var follower = nodes.get(others(leader.getNodeId()).get(0));
+        var error = assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> follower.submit(null, 0, "x".getBytes(StandardCharsets.UTF_8), false).get(5, TimeUnit.SECONDS));
+        assertTrue(error.getCause() instanceof UnknownOutcomeException);
+    }
+
+    @Test
+    void nodeStopsInsteadOfDivergingWhenTheStateMachineFails() throws Exception {
+        machineFactory = () -> new ListStateMachine() {
+            @Override
+            public void onApply(String node, LogEntry entry) {
+                if ("boom".equals(new String(entry.getCommand(), StandardCharsets.UTF_8))) {
+                    throw new IllegalStateException("state machine failure");
+                }
+                super.onApply(node, entry);
+            }
+        };
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        write(leader, "1");
+        leader.appendClientCommand("boom".getBytes(StandardCharsets.UTF_8));
+        // Node nào apply tới lệnh đó thì tự tắt. Leader tắt có thể trước khi follower biết lệnh đã commit; leader mới
+        // commit lại nó rồi cũng tắt, còn node cuối cùng không còn đa số nên không bao giờ apply tới lệnh đó.
+        await("leader to stop", leader::isStopped);
+        await("a second node to stop",
+                () -> nodes.values().stream().filter(RaftNode::isStopped).count() >= 2);
+        // không bản sao nào apply dở hay chạy tiếp với state khác các bản còn lại
+        for (String id : List.of("A", "B", "C")) {
+            assertEquals(List.of("1"), machines.get(id).getStore());
+        }
     }
 
     // ---------- pipelining ----------

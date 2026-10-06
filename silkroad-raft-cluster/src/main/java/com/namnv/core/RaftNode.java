@@ -144,6 +144,8 @@ public class RaftNode implements RaftServerService {
     // lô đang được fsync ở thread IO (null nếu không có); shutdown() trả lời nó nếu thread IO không còn chạy tới
     private List<SyncWaiter> syncingBatch;
     private boolean logSyncQueued;
+    // state machine đã ném lỗi khi apply: không apply gì nữa, node đang tự tắt
+    private boolean stateMachineFailed;
     // follower: các lần đọc chưa được hỏi readIndex, và nhóm đang chờ leader trả lời (null nếu không có request nào đang bay)
     private List<QueuedRead> queuedReads = new ArrayList<>();
     private ReadIndexBatch readIndexBatch;
@@ -152,6 +154,8 @@ public class RaftNode implements RaftServerService {
 
     // node từng là thành viên; khi cấu hình không còn nó được commit thì node tự tắt
     private boolean wasMember;
+    // learner cố định (RaftConfig.learners), trừ chính node này: leader gửi log cho họ nhưng không tính họ vào quorum
+    private final List<String> learners;
     private boolean transferring;
     private boolean removalHandled;
 
@@ -166,6 +170,10 @@ public class RaftNode implements RaftServerService {
                 () -> onNode(this::onElectionTimeout));
         this.heartbeatTimer = new HeartbeatTimer(runtime, nodeOptions.getHeartbeatIntervalMs(), () -> onNode(this::onHeartbeatTick));
         this.initialConf = new ConfigurationEntry(nodeOptions.getRaftConfig().getPeers());
+        var learnerIds = new ArrayList<>(nodeOptions.getRaftConfig().getLearners());
+        learnerIds.remove(nodeId);
+        learnerIds.removeAll(nodeOptions.getRaftConfig().getPeers()); // đã là thành viên thì không còn là learner
+        this.learners = List.copyOf(learnerIds);
         refreshConf();
     }
 
@@ -334,7 +342,7 @@ public class RaftNode implements RaftServerService {
 
     private void failPendingFutures() {
         for (PendingCommand pending : pendingFutures) {
-            complete(pending.future(), false);
+            finish(pending.applied(), pending.result(), null, LOST);
         }
         pendingFutures.clear();
         var notLeader = new NotLeaderException(nodeId, leaderId);
@@ -384,41 +392,59 @@ public class RaftNode implements RaftServerService {
             return CompletableFuture.completedFuture(false);
         }
         var future = new CompletableFuture<Boolean>();
-        onNode(() -> acceptClientCommand(clientId, sequence, command, batch, future));
+        onNode(() -> acceptClientCommand(clientId, sequence, command, batch, future, null));
+        return future;
+    }
+
+    /**
+     * Ghi một lệnh (hoặc một lô, với {@code batch}) và nhận về kết quả mà state machine trả cho nó
+     * ({@link com.namnv.statemachine.StateMachine#onApplyWithResult}); với lô là các kết quả của từng lệnh gói bằng
+     * {@link CommandBatch#encode}, lệnh không có kết quả thì là mảng rỗng. Future thất bại với
+     * {@link UnknownOutcomeException} khi không biết lệnh đã được apply hay chưa.
+     * <p>
+     * Lệnh bị coi là trùng theo (clientId, sequence) thì không được apply lại và kết quả của lần đầu không còn: khi cần
+     * kết quả, nên chống trùng bằng định danh nghiệp vụ của chính lệnh (ví dụ id của giao dịch) và để clientId null.
+     */
+    public CompletableFuture<byte[]> submit(String clientId, long sequence, byte[] command, boolean batch) {
+        if (batch && !CommandBatch.isValid(command)) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("malformed command batch"));
+        }
+        var future = new CompletableFuture<byte[]>();
+        onNode(() -> acceptClientCommand(clientId, sequence, command, batch, null, future));
         return future;
     }
 
     private void acceptClientCommand(String clientId, long sequence, byte[] command, boolean batch,
-                                     CompletableFuture<Boolean> future) {
+                                     CompletableFuture<Boolean> applied, CompletableFuture<byte[]> result) {
         if (stopped || state != NodeState.LEADER) {
-            complete(future, false);
+            finish(applied, result, null, NOT_LEADER);
         } else if (isDuplicate(clientId, sequence)) {
             duplicateCommands++;
-            complete(future, true); // lần gửi trước đã được apply
+            finish(applied, result, NO_RESULT, null); // lần gửi trước đã được apply; kết quả của nó không còn
         } else if (pendingFutures.size() >= nodeOptions.getMaxPendingCommands()) {
             // follower không theo kịp: từ chối sớm thay vì để hàng chờ lớn mãi
             commandsRejected++;
-            complete(future, false);
+            finish(applied, result, null, OVERLOADED);
         } else {
             long nextIndex = persistent.getLogStore().lastIndex() + 1;
             var entry = new LogEntry(nextIndex, persistent.getCurrentTerm(), command, clientId, sequence);
             entry.setBatch(batch);
-            appendAndTrack(entry, future);
+            appendAndTrack(entry, applied, result);
         }
     }
 
-    // leader ghi entry vào log; future hoàn tất khi entry được apply (true) hoặc không rõ kết quả (false)
-    private void appendAndTrack(LogEntry entry, CompletableFuture<Boolean> future) {
+    // leader ghi entry vào log; người gọi được báo khi entry được apply hoặc khi không rõ kết quả
+    private void appendAndTrack(LogEntry entry, CompletableFuture<Boolean> applied, CompletableFuture<byte[]> result) {
         try {
             persistent.getLogStore().appendEntry(entry);
         } catch (Exception error) {
             log.error("Leader {} failed to append client command", nodeId, error);
             commandsRejected++;
-            complete(future, false);
+            finish(applied, result, null, APPEND_FAILED);
             return;
         }
         commandsAccepted++;
-        pendingFutures.addLast(new PendingCommand(entry.getIndex(), future, deadline()));
+        pendingFutures.addLast(new PendingCommand(entry.getIndex(), applied, result, deadline()));
         // replicate log đến followers; trong một lô sự kiện thì gửi một lần cho cả lô
         if (draining) {
             broadcastDeferred = true;
@@ -427,7 +453,27 @@ public class RaftNode implements RaftServerService {
         }
     }
 
-    private record PendingCommand(long index, CompletableFuture<Boolean> future, long deadlineNanos) {
+    // lệnh đang chờ commit: đúng một trong hai future được dùng, tuỳ người gọi cần biết "đã apply" hay cần kết quả
+    private record PendingCommand(long index, CompletableFuture<Boolean> applied, CompletableFuture<byte[]> result,
+                                  long deadlineNanos) {
+    }
+
+    private static final UnknownOutcomeException NOT_LEADER = new UnknownOutcomeException("not the leader");
+    private static final UnknownOutcomeException TIMED_OUT = new UnknownOutcomeException("not committed in time");
+    private static final UnknownOutcomeException OVERLOADED = new UnknownOutcomeException("too many pending commands");
+    private static final UnknownOutcomeException LOST = new UnknownOutcomeException("leadership changed before commit");
+    private static final UnknownOutcomeException APPEND_FAILED = new UnknownOutcomeException("failed to append to the log");
+
+    // báo kết quả cho người gọi (sau khi nhả lock): đã apply kèm kết quả, hoặc không rõ
+    private void finish(CompletableFuture<Boolean> applied, CompletableFuture<byte[]> result, byte[] value,
+                        UnknownOutcomeException unknown) {
+        if (applied != null) {
+            complete(applied, unknown == null);
+        } else if (unknown == null) {
+            complete(result, value);
+        } else {
+            fail(result, unknown);
+        }
     }
 
     private long deadline() {
@@ -448,7 +494,8 @@ public class RaftNode implements RaftServerService {
             var now = runtime.nanoTime();
             // cả hai hàng đều xếp theo thứ tự đến, nên phần tử đầu luôn hết hạn sớm nhất
             while (!pendingFutures.isEmpty() && pendingFutures.peekFirst().deadlineNanos() - now <= 0) {
-                complete(pendingFutures.pollFirst().future(), false); // timeout → fail client
+                var expired = pendingFutures.pollFirst(); // timeout → không rõ kết quả
+                finish(expired.applied(), expired.result(), null, TIMED_OUT);
             }
             while (!pendingReads.isEmpty() && pendingReads.peekFirst().deadlineNanos() - now <= 0) {
                 pendingReads.pollFirst().fail(new TimeoutException("Read was not confirmed by a quorum in time"));
@@ -496,7 +543,7 @@ public class RaftNode implements RaftServerService {
             }
             var index = persistent.getLogStore().lastIndex() + 1;
             var future = new CompletableFuture<Boolean>();
-            appendAndTrack(LogEntry.newSessionClose(index, persistent.getCurrentTerm(), clientId), future);
+            appendAndTrack(LogEntry.newSessionClose(index, persistent.getCurrentTerm(), clientId), future, null);
             return future;
         } finally {
             unlock();
@@ -979,14 +1026,18 @@ public class RaftNode implements RaftServerService {
         return peers;
     }
 
-    // mọi node leader cần gửi log: thành viên hiện tại, node đang rời đi và node mới đang bắt kịp
+    // mọi node leader cần gửi log: thành viên hiện tại, node đang rời đi, node mới đang bắt kịp và learner cố định
     private Collection<String> replicationTargets() {
-        if (leaderState.getDeparting().isEmpty() && leaderState.getCatchingUp().isEmpty()) {
+        if (leaderState.getDeparting().isEmpty() && leaderState.getCatchingUp().isEmpty() && learners.isEmpty()) {
             return peers();
         }
         Set<String> targets = new LinkedHashSet<>(peers());
         targets.addAll(leaderState.getDeparting().keySet());
         targets.addAll(leaderState.getCatchingUp());
+        for (String learner : learners) {
+            // learner được thêm vào cấu hình thì đã nằm trong peers
+            targets.add(learner);
+        }
         return targets;
     }
 
@@ -1058,7 +1109,15 @@ public class RaftNode implements RaftServerService {
                 var writer = new SnapshotWriter(snapshotStore.prepareTemp(), meta.getFiles());
                 stateMachine.onSnapshotSave(writer, status -> {
                     if (status.isOk()) {
-                        runIo(() -> finishSnapshot(meta));
+                        // Chốt snapshot đọc lại mọi file của nó để tính checksum, có thể hàng trăm MB: làm ở thread dành cho
+                        // việc đĩa không gấp, không phải thread IO đang fsync log, để các lệnh ghi không phải chờ nó
+                        runtime.executeRead(() -> {
+                            try {
+                                finishSnapshot(meta);
+                            } catch (RuntimeException e) {
+                                log.error("Node {} failed to commit snapshot at index {}", nodeId, meta.getLastIncludedIndex(), e);
+                            }
+                        });
                     } else {
                         log.error("Snapshot failed: {}", status.getMsg());
                         endSnapshotting();
@@ -1724,7 +1783,7 @@ public class RaftNode implements RaftServerService {
     private void onElectionTimeout() {
         lock.lock();
         try {
-            if (stopped || state == NodeState.LEADER) {
+            if (stopped || stateMachineFailed || state == NodeState.LEADER) {
                 return;
             }
             // luôn hẹn lại timer, nếu không một vòng bầu cử thất bại sẽ không bao giờ được thử lại
@@ -2295,25 +2354,35 @@ public class RaftNode implements RaftServerService {
     }
 
     private void applyCommitted() {
-        if (loadingSnapshot) {
-            return; // sẽ apply sau khi snapshot load xong
+        if (loadingSnapshot || stateMachineFailed) {
+            return; // sẽ apply sau khi snapshot load xong; hoặc state machine đã hỏng và node đang tắt
         }
         var lastApplied = volatileState.getLastApplied();
         var commitIndex = volatileState.getCommitIndex();
         var logStore = persistent.getLogStore();
         for (long idx = lastApplied + 1; idx <= commitIndex; idx++) {
             LogEntry logEntry = logStore.get(idx);
+            byte[] result = null;
             // no-op và config entry không thuộc về state machine
             if (logEntry != null && logEntry.isSessionClose()) {
                 sessions.remove(logEntry.getClientId());
             } else if (logEntry != null && !logEntry.isConfigurationEntry() && logEntry.getCommand() != null) {
-                applyCommand(logEntry);
+                try {
+                    result = applyCommand(logEntry);
+                } catch (Throwable error) {
+                    stateMachineFailed(idx, error);
+                    return;
+                }
             }
             volatileState.setLastApplied(idx);
             // hàng chờ xếp theo index, và các entry được apply theo đúng thứ tự đó
             while (!pendingFutures.isEmpty() && pendingFutures.peekFirst().index() <= idx) {
                 var pending = pendingFutures.pollFirst();
-                complete(pending.future(), pending.index() == idx);
+                if (pending.index() == idx) {
+                    finish(pending.applied(), pending.result(), result == null ? NO_RESULT : result, null);
+                } else {
+                    finish(pending.applied(), pending.result(), null, LOST); // entry đó đã bị leader mới ghi đè
+                }
             }
         }
         // commit index chỉ cập nhật trong bộ nhớ, ghi xuống đĩa sau theo nhịp ở thread IO
@@ -2354,19 +2423,46 @@ public class RaftNode implements RaftServerService {
 
     // lệnh client gửi lại (cùng clientId và sequence đã apply) có thể nằm trong log hai lần nhưng chỉ được apply một lần.
     // Mọi node quyết định giống nhau vì bảng sessions chỉ phụ thuộc vào các entry đã apply trước đó.
-    private void applyCommand(LogEntry entry) {
-        if (isDuplicate(entry.getClientId(), entry.getSequence())) {
-            return;
+    /**
+     * State machine ném lỗi khi apply: state của nó có thể đã đổi một phần, và các node khác có thể không gặp lỗi đó
+     * (ví dụ hết bộ nhớ). Chạy tiếp thì bản sao này lệch khỏi các bản khác mà không ai biết, nên node ngừng apply và tự
+     * tắt (fail-stop, như etcd). Khởi động lại sẽ dựng state từ snapshot và log trên đĩa.
+     */
+    private void stateMachineFailed(long index, Throwable error) {
+        stateMachineFailed = true;
+        log.error("Node {} stops: the state machine failed to apply index {}. Restart rebuilds it from the snapshot "
+                + "and the log", nodeId, index, error);
+        if (state == NodeState.LEADER) {
+            becomeFollower(persistent.getCurrentTerm()); // không nhận lệnh hay trả lời đọc nào nữa
         }
+        runIo(this::shutdown);
+    }
+
+    // kết quả trả về cho lệnh của state machine không có kết quả, hoặc lệnh trùng không được apply lại
+    private static final byte[] NO_RESULT = new byte[0];
+
+    private byte[] applyCommand(LogEntry entry) {
+        if (isDuplicate(entry.getClientId(), entry.getSequence())) {
+            return null;
+        }
+        byte[] result;
         if (entry.isBatch()) {
             // state machine thấy từng lệnh như một entry riêng, cùng index với lô
-            CommandBatch.forEach(entry.getCommand(), command -> stateMachine.onApply(nodeId,
-                    new LogEntry(entry.getIndex(), entry.getTerm(), command, entry.getClientId(), entry.getSequence())));
+            var results = new ArrayList<byte[]>();
+            var anyResult = new boolean[1];
+            CommandBatch.forEach(entry.getCommand(), command -> {
+                byte[] one = stateMachine.onApplyWithResult(nodeId,
+                        new LogEntry(entry.getIndex(), entry.getTerm(), command, entry.getClientId(), entry.getSequence()));
+                anyResult[0] |= one != null;
+                results.add(one == null ? NO_RESULT : one);
+            });
+            result = anyResult[0] ? CommandBatch.encode(results) : null;
         } else {
-            stateMachine.onApply(nodeId, entry);
+            result = stateMachine.onApplyWithResult(nodeId, entry);
         }
         if (entry.getClientId() != null) {
             sessions.computeIfAbsent(entry.getClientId(), id -> new ClientSession()).markApplied(entry.getSequence());
         }
+        return result;
     }
 }

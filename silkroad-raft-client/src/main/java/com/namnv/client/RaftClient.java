@@ -45,7 +45,9 @@ public class RaftClient implements AutoCloseable {
 
     /**
      * @param servers          địa chỉ host:port của các node
-     * @param clientId         định danh duy nhất của client này, dùng để chống ghi trùng
+     * @param clientId         định danh duy nhất của client này, dùng để chống ghi trùng; null nếu state machine tự chống
+     *                         trùng bằng định danh của chính lệnh (lần gửi lại khi đó được apply lại và trả về kết quả
+     *                         của nó, thay vì bị bỏ qua)
      * @param requestTimeoutMs thời hạn cho mỗi lần gửi tới một node
      * @param maxWaitMs        tổng thời gian tối đa cho một thao tác, tính cả các lần gửi lại
      */
@@ -74,9 +76,35 @@ public class RaftClient implements AutoCloseable {
     public CompletableFuture<Boolean> write(byte[] command) {
         var request = new ClientWriteRequest(clientId, nextSequence.incrementAndGet(), command);
         var result = new CompletableFuture<Boolean>();
-        attemptWrite(request, result, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs));
+        attemptWrite(request, result, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs), APPLIED);
         return result;
     }
+
+    /**
+     * Ghi một lệnh và nhận về kết quả mà state machine trả cho nó (null nếu state machine không trả gì).
+     * Lệnh được gửi lại tới leader mới khi không rõ kết quả, nên state machine nên chống trùng bằng định danh của chính
+     * lệnh (ví dụ id giao dịch) để lần gửi lại trả về đúng kết quả.
+     */
+    public CompletableFuture<byte[]> submit(byte[] command) {
+        var request = new ClientWriteRequest(clientId, nextSequence.incrementAndGet(), command);
+        var result = new CompletableFuture<byte[]>();
+        attemptWrite(request, result, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs), RESULT);
+        return result;
+    }
+
+    /**
+     * Như {@link #writeBatch} nhưng nhận về kết quả của từng lệnh trong lô, gói bằng {@link CommandBatch#encode}
+     * ({@link CommandBatch#forEach} để đọc); null nếu state machine không trả kết quả nào.
+     */
+    public CompletableFuture<byte[]> submitBatch(List<byte[]> commands) {
+        var request = new ClientWriteRequest(clientId, nextSequence.incrementAndGet(), CommandBatch.encode(commands), true);
+        var result = new CompletableFuture<byte[]>();
+        attemptWrite(request, result, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs), RESULT);
+        return result;
+    }
+
+    private static final java.util.function.Function<ClientWriteResponse, Boolean> APPLIED = response -> Boolean.TRUE;
+    private static final java.util.function.Function<ClientWriteResponse, byte[]> RESULT = response -> response.result;
 
     /**
      * Ghi nhiều lệnh trong một request và một entry của log: cả lô được apply cùng nhau, đúng một lần, và future
@@ -85,7 +113,7 @@ public class RaftClient implements AutoCloseable {
     public CompletableFuture<Boolean> writeBatch(List<byte[]> commands) {
         var request = new ClientWriteRequest(clientId, nextSequence.incrementAndGet(), CommandBatch.encode(commands), true);
         var result = new CompletableFuture<Boolean>();
-        attemptWrite(request, result, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs));
+        attemptWrite(request, result, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs), APPLIED);
         return result;
     }
 
@@ -105,17 +133,18 @@ public class RaftClient implements AutoCloseable {
         return result;
     }
 
-    private void attemptWrite(ClientWriteRequest request, CompletableFuture<Boolean> result, long deadlineNanos) {
+    private <T> void attemptWrite(ClientWriteRequest request, CompletableFuture<T> result, long deadlineNanos,
+                                  java.util.function.Function<ClientWriteResponse, T> outcome) {
         var server = target;
         transport.send(server, request, ClientWriteResponse.class).whenComplete((response, error) -> {
             if (response != null && response.success) {
-                result.complete(true);
+                result.complete(outcome.apply(response));
             } else if (System.nanoTime() >= deadlineNanos) {
                 result.completeExceptionally(new TimeoutException("write was not confirmed within " + maxWaitMs + " ms"));
             } else {
                 moveOn(server, response != null ? response.leaderId : null);
                 // cùng sequence: nếu lần gửi trước thật ra đã được commit thì lần này chỉ nhận lại kết quả
-                RETRY_TIMER.schedule(() -> attemptWrite(request, result, deadlineNanos), RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
+                RETRY_TIMER.schedule(() -> attemptWrite(request, result, deadlineNanos, outcome), RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
             }
         });
     }

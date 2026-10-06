@@ -12,6 +12,16 @@ public interface StateMachine {
     void onApply(String node, LogEntry entry);
 
     /**
+     * Như {@link #onApply} nhưng trả về kết quả của lệnh cho client đã gửi nó (ví dụ "không đủ tiền"), hoặc null nếu
+     * không có. Kết quả phải chỉ phụ thuộc vào state và lệnh, để mọi node tính ra giống nhau. Chỉ kết quả trên leader
+     * được gửi về client. Mặc định gọi {@link #onApply} và không có kết quả.
+     */
+    default byte[] onApplyWithResult(String node, LogEntry entry) {
+        onApply(node, entry);
+        return null;
+    }
+
+    /**
      * Lưu state hiện tại vào thư mục {@code snapshotWriter.getPath()} rồi gọi {@code done}.
      * Được gọi khi node đang giữ lock: nên chụp bản sao state ngay trong lời gọi này, còn việc ghi file
      * thì làm ở thread khác và gọi {@code done} khi xong. Ghi đồng bộ vẫn đúng nhưng sẽ chặn node trong lúc ghi.

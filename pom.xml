@@ -19,9 +19,10 @@
         silkroad-raft-client       RaftClient cho ứng dụng                              -> transport
         silkroad-raft-cluster      đồng thuận Raft: RaftNode, runtime, state machine    -> protocol, log, agent
         silkroad-raft-kv           kho KV trên LMDB / RocksDB                           -> cluster
+        silkroad-raft-ledger       dịch vụ sổ cái: state machine, client, node          -> cluster, transport, client
         silkroad-raft-samples      các demo                                             -> cluster, transport
         silkroad-raft-benchmarks   đo hiệu năng                                         -> tất cả
-        silkroad-raft-system-tests test đi qua mạng thật: cluster + transport + client
+        silkroad-raft-system-tests  test đi qua mạng thật: cluster + transport + client
     -->
     <modules>
         <module>silkroad-raft-agent</module>
@@ -31,6 +32,7 @@
         <module>silkroad-raft-client</module>
         <module>silkroad-raft-cluster</module>
         <module>silkroad-raft-kv</module>
+        <module>silkroad-raft-ledger</module>
         <module>silkroad-raft-samples</module>
         <module>silkroad-raft-benchmarks</module>
         <module>silkroad-raft-system-tests</module>
@@ -54,6 +56,7 @@
             <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-client</artifactId><version>${project.version}</version></dependency>
             <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-cluster</artifactId><version>${project.version}</version></dependency>
             <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-kv</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-ledger</artifactId><version>${project.version}</version></dependency>
 
             <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-slf4j2-impl</artifactId><version>${log4j.version}</version></dependency>
             <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId><version>${log4j.version}</version></dependency>

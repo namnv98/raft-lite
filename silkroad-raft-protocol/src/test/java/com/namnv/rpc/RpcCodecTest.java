@@ -79,6 +79,7 @@ class RpcCodecTest {
                 new ClientWriteRequest("client-1", 42, "set x=1".getBytes(StandardCharsets.UTF_8)),
                 new ClientWriteRequest(null, 0, new byte[0]),
                 new ClientWriteResponse(false, "localhost:8081"),
+                new ClientWriteResponse(true, null, new byte[]{0, 0, 0, 1, 42}),
                 new ClientReadRequest(new byte[]{9, 8, 7}),
                 new ClientReadResponse(true, null, "kết quả".getBytes(StandardCharsets.UTF_8)),
                 new ClientReadResponse(false, "localhost:8081", null),

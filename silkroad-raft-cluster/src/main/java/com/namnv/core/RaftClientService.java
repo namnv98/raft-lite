@@ -27,8 +27,11 @@ public class RaftClientService implements ClientService {
 
     @Override
     public CompletableFuture<ClientWriteResponse> handleClientWrite(ClientWriteRequest request) {
-        return node.appendClientCommand(request.clientId, request.sequence, request.command, request.batch)
-                .handle((ok, error) -> new ClientWriteResponse(Boolean.TRUE.equals(ok), node.getLeaderId()));
+        // kết quả của state machine (nếu có) đi về client cùng câu trả lời
+        return node.submit(request.clientId, request.sequence, request.command, request.batch)
+                .handle((result, error) -> error == null
+                        ? new ClientWriteResponse(true, node.getLeaderId(), result == null || result.length == 0 ? null : result)
+                        : new ClientWriteResponse(false, node.getLeaderId()));
     }
 
     @Override

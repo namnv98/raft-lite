@@ -65,8 +65,7 @@ public final class AgentLoop implements Executor, AutoCloseable {
     private int selectedCount;
 
     public AgentLoop(String name) {
-        this(name, IdleStrategy.valueOf(System.getProperty("raft.agent.idle", "backoff").toUpperCase()),
-                Long.getLong("raft.agent.spinMicros", 50));
+        this(name, IdleStrategy.valueOf(System.getProperty("raft.agent.idle", "backoff").toUpperCase()), Long.getLong("raft.agent.spinMicros", 50));
     }
 
     public AgentLoop(String name, IdleStrategy idleStrategy, long spinMicros) {

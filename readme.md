@@ -294,6 +294,195 @@ client.write(KvCommands.put(key, value));
 byte[] value = KvCommands.value(client.read(KvCommands.get(key)).get());
 ```
 
+### Kết quả của lệnh
+
+State machine trả được kết quả cho client của từng lệnh (ví dụ "không đủ tiền") bằng `onApplyWithResult`; kết quả
+phải chỉ phụ thuộc vào state và lệnh để mọi node tính ra giống nhau, và chỉ kết quả trên leader đi về client:
+
+```java
+byte[] result = node.submit(null, 0, command, false).get();         // trên node
+byte[] result = raftClient.submit(command).get();                   // qua mạng
+byte[] results = raftClient.submitBatch(commands).get();            // mỗi lệnh một kết quả, đọc bằng CommandBatch.forEach
+```
+
+Future thất bại với `UnknownOutcomeException` khi không biết lệnh đã được apply hay chưa. Lệnh bị chống trùng theo
+`(clientId, sequence)` không được apply lại và kết quả lần đầu không còn, nên khi cần kết quả hãy chống trùng bằng id
+nghiệp vụ của chính lệnh và để `clientId` null (như sổ cái bên dưới).
+
+Nếu state machine ném lỗi khi apply, node ngừng apply và tự tắt thay vì chạy tiếp với một state có thể đã đổi dở và khác
+các bản sao khác (fail-stop, như etcd). Khởi động lại sẽ dựng state từ snapshot và log.
+
+### Sổ cái (`silkroad-raft-ledger`)
+
+Một dịch vụ sổ cái kép dựng trên thư viện, theo cách của Binance Ledger và TigerBeetle: tài khoản (`LedgerAccount`) thuộc
+một sổ (đơn vị tiền), có cờ "không được âm" cho tài khoản khách hàng; chuyển tiền (`LedgerTransfer`) cộng cùng một số
+tiền vào tổng nợ của tài khoản nợ và tổng có của tài khoản có, nên tổng nợ của cả sổ luôn bằng tổng có.
+
+- Mọi kiểm tra chạy trong state machine một thread, không khoá: tài khoản tồn tại và khác nhau, cùng sổ, số tiền dương,
+  không tràn số, không vượt số dư. Tài khoản "nóng" không làm chậm hệ thống như khoá dòng của cơ sở dữ liệu quan hệ.
+- Id của giao dịch do client chọn: gửi lại một giao dịch đã ghi trả về `EXISTS`, không ghi hai lần. Mỗi giao dịch có
+  kết quả riêng (`LedgerResult`) gửi về client.
+- Tài khoản nằm trong bộ nhớ dưới dạng mảng số nguyên thuỷ. Lịch sử giao dịch (`TransferStore`) có giới hạn bộ nhớ:
+  giao dịch mới nằm trong một đoạn cố định (mặc định 1 triệu giao dịch); đoạn đầy được một thread nền ghi xuống RocksDB
+  (một `WriteBatch`, không WAL vì Raft log đã giữ độ bền) rồi dùng lại. Chống trùng không đọc RocksDB cho mỗi giao dịch:
+  một bloom filter của mọi id (khoảng 1,5 byte mỗi giao dịch) trả lời "chắc chắn chưa có"; chỉ khi nó nói "có thể có"
+  (khoảng 1%) mới đọc RocksDB, nên kết quả luôn chính xác và giống nhau trên mọi node. RocksDB ghi không kịp thì thread của
+  node chờ khi đã có 4 đoạn chưa ghi, thay vì dồn bộ nhớ.
+- Snapshot: các mảng tài khoản, checkpoint của RocksDB (hard link tới các SST, tạo đúng lúc mọi giao dịch trước thời điểm
+  chụp đã xuống RocksDB) và bloom filter; phần ghi file chạy ở thread riêng.
+
+```java
+var client = new LedgerClient(List.of("host1:9001", "host2:9001", "host3:9001"), 10_000);
+client.createAccounts(List.of(new LedgerAccount(1, 840, 0),
+        new LedgerAccount(2, 840, LedgerAccount.DEBITS_MUST_NOT_EXCEED_CREDITS))).get();
+List<LedgerResult> results = client.transfers(List.of(new LedgerTransfer(100, 1, 2, 500, 840))).get();
+LedgerTotals totals = client.totals().get();          // totals.balanced() luôn đúng
+```
+
+Một node: `java ... com.namnv.ledger.LedgerNode host:port host1:port1,host2:port2,host3:port3 thư-mục-dữ-liệu`.
+
+#### Learner và dòng sự kiện (CQRS)
+
+Hệ thống khác (app, báo cáo, thông báo, đối soát, chống gian lận) không đọc thẳng từ sổ cái: chúng nghe một dòng sự kiện
+và tự dựng mô hình truy vấn của riêng mình. Ở đây dòng đó được phát từ một **learner**: một node nhận log từ leader như
+mọi follower nhưng không nằm trong cấu hình, nên không bỏ phiếu, không được tính vào quorum và không bao giờ thành leader.
+Learner chậm hay chết không làm chậm việc ghi.
+
+- `RaftConfig.learners`: danh sách learner cố định, khai báo giống nhau trên mọi node.
+- Mỗi tài khoản mới hoặc giao dịch đã ghi sinh một `LedgerEvent` có vị trí `(index, position)`: index của entry trong Raft
+  log và thứ tự của lệnh trong lô. Vị trí này giống nhau trên mọi node. Lệnh bị từ chối và `EXISTS` không sinh sự kiện.
+- `EventPublisher` đưa sự kiện từ thread của node sang thread riêng theo lô, qua một hàng đợi có giới hạn (sink chậm thì
+  node chờ, không phình bộ nhớ). `EventSink` là nơi nhận, ví dụ Kafka hay một bảng; `JsonLinesEventSink` là bản mẫu ghi
+  file JSON lines, fsync mỗi lô.
+- **Đúng một lần:** khởi động lại, node dựng lại sổ cái từ snapshot và log rồi sinh lại các sự kiện sau snapshot với đúng
+  vị trí cũ. Sink bỏ qua những gì nó đã có (so vị trí với sự kiện cuối cùng của nó), và dòng ghi dở bị cắt khi mở lại.
+  Snapshot chỉ được chụp khi mọi sự kiện trước nó đã nằm trong sink, nên không bao giờ có lỗ hổng.
+
+```bash
+# trên mọi node: -Dledger.learners=host4:9001 ; riêng learner thêm nơi phát sự kiện
+java -Dledger.learners=host4:9001 -Dledger.eventsFile=/data/events.jsonl ... com.namnv.ledger.LedgerNode \
+     host4:9001 host1:9001,host2:9001,host3:9001 /data/ledger
+```
+
+#### Cổng HTTP (`LedgerGateway`)
+
+Hệ thống thật gửi lệnh chuyển tiền qua HTTP/JSON (hoặc gRPC) tới một dịch vụ cổng, không nói giao thức của cụm. Cổng nhận
+request lẻ, đổi thành lệnh nhị phân gửi tới leader, và trả mã HTTP theo kết quả:
+
+```
+POST /transfers   {"debitAccountId":2,"creditAccountId":3,"amount":100,"ledger":840}   Idempotency-Key: order-8812
+POST /accounts    {"id":2,"ledger":840,"flags":1}
+GET  /accounts/{id}   GET /transfers/{id}   GET /totals   GET /stats
+```
+
+| Mã | Ý nghĩa |
+|---|---|
+| 201 | ghi mới |
+| 200 | đã có từ lần gửi trước (`EXISTS`): coi như thành công |
+| 409 | id / key đã dùng cho một giao dịch khác |
+| 422 | bị từ chối theo quy tắc của sổ: không đủ tiền, sai sổ, tài khoản không tồn tại... (body có `result`) |
+| 400 / 404 / 405 | request sai / không có / sai method |
+| 503 | không rõ kết quả (đổi leader, quá hạn, quá tải): gửi lại với cùng `Idempotency-Key` |
+
+- **Chống trùng:** id của giao dịch là `id` trong body, hoặc nếu không có thì là 63 bit đầu SHA-256 của `Idempotency-Key`.
+  Client gửi lại sau timeout hay 503 không bao giờ làm ghi hai lần: lần sau nhận 200. Cổng không cần lưu key ở đâu cả,
+  chính sổ cái là nơi chống trùng.
+- **Tự gom lô (`TransferBatcher`)**, kiểu Nagle không chờ theo thời gian: dưới `maxInflight` lô đang bay thì gửi ngay
+  (tải thấp: độ trễ như gửi lẻ); đủ rồi thì request mới xếp hàng và đi chung lô kế tiếp, ngay khi một lô trả lời (tải cao:
+  lô tự lớn, tới `maxBatch`). Mỗi giao dịch trong lô vẫn được kiểm tra và trả kết quả riêng.
+- `HttpServer` của JDK, mỗi request một virtual thread.
+
+```bash
+java -Dgateway.maxBatch=1000 -Dgateway.maxInflight=4 ... com.namnv.ledger.LedgerGateway 8080 host1:9001,host2:9001,host3:9001
+# -Dgateway.batch=false: không gom, mỗi request một lệnh Raft
+```
+
+`LedgerBenchmark` chạy 3 node thành 3 tiến trình, tạo 100.000 tài khoản khách hàng không được âm, nạp tiền cho từng tài
+khoản, rồi cho nhiều client chuyển tiền theo lô 100 giao dịch (kịch bản "hot": một nửa số giao dịch đi vào hoặc ra khỏi
+cùng một tài khoản). Cuối lượt nó kiểm tra trên cả ba node: tổng nợ bằng tổng có, ba bản sao giống hệt nhau, không khách
+hàng nào âm, tổng số dư khách hàng đúng bằng số đã nạp. Trên một máy (i5-13500, NVMe, có fsync, qua loopback):
+
+| Kịch bản | Giao dịch/giây | p50 / p99 / max của một lô |
+|---|---|---|
+| đều, 1 client | ~116.000 | 0,89 / 1,2 / 6 ms |
+| đều, 32 client | ~1.050.000 | 2,8 / 7,2 / 17 ms |
+| đều, 256 client | ~1.310.000 | 17 / 42 / 47 ms |
+| tài khoản nóng, 32 client | ~780.000 | 3,4 / 17 / 49 ms |
+| tài khoản nóng, 256 client | ~1.110.000 | 21 / 42 / 51 ms |
+
+Mỗi node chạy với heap 2 GB. Một lượt 30 giây ghi hơn 35 triệu giao dịch (khoảng 1,13 triệu mỗi giây) mà bộ nhớ không
+tăng theo; lịch sử trên đĩa khoảng 20 byte mỗi giao dịch nhờ nén.
+
+Để so sánh, Binance công bố sổ cái của họ đạt hơn 10.000 giao dịch/giây, đa số trong 10 ms, trên 4 máy AWS
+(M6i.4xlarge, ổ EBS gp3). Điều kiện khác hẳn: nhiều máy qua mạng thật, ổ đĩa mạng, nghiệp vụ đầy đủ; số ở đây là một máy.
+
+```bash
+mvn -q compile dependency:build-classpath -pl silkroad-raft-ledger -am -Dmdep.includeScope=runtime -Dmdep.outputFile=target/ledger-cp.txt
+java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.LedgerBenchmark
+```
+
+`GatewayBenchmark` đo cùng một cụm 3 node với mỗi request một giao dịch, theo ba cách: nhị phân (`LedgerClient.transfer`),
+HTTP qua cổng không gom, và HTTP qua cổng có gom. Cổng là tiến trình thứ tư, client tạo tải ở tiến trình thứ năm (mỗi client
+một kết nối keep-alive). Cột CPU là số core mà client / cổng / 3 node dùng. Có fsync:
+
+| Cách gửi | Client | Giao dịch/s | p50 / p99 / max | Lô TB | CPU client / cổng / node |
+|---|---|---|---|---|---|
+| nhị phân, từng lệnh | 1 | ~1.400 | 0,63 / 1,3 / 6 ms | 1 | 0,3 / – / 1,6 |
+| nhị phân, từng lệnh | 512 | ~133.000–247.000 | 1,8–3,0 / 6–24 / 37–117 ms | 1 | 1,3–2,0 / – / 1,3–1,8 |
+| HTTP, từng lệnh | 512 | ~124.000 | 3,6 / 13 / 43 ms | 1 | 1,9 / – / 2,3 |
+| HTTP, gom lô | 1 | ~1.490 | 0,60 / 1,1 / 8 ms | 1,0 | 0,1 / 0,4 / 0,9 |
+| HTTP, gom lô | 64 | ~33.500 | 1,7 / 3,1 / 8 ms | 11 | 0,8 / 2,0 / 1,1 |
+| HTTP, gom lô | 512 | ~165.000 | 3,0 / 6,1 / 22 ms | 74 | 2,6 / 6,6 / 1,3 |
+
+Không fsync (thấy rõ chi phí của riêng tầng HTTP):
+
+| Cách gửi | Client | Giao dịch/s | p50 / p99 / max |
+|---|---|---|---|
+| nhị phân, từng lệnh | 1 / 64 / 512 | ~35.700 / 293.000 / 389.000 | 0,02 / 0,19 / 1,1 ms (p50) |
+| HTTP, từng lệnh | 1 / 64 / 512 | ~13.000 / 122.000 / 119.000 | 0,07 / 0,46 / 3,5 ms (p50); p99 ở 512: 17 ms |
+| HTTP, gom lô | 1 / 64 / 512 | ~12.600 / 133.000 / 185.000 | 0,07 / 0,45 / 2,6 ms (p50); p99 ở 512: 6,4 ms |
+
+- Tải thấp: gom lô không thêm độ trễ (1 client, lô 1,0). Tải cao: lô tự lớn tới 50–75 giao dịch, và cụm chỉ còn dùng
+  khoảng 1,2 core thay vì 2–3. Số giao dịch/s và p99 thì không hơn rõ rệt (xem phép đo bằng wrk bên dưới): bản thân Raft đã
+  gom các lệnh đồng thời vào cùng một lần fsync và một lần gửi, nên lợi ích chính của gom lô ở cổng là ít entry hơn (ít CPU,
+  ít byte trên mạng, snapshot thưa hơn), không phải nhanh hơn trên một máy.
+- Trần của đường HTTP là chính cổng: `HttpServer` của JDK tốn khoảng 40 µs CPU mỗi request (6–7 core ở 165–185k/s). Một
+  máy chủ HTTP nhanh hơn (Netty, Vert.x...) hay nhiều cổng song song nâng được trần này; cụm Raft phía sau vẫn còn dư. Client
+  HTTP của JDK cũng tốn CPU tới mức tự giới hạn phép đo (~55k/s, 5–6 core), nên benchmark dùng một client HTTP/1.1 tối giản.
+- Ổ NVMe của máy đo đôi lúc có pha fsync chậm: các lượt có fsync dao động (như dòng nhị phân 512 client ở trên), nên so sánh
+  nên chạy vài lần.
+
+```bash
+java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.GatewayBenchmark
+# -Dgateway.clients=1,64,512 -Dgateway.modes=binary,http,http-batch -Dledger.logSync=false
+```
+
+Đo bằng [wrk](https://github.com/wg/wrk) (client C, gần như không tốn CPU so với cổng): `bench/wrk/run.sh` là một file
+làm hết: tìm wrk (không có thì tự build), build project, dựng cụm và hai cổng (`GatewayBenchmark -Dgateway.modes=serve`),
+chạy wrk với script Lua nhúng sẵn (mỗi request một `Idempotency-Key` mới) rồi in bảng. 4 thread wrk, mỗi lượt 5 giây, `-Dledger.snapshotInterval=2000000`:
+
+| Cổng | Kết nối | Có fsync: req/s | p50 / p99 | Không fsync: req/s | p50 / p99 |
+|---|---|---|---|---|---|
+| từng lệnh | 1 | ~1.610 | 0,55 / 1,0 ms | ~16.500 | 51 / 149 µs |
+| từng lệnh | 64 | ~43.400 | 1,5 / 2,3 ms | ~171.000 | 0,28 / 2,3 ms |
+| từng lệnh | 512 | ~170.000 | 2,5 / 8 ms | ~193.000 | 2,1 / 6,6 ms |
+| gom lô | 1 | ~1.620 | 0,55 / 1,0 ms | ~16.000 | 53 / 143 µs |
+| gom lô | 64 | ~32.800 | 1,8 / 3,1 ms | ~165.000 | 0,28 / 2,0 ms |
+| gom lô (TB 74 / lô) | 512 | ~127.000–168.000 | 2,6–2,8 / 8–15 ms | ~196.000 | 2,1 / 19 ms |
+
+- Qua HTTP, một giao dịch có fsync mất khoảng 0,55 ms đầu-cuối, gần như toàn bộ là fsync; tầng HTTP + JSON thêm khoảng
+  30–50 µs.
+- Cả hai cổng chạm cùng một trần khoảng 190k req/s không fsync: đó là `HttpServer` của JDK, không phải cụm Raft.
+- Snapshot đếm theo số entry: khi mỗi request là một entry, `snapshotInterval=100000` nghĩa là khoảng mỗi 100k giao dịch
+  lại chụp một lần (58 MB mỗi node, phần lớn là bloom filter cỡ `expectedTransfers`), đủ để đĩa bận và làm chậm fsync
+  của các lượt đo sau. Đặt khoảng snapshot theo lượng giao dịch thực tế mỗi entry.
+
+```bash
+bench/wrk/run.sh                       # 1 64 512 kết nối, có fsync
+FSYNC=false DURATION=5 bench/wrk/run.sh 64 512 2048
+# các biến khác ở đầu file: WRK, THREADS, WARMUP, MODES, MAX_BATCH, MAX_INFLIGHT, WRK_CPUS (taskset), KEEP
+```
+
 ## Kiến trúc
 
 ### Module
@@ -311,6 +500,7 @@ cần `silkroad-raft-cluster` cùng một transport.
 | `silkroad-raft-client` | `RaftClient` | transport |
 | `silkroad-raft-cluster` | đồng thuận: `RaftNode`, `RaftRuntime`, `NodeOptions`, state bền vững, timer, `StateMachine` | protocol, log, agent |
 | `silkroad-raft-kv` | `LmdbKvStateMachine`, `RocksDbKvStateMachine` | cluster |
+| `silkroad-raft-ledger` | dịch vụ sổ cái kép: `Ledger` (state machine), `LedgerClient`, `LedgerNode`, cổng HTTP `LedgerGateway`, dòng sự kiện `EventPublisher`, `LedgerBenchmark`, `GatewayBenchmark` | cluster, transport, client |
 | `silkroad-raft-samples` | `AppRaftInMem`, `AppRaftSocket` | cluster, transport |
 | `silkroad-raft-benchmarks` | `ClusterBenchmark`, `RaftBenchmark`, `BenchNode`, cluster tham chiếu dùng SOFAJRaft | tất cả |
 | `silkroad-raft-system-tests` | test đi qua mạng thật: cluster, transport và client cùng chạy | tất cả (test) |
