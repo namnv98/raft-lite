@@ -18,13 +18,18 @@ import java.util.List;
 public class AeronNode {
     static final int PORT_BASE = 19000;
     static final List<String> HOSTS = List.of("localhost", "localhost", "localhost");
+    // -Dbench.netemIps=true: đường nội bộ giữa các node ở 127.0.1.N, cổng cho client ở 127.0.2.N, để tc netem chỉ làm chậm
+    // đường giữa các node (xem bench/netem/netem.sh udp)
+    static final boolean NETEM_IPS = Boolean.getBoolean("bench.netemIps");
+    static final List<String> CLUSTER_HOSTS = NETEM_IPS ? List.of("127.0.1.1", "127.0.1.2", "127.0.1.3") : HOSTS;
+    static final List<String> INGRESS_HOSTS = NETEM_IPS ? List.of("127.0.2.1", "127.0.2.2", "127.0.2.3") : HOSTS;
 
     public static void main(String[] args) {
         int nodeId = Integer.parseInt(args[0]);
         File parentDir = new File(args[1]);
         int syncLevel = Integer.parseInt(args[2]);
 
-        ClusterConfig config = ClusterConfig.create(0, nodeId, HOSTS, HOSTS, PORT_BASE, parentDir, new EchoService());
+        ClusterConfig config = ClusterConfig.create(0, nodeId, INGRESS_HOSTS, CLUSTER_HOSTS, PORT_BASE, parentDir, new EchoService());
         config.errorHandler(Throwable::printStackTrace);
         config.mediaDriverContext().dirDeleteOnStart(true).dirDeleteOnShutdown(true);
         config.archiveContext().deleteArchiveOnStart(true).fileSyncLevel(syncLevel).catalogFileSyncLevel(syncLevel);

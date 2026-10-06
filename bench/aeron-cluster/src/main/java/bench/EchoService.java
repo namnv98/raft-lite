@@ -10,7 +10,7 @@ import io.aeron.logbuffer.Header;
 import org.agrona.DirectBuffer;
 
 /**
- * State machine tương đương CountingMachine của Raft Lite: đếm số lệnh, và xác nhận mỗi lệnh bằng 8 byte đầu của nó
+ * State machine tương đương CountingMachine của Silk Road Raft: đếm số lệnh, và xác nhận mỗi lệnh bằng 8 byte đầu của nó
  * (dấu thời gian mà client đã ghi vào).
  */
 public class EchoService implements ClusteredService {

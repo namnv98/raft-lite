@@ -1,6 +1,6 @@
-# Raft Lite
+# Silk Road Raft
 
-Raft Lite là một cài đặt gọn của thuật toán đồng thuận Raft bằng Java, viết để học và thử nghiệm.
+Silk Road Raft là một cài đặt gọn của thuật toán đồng thuận Raft bằng Java, viết để học và thử nghiệm.
 Nó nhân bản một log lệnh qua nhiều node, áp dụng log đó lên state machine của bạn theo cùng một thứ tự trên mọi node,
 và giữ được dữ liệu khi node chết, mất điện hay mạng bị chia cắt.
 
@@ -41,14 +41,17 @@ và giữ được dữ liệu khi node chết, mất điện hay mạng bị ch
 Yêu cầu: JDK 21 trở lên và Maven.
 
 ```bash
-mvn test                                  # toàn bộ test, khoảng 50 giây
-mvn compile
+mvn test                                  # toàn bộ test của mọi module, khoảng 1 phút
+
+# classpath của module demo (gồm các module nó phụ thuộc, lấy thẳng từ thư mục target/classes của chúng)
+mvn -q compile dependency:build-classpath -pl silkroad-raft-samples -am -Dmdep.includeScope=runtime -Dmdep.outputFile=target/samples-cp.txt
+CP="silkroad-raft-samples/target/classes:$(cat target/samples-cp.txt)"
 
 # demo 3 node trong một tiến trình: ghi lệnh, cô lập leader, nối lại, thêm node D, snapshot
-java -cp "target/classes:$(mvn -q dependency:build-classpath -Dmdep.outputFile=/dev/stdout)" com.namnv.AppRaftInMem
+java -cp "$CP" com.namnv.samples.AppRaftInMem
 
 # demo tương tự qua socket trên localhost:8080-8083
-java -cp "target/classes:$(mvn -q dependency:build-classpath -Dmdep.outputFile=/dev/stdout)" com.namnv.AppRaftSocket
+java -cp "$CP" com.namnv.samples.AppRaftSocket
 ```
 
 Cả hai demo xoá thư mục `data/` ở thư mục hiện tại khi khởi động, rồi chạy tới khi bạn tắt.
@@ -106,6 +109,24 @@ node không phải leader, mất quyền giữa chừng, quá `clientTimeoutMs` 
 Với bản có `clientId`, cách xử lý đúng khi nhận `false` là gửi lại y nguyên `(clientId, sequence)` tới leader hiện tại
 cho tới khi nhận `true`; lệnh được apply nhiều nhất một lần dù gửi bao nhiêu lần. Client có thể gửi nhiều lệnh cùng lúc
 mà không cần chờ lệnh trước, miễn là không bỏ sót sequence nào.
+
+**Ghi theo lô.** Khi client có sẵn nhiều lệnh, gom chúng vào một lô: cả lô đi trong một request và nằm trong **một** entry
+của log, được commit và apply cùng nhau (lần lượt từng lệnh qua `onApply`, chung index), và được chống ghi trùng như một
+lệnh theo `(clientId, sequence)`. Chi phí của Raft cho mỗi entry được chia cho mọi lệnh trong lô:
+
+```java
+node.appendClientBatch("client-7", 2, List.of(cmd1, cmd2, cmd3));   // trên node
+raftClient.writeBatch(List.of(cmd1, cmd2, cmd3));                   // qua mạng
+```
+
+Đo với `ClusterBenchmark -Dbench.batch=N` (lệnh 128 byte, TPS tính theo số lệnh):
+
+| | 1 lệnh mỗi lần | lô 10 | lô 100 |
+|---|---|---|---|
+| có fsync, 1 client | ~1.570 TPS | ~15.100 | ~128.000 (p50 0,8 ms) |
+| có fsync, 32 client | ~24.000 | ~240.000 | ~734.000 |
+| có fsync, 512 client | ~212.000 | ~1.130.000 | ~1.780.000 (p50 29 ms) |
+| không fsync, 32 client | ~218.000 | ~1.600.000 | ~3.230.000 |
 
 ### Đọc nhất quán
 
@@ -184,7 +205,7 @@ RaftMetrics m = node.metrics();
 // m.commandsRejected(), m.duplicateCommands(), m.readsServed(), m.snapshotsCreated(), m.snapshotsInstalled()
 ```
 
-Các bộ đếm tính từ lúc node khởi động. Raft Lite không tự xuất metrics ra hệ thống nào; bạn đọc và đẩy đi theo cách của mình.
+Các bộ đếm tính từ lúc node khởi động. Silk Road Raft không tự xuất metrics ra hệ thống nào; bạn đọc và đẩy đi theo cách của mình.
 
 ### Tắt node
 
@@ -204,6 +225,7 @@ node.shutdown();
 | `electionTimeoutMinMs`, `electionTimeoutMaxMs` | bắt buộc | Follower không nghe leader trong một khoảng ngẫu nhiên giữa hai giá trị này thì bắt đầu bầu cử. Leader mất liên lạc với đa số quá giá trị max thì step-down |
 | `heartbeatIntervalMs` | bắt buộc | Nhịp leader gửi heartbeat; nên nhỏ hơn nhiều so với election timeout |
 | `clientTimeoutMs` | `5000` | Một lệnh hoặc một lần đọc chờ tối đa bao lâu trước khi nhận kết quả "không rõ" |
+| `maxInflightAppends` | `32` | Số AppendEntries gửi liên tiếp cho một follower mà chưa có câu trả lời (xem [Pipelining](#pipelining)). `1` = tắt |
 | `maxPendingCommands` | `100000` | Leader từ chối lệnh mới khi số lệnh đang chờ commit vượt mức này |
 | `maxEntriesPerRequest` | `1024` | Số entry tối đa trong một AppendEntries |
 | `snapshotIntervalEntries` | `0` (tắt) | Tự tạo snapshot khi số entry đã apply mà chưa compact đạt mức này |
@@ -274,6 +296,29 @@ byte[] value = KvCommands.value(client.read(KvCommands.get(key)).get());
 
 ## Kiến trúc
 
+### Module
+
+Dự án chia thành các module Maven theo tầng, kiểu Aeron (`aeron-client`, `aeron-driver`, `aeron-cluster`...).
+Phụ thuộc chỉ đi xuống, nên ứng dụng chỉ kéo về đúng phần mình dùng: một client chỉ cần `silkroad-raft-client`, một node
+cần `silkroad-raft-cluster` cùng một transport.
+
+| Module | Nội dung | Phụ thuộc |
+|---|---|---|
+| `silkroad-raft-agent` | `AgentLoop` (vòng làm việc kiểu agent), `Utf8Cache` | — |
+| `silkroad-raft-log` | `LogEntry`, `ConfigurationEntry`, `CommandBatch`, log nhị phân (`BinaryLogStorage`, `LogOptions`), `SnapshotStore`, snapshot reader/writer | agent |
+| `silkroad-raft-protocol` | request/response, `RpcCodec`, các interface `RaftServerService`, `ClientService`, `RpcProcessor`, `MessageTransport` | log |
+| `silkroad-raft-transport` | `SocketRpcClient`/`SocketRpcServer`, `NioRpcClient`/`NioRpcServer`, `InMemoryRpcClient`, TLS | protocol, agent |
+| `silkroad-raft-client` | `RaftClient` | transport |
+| `silkroad-raft-cluster` | đồng thuận: `RaftNode`, `RaftRuntime`, `NodeOptions`, state bền vững, timer, `StateMachine` | protocol, log, agent |
+| `silkroad-raft-kv` | `LmdbKvStateMachine`, `RocksDbKvStateMachine` | cluster |
+| `silkroad-raft-samples` | `AppRaftInMem`, `AppRaftSocket` | cluster, transport |
+| `silkroad-raft-benchmarks` | `ClusterBenchmark`, `RaftBenchmark`, `BenchNode`, cluster tham chiếu dùng SOFAJRaft | tất cả |
+| `silkroad-raft-system-tests` | test đi qua mạng thật: cluster, transport và client cùng chạy | tất cả (test) |
+
+Thư viện chỉ phụ thuộc `slf4j-api`; ứng dụng tự chọn backend log (demo và benchmark dùng Log4j2).
+
+### Package
+
 ```
 com.namnv
 ├── agent
@@ -295,22 +340,24 @@ com.namnv
 │   ├── VolatileState       commitIndex, lastApplied
 │   └── LeaderState         nextIndex/matchIndex và các sổ theo dõi khác của leader
 ├── storage
-│   ├── binary              BinaryLogStorage: log nhị phân, ghi theo khối (kiểu Aeron Archive)
+│   ├── binary              BinaryLogStorage, LogOptions: log nhị phân, ghi theo khối (kiểu Aeron Archive)
 │   ├── SnapshotStore       thư mục snapshot, lưu atomic
 │   ├── Checksum, FileUtil  CRC32, ghi file atomic, fsync thư mục
 │   └── DiskFaultInjector   điểm chèn lỗi đĩa cho test
 ├── statemachine            interface StateMachine, SnapshotReader/Writer/Meta
 ├── timer                   ElectionTimer, HeartbeatTimer
-├── rpc
-│   ├── RaftServerService   các RPC một node phải xử lý
-│   ├── RpcCodec            khung và mã hoá nhị phân của transport TCP
-│   ├── TlsContexts         tạo SSLContext từ keystore
-│   ├── client              RpcProcessor, InMemoryRpcClient, SocketRpcClient
-│   ├── server              SocketRpcServer
-│   ├── nio                 NioRpcClient, NioRpcServer: transport chạy trên vòng của node
+├── rpc                     (silkroad-raft-protocol)
+│   ├── RaftServerService   các RPC một node phải xử lý; ClientService cho client bên ngoài
+│   ├── RpcProcessor        phía gửi RPC của node; MessageTransport cho client
+│   ├── RpcCodec            khung và mã hoá nhị phân
 │   └── model               request/response của từng RPC
+├── transport               (silkroad-raft-transport) SocketRpcClient, SocketRpcServer, InMemoryRpcClient, TlsContexts
+│   └── nio                 NioRpcClient, NioRpcServer: transport chạy trên vòng của node
+├── client                  (silkroad-raft-client) RaftClient
+├── kv                      (silkroad-raft-kv) kho KV trên LMDB, RocksDB
+├── util                    Utf8Cache
 ├── ListStateMachine        state machine mẫu: danh sách các lệnh đã apply
-└── AppRaftInMem, AppRaftSocket   hai demo
+└── samples                 (silkroad-raft-samples) AppRaftInMem, AppRaftSocket
 ```
 
 ### Luồng xử lý: một thread cho mỗi node
@@ -338,6 +385,26 @@ Kết quả trả cho người gọi nằm ngoài lock: future của `appendClie
 lần lượt theo thứ tự commit. Callback gắn vào future vì thế gọi ngược vào node được, nhưng một callback chậm
 vẫn làm kết quả của các lệnh sau nó đến trễ. Vì lệnh được ghi vào log trên thread của node, `appendClientCommand` trả về
 trước khi entry nằm trong log.
+
+### Cấp phát trên đường nóng
+
+Những gì được tạo ra cho mỗi lệnh đều sẽ thành việc của GC, nên đường đi của một lệnh tránh tạo object khi không cần:
+
+- Leader gửi cho follower đúng các khung mà log đã dựng lúc append (`LogStorage.Block`), ghi thẳng từng khung ra
+  socket, không nối chúng thành một mảng mới cho mỗi lần gửi.
+- Bộ đệm của kết nối NIO là direct buffer: socket đọc và ghi thẳng vào đó. Với heap buffer, JDK ngầm chép mọi byte
+  qua một direct buffer tạm ở mỗi lần đọc/ghi.
+- Transport NIO mã hoá message thẳng vào bộ đệm ghi của kết nối và giải mã ngay trong bộ đệm đọc
+  (`RpcCodec.encodeBody`, `RpcCodec.decode(ByteBuffer, int)`), không qua stream hay mảng trung gian.
+- Follower đọc các entry tại chỗ trong khung AppendEntries, và ghi vào log đúng khung leader gửi thay vì mã hoá lại.
+- `EntryFrame` ghi và đọc theo vị trí tuyệt đối; CRC32 dùng lại theo thread.
+- clientId và id của node được giữ dạng UTF-8 trong một bảng nhỏ theo thread (`Utf8Cache`).
+
+Đo với `ClusterBenchmark` (512 client, không fsync), so với trước các thay đổi này: 530.000–554.000 → 618.000–622.000 TPS,
+p99 1,8–2,0 → 1,55 ms, số lần GC thế hệ trẻ trên ba node 55–59 → 39, tổng thời gian dừng 155–172 → 106–109 ms.
+Mỗi lần dừng vẫn khoảng 2,5–3 ms: thời gian đó phụ thuộc lượng object còn sống (~20 MB), không phụ thuộc lượng rác.
+Phần còn được cấp phát cho mỗi lệnh chủ yếu là thứ API cần giữ: mảng lệnh, khung của entry trong log, `LogEntry` và
+future trả về cho người gọi.
 
 ### `RaftRuntime`
 
@@ -378,6 +445,41 @@ Election timer luôn được hẹn lại, nên một vòng bầu cử thất b�
   ngoài lock, rồi mới gửi; các lệnh mới không phải chờ lần đọc đó.
 - Phần follower cần đã bị compact thì leader gửi snapshot thay cho entry.
 - Khi số lệnh chờ commit vượt `maxPendingCommands`, leader từ chối lệnh mới thay vì để hàng chờ lớn mãi.
+
+### Pipelining
+
+Leader theo dõi từng follower theo hai trạng thái, như `Progress` của etcd/raft:
+
+- **Dò:** chưa biết log của follower khớp tới đâu (vừa lên làm leader, follower vừa từ chối, một request bị mất).
+  Mỗi lúc một AppendEntries; `nextIndex` chỉ đổi khi có câu trả lời.
+- **Pipeline:** lần gửi trước đã khớp. Leader gửi liên tiếp tới `maxInflightAppends` (mặc định 32) request mà không chờ,
+  đẩy `nextIndex` lên ngay khi gửi. Transport giữ thứ tự trên một kết nối, nên follower nhận đúng thứ tự gửi.
+
+Follower từ chối, hoặc một request bị mất hay hết hạn, thì leader quay về dò từ phần đã chắc chắn (`matchIndex + 1`).
+Response của các request gửi trước đó vẫn cập nhật được `matchIndex` (một lần ack thành công luôn đúng), nhưng không còn
+được tính là request đang bay. `matchIndex` chỉ tăng khi follower trả lời, không bao giờ tăng lúc gửi.
+
+Đo với độ trễ mạng thật ở tầng kernel giữa các node (`tc netem`, xem `bench/netem/netem.sh`), có fsync, lệnh 128 byte:
+
+| RTT giữa các node | Client | 1 request mỗi lần | Pipelining (32) | Pipelining + lô 100 lệnh |
+|---|---|---|---|---|
+| 0,27 ms | 512 | 225.000 TPS, p50 1,8 ms | 230.000, p50 1,9 ms | — |
+| 0,27 ms | 32 | 24.900, p50 1,3 ms | 22.800, p50 1,1 ms | 785.000, p50 3,8 ms |
+| 1,07 ms | 32 | 12.900, p50 2,3 ms | 14.400, p50 2,1 ms | 797.000, p50 3,8 ms |
+| 1,07 ms | 512 | 161.000, p50 3,0 ms | 199.000, p50 2,4 ms | 1.780.000, p50 31 ms |
+| 10,2 ms | 32 | 1.900, p50 16,5 ms | 3.000, p50 10,7 ms | 140.000 |
+| 10,2 ms | 512 | 29.000, p50 17,5 ms | 45.700, p50 11 ms | 808.000 |
+| 10,2 ms | 4096 | 86.000, p50 47 ms | 113.000, p50 14 ms | 172.000 |
+
+Khi RTT nhỏ hơn thời gian fsync, đĩa là giới hạn và pipelining không đổi được gì. RTT càng lớn thì pipelining càng có ích:
+mỗi lệnh chờ khoảng một RTT thay vì gần hai. Ở RTT 10 ms và tải rất nặng (hàng nghìn client, hoặc lô lớn) độ trễ đuôi
+lên tới hàng trăm mili giây đến hơn một giây và dao động mạnh giữa các lần đo: cửa sổ hiện đếm theo số request, chưa đếm
+theo số byte, nên một follower có thể bị dồn hàng chục MB trên một kết nối (TCP báo cửa sổ nhận bằng 0).
+
+Không có quyền root thì có thể giả lập độ trễ trong Java bằng `-Dbench.peerRttMicros` (truyền cho node qua
+`-Dbench.nodeArgs`); `-Dbench.maxInflight=1` tắt pipelining. Trên loopback (gần như không có độ trễ) pipelining làm trần
+thấp hơn chừng 5-10% vì leader gửi nhiều request nhỏ hơn; khi các node cùng một máy hoặc một rack thì có thể đặt
+`maxInflightAppends = 1`.
 
 ### Các quy tắc về độ bền
 
@@ -538,7 +640,14 @@ và một entry bị đổi có thể khiến các node áp dụng những lện
 - **Bộ nhớ:** chỉ `logCacheEntries` entry mới nhất của log nằm trong RAM; phần còn lại nằm trên đĩa cho tới khi snapshot compact nó. Đặt `snapshotIntervalEntries` để log trên đĩa không lớn mãi.
 - **Định dạng đĩa và định dạng RPC** đã đổi nhiều lần trong quá trình phát triển và không có cơ chế nâng cấp:
   dữ liệu của bản cũ không đọc lại được, và các node phải chạy cùng một bản.
-- **Log** dùng Log4j2; cấu hình ở `src/main/resources/log4j2.xml`.
+- **Log** đi qua SLF4J; demo dùng Log4j2 với cấu hình ở `silkroad-raft-samples/src/main/resources/log4j2.xml`.
+- **JVM:** đặt heap cố định (`-Xms` bằng `-Xmx`, ví dụ 2 GB) và `-XX:+AlwaysPreTouch`. Với G1, cách này giảm số lần GC
+  khoảng 3,5 lần và lần dừng lâu nhất từ ~10 ms xuống ~4 ms so với để JVM tự chọn kích thước heap. ZGC gần như không dừng
+  (dưới 0,03 ms) và cho throughput ngang G1, nhưng nó dọn rác song song nên cần CPU rảnh: trên máy bị giới hạn CPU, độ trễ
+  đuôi dao động mạnh hơn hẳn (đã đo tới hàng trăm mili giây).
+- **CPU:** trên CPU có lõi hiệu năng và lõi tiết kiệm (Intel thế hệ 12 trở đi), thread của node có thể bị xếp lên lõi chậm.
+  Gắn tiến trình node vào các lõi hiệu năng (`taskset -c ...`) tăng throughput khoảng 15% (512 client, không fsync:
+  ~600.000 → ~700.000 TPS, p99 1,5 → 1,24 ms).
 
 ## Transport
 
@@ -599,18 +708,20 @@ Một lời gọi thất bại chỉ cần làm future hoàn tất với excepti
 
 ```bash
 mvn test                                                    # tất cả
+mvn test -pl silkroad-raft-cluster -am                          # một module (cùng các module nó cần)
 
 # mô phỏng tất định: nhiều seed hơn, hoặc chạy lại đúng một seed
-mvn test -Dtest=RaftSimulationTest -Dsim.runs=500
-mvn test -Dtest=RaftSimulationTest -Dsim.seed=123456
+ONE="-pl silkroad-raft-cluster -am -Dsurefire.failIfNoSpecifiedTests=false"
+mvn test $ONE -Dtest=RaftSimulationTest -Dsim.runs=500
+mvn test $ONE -Dtest=RaftSimulationTest -Dsim.seed=123456
 
 # fault injection chạy thread thật, lâu hơn
-mvn test -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
+mvn test $ONE -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 ```
 
 | Bộ test | Kiểm tra gì |
 |---|---|
-| `RaftSimulationTest` | Cả cluster, mạng, đĩa, client và nemesis chạy trên một thread với thời gian ảo. Một seed luôn cho đúng một lịch sử, nên lỗi tìm ra thì chạy lại được y hệt. Có lượt 5 node, 7 node và một lượt dài nửa giờ ảo |
+| `RaftSimulationTest` | Cả cluster, mạng, đĩa, client và nemesis chạy trên một thread với thời gian ảo. AppendEntries đi qua mã hoá nhị phân như trên mạng thật. Một seed luôn cho đúng một lịch sử, nên lỗi tìm ra thì chạy lại được y hệt. Có lượt 5 node, 7 node và một lượt dài nửa giờ ảo |
 | `RaftChaosTest` | Cùng kịch bản nhưng với thread và đồng hồ thật, để bắt lỗi tranh chấp giữa các thread. Seed ở đây không tái hiện chắc chắn |
 | `RaftClusterTest` | Test tất định cho từng hành vi và từng quy tắc an toàn, trên cluster in-memory |
 | `LmdbKvStateMachineTest`, `RocksDbKvStateMachineTest` | Cùng một bộ test cho mỗi kho KV: đọc thấy lệnh chưa vào LMDB, xoá, snapshot đúng thời điểm khi còn lô chưa ghi, nạp snapshot thay state cũ; cluster 3 node qua mạng, một follower tắt lâu rồi bật lại và nhận snapshot từ leader |
@@ -649,10 +760,11 @@ Những lỗi mà mô phỏng ngẫu nhiên khó chạm tới đều có test t�
 
 ## Đo hiệu năng
 
-Hai chương trình trong `src/test/java/com/namnv/bench` (không phải test, chạy bằng tay sau `mvn -q test-compile`):
+Các chương trình trong module `silkroad-raft-benchmarks` (chạy bằng tay):
 
 ```bash
-CP="target/test-classes:target/classes:$(mvn -q dependency:build-classpath -Dmdep.includeScope=test -Dmdep.outputFile=/dev/stdout)"
+mvn -q compile dependency:build-classpath -pl silkroad-raft-benchmarks -am -Dmdep.includeScope=runtime -Dmdep.outputFile=target/bench-cp.txt
+CP="silkroad-raft-benchmarks/target/classes:$(cat target/bench-cp.txt)"
 
 # 3 node là 3 tiến trình riêng, client ở tiến trình thứ tư, mọi thứ đi qua TCP
 java -cp "$CP" com.namnv.bench.ClusterBenchmark
@@ -667,6 +779,12 @@ java -Dbench.transport=socket -cp "$CP" com.namnv.bench.ClusterBenchmark
 # -Dbench.kvSync=false: kho không fsync mỗi lô (RocksDB: tắt WAL) trong khi Raft log vẫn fsync
 java -Dbench.kv=lmdb -cp "$CP" com.namnv.bench.ClusterBenchmark
 java -Dbench.kv=rocksdb -cp "$CP" com.namnv.bench.ClusterBenchmark
+# ghi theo lô: mỗi lần ghi là một lô 100 lệnh (TPS tính theo số lệnh)
+java -Dbench.batch=100 -cp "$CP" com.namnv.bench.ClusterBenchmark
+# độ trễ mạng thật giữa các node (cần sudo): mỗi node một địa chỉ 127.0.1.N, tc netem làm chậm riêng đường giữa chúng
+bench/netem/netem.sh on 500us
+java -Dbench.nodeIps=true -cp "$CP" com.namnv.bench.ClusterBenchmark
+bench/netem/netem.sh off
 java -Draft.agent.idle=busy -Dbench.nodeArgs=-Draft.agent.idle=busy -cp "$CP" com.namnv.bench.ClusterBenchmark
 
 # Aeron Cluster theo cùng kịch bản, để so sánh: project riêng trong bench/aeron-cluster (xem README trong đó)

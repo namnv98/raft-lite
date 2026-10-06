@@ -1,6 +1,5 @@
 # Default ignored files
 /.idea/
-/target/
+target/
 /data/
 /logs/
-/bench/*/target/

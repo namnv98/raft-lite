@@ -5,126 +5,123 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.namnv</groupId>
-    <artifactId>raft-lite</artifactId>
+    <artifactId>silkroad-raft-parent</artifactId>
     <version>1.0.0</version>
+    <packaging>pom</packaging>
+
+    <!--
+        Mỗi module một tầng, phụ thuộc chỉ đi xuống (giống cách Aeron chia aeron-client / aeron-driver / aeron-cluster):
+
+        silkroad-raft-agent        vòng làm việc kiểu agent, tiện ích không phụ thuộc gì
+        silkroad-raft-log          entry, log nhị phân, snapshot store                  -> agent
+        silkroad-raft-protocol     message, RpcCodec, các interface dịch vụ             -> log
+        silkroad-raft-transport    TCP (socket, NIO), in-memory, TLS                    -> protocol, agent
+        silkroad-raft-client       RaftClient cho ứng dụng                              -> transport
+        silkroad-raft-cluster      đồng thuận Raft: RaftNode, runtime, state machine    -> protocol, log, agent
+        silkroad-raft-kv           kho KV trên LMDB / RocksDB                           -> cluster
+        silkroad-raft-samples      các demo                                             -> cluster, transport
+        silkroad-raft-benchmarks   đo hiệu năng                                         -> tất cả
+        silkroad-raft-system-tests test đi qua mạng thật: cluster + transport + client
+    -->
+    <modules>
+        <module>silkroad-raft-agent</module>
+        <module>silkroad-raft-log</module>
+        <module>silkroad-raft-protocol</module>
+        <module>silkroad-raft-transport</module>
+        <module>silkroad-raft-client</module>
+        <module>silkroad-raft-cluster</module>
+        <module>silkroad-raft-kv</module>
+        <module>silkroad-raft-samples</module>
+        <module>silkroad-raft-benchmarks</module>
+        <module>silkroad-raft-system-tests</module>
+    </modules>
 
     <properties>
         <java.version>21</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <lombok.version>1.18.42</lombok.version>
+        <slf4j.version>2.0.12</slf4j.version>
+        <log4j.version>2.23.1</log4j.version>
+        <junit.version>5.12.2</junit.version>
     </properties>
 
+    <dependencyManagement>
+        <dependencies>
+            <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-agent</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-log</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-protocol</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-transport</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-client</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-cluster</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-kv</artifactId><version>${project.version}</version></dependency>
+
+            <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-slf4j2-impl</artifactId><version>${log4j.version}</version></dependency>
+            <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId><version>${log4j.version}</version></dependency>
+            <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId><version>2.16.2</version></dependency>
+            <dependency><groupId>commons-io</groupId><artifactId>commons-io</artifactId><version>2.17.0</version></dependency>
+            <!-- kho KV: LMDB cùng thiết kế B+tree trên mmap với bbolt của etcd; RocksDB là LSM-tree -->
+            <dependency><groupId>org.lmdbjava</groupId><artifactId>lmdbjava</artifactId><version>0.9.3</version></dependency>
+            <dependency><groupId>org.rocksdb</groupId><artifactId>rocksdbjni</artifactId><version>11.1.1</version></dependency>
+            <!-- cluster tham chiếu trong benchmarks -->
+            <dependency><groupId>com.alipay.sofa</groupId><artifactId>jraft-core</artifactId><version>1.4.0</version></dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <!-- mọi module: log qua SLF4J (Lombok @Slf4j); log4j chỉ có lúc chạy test, ứng dụng tự chọn backend -->
     <dependencies>
-
-
-
-        <!-- SLF4J API -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
-            <version>2.0.12</version>
+            <version>${slf4j.version}</version>
         </dependency>
-
-        <!-- SLF4J → Log4j2 Bridge -->
-        <dependency>
-            <groupId>org.apache.logging.log4j</groupId>
-            <artifactId>log4j-slf4j2-impl</artifactId>
-            <version>2.23.1</version>
-        </dependency>
-
-        <!-- Log4j2 Core -->
-        <dependency>
-            <groupId>org.apache.logging.log4j</groupId>
-            <artifactId>log4j-core</artifactId>
-            <version>2.23.1</version>
-        </dependency>
-
-        <!-- Optional: log4j-layout (đẹp hơn) -->
-        <dependency>
-            <groupId>org.apache.logging.log4j</groupId>
-            <artifactId>log4j-layout-template-json</artifactId>
-            <version>2.23.1</version>
-        </dependency>
-
-
-        <!-- jraft -->
-        <dependency>
-            <groupId>com.alipay.sofa</groupId>
-            <artifactId>jraft-core</artifactId>
-            <version>1.4.0</version>
-            <scope>test</scope>
-        </dependency>
-
-        <!-- Jackson -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>2.16.2</version>
-        </dependency>
-
-        <!-- Commons IO -->
-        <dependency>
-            <groupId>commons-io</groupId>
-            <artifactId>commons-io</artifactId>
-            <version>2.17.0</version>
-        </dependency>
-        <!-- kho KV mẫu (com.namnv.kv): LMDB, cùng thiết kế B+tree trên mmap với bbolt của etcd. Không bắt buộc -->
-        <dependency>
-            <groupId>org.lmdbjava</groupId>
-            <artifactId>lmdbjava</artifactId>
-            <version>0.9.3</version>
-            <optional>true</optional>
-        </dependency>
-        <!-- kho KV mẫu trên RocksDB (LSM-tree). Không bắt buộc -->
-        <dependency>
-            <groupId>org.rocksdb</groupId>
-            <artifactId>rocksdbjni</artifactId>
-            <version>11.1.1</version>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- Lombok -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <version>${lombok.version}</version>
             <scope>provided</scope>
         </dependency>
-
-        <!-- JUnit -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
-            <version>5.12.2</version>
+            <version>${junit.version}</version>
             <scope>test</scope>
         </dependency>
-
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-slf4j2-impl</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
-        <plugins>
-            <!-- Compiler -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
-                <configuration>
-                    <release>${java.version}</release>
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                            <version>${lombok.version}</version>
-                        </path>
-                    </annotationProcessorPaths>
-                </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.2.5</version>
-            </plugin>
-        </plugins>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.11.0</version>
+                    <configuration>
+                        <release>${java.version}</release>
+                        <annotationProcessorPaths>
+                            <path>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok</artifactId>
+                                <version>${lombok.version}</version>
+                            </path>
+                        </annotationProcessorPaths>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.2.5</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
     </build>
-
 </project>

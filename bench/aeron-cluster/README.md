@@ -1,9 +1,9 @@
 # Đo Aeron Cluster trên cùng máy
 
-Project Maven riêng (không thuộc build của Raft Lite) để chạy Aeron Cluster theo đúng kịch bản của
+Project Maven riêng (không thuộc build của Silk Road Raft) để chạy Aeron Cluster theo đúng kịch bản của
 `com.namnv.bench.ClusterBenchmark`: 3 node là 3 tiến trình trên máy này, tiến trình thứ tư là client, mọi thứ đi qua
 mạng loopback (UDP với Aeron). State machine (`EchoService`) chỉ đếm số lệnh và xác nhận từng lệnh, tương đương
-`CountingMachine` của Raft Lite.
+`CountingMachine` của Silk Road Raft.
 
 - `AeronNode`: một node = media driver + archive + consensus module + service container, dựng bằng `ClusterConfig`
   của `aeron-samples`.

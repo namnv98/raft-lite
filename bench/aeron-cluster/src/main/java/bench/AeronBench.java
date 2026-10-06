@@ -20,9 +20,9 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Cùng kịch bản với ClusterBenchmark của Raft Lite, nhưng trên Aeron Cluster: 3 node là 3 tiến trình trên máy này,
+ * Cùng kịch bản với ClusterBenchmark của Silk Road Raft, nhưng trên Aeron Cluster: 3 node là 3 tiến trình trên máy này,
  * tiến trình này là client. "N client đồng thời" ở đây là N lệnh đang chờ xác nhận cùng lúc trên một phiên client,
- * mỗi lệnh được gửi tiếp ngay khi lệnh trước của nó được xác nhận (vòng kín), như bên Raft Lite.
+ * mỗi lệnh được gửi tiếp ngay khi lệnh trước của nó được xác nhận (vòng kín), như bên Silk Road Raft.
  * Tham số: thư mục dữ liệu | mức fsync. -Dbench.seconds=5, -Dbench.payloads=128,4096, -Dbench.clients=1,32,512.
  */
 public class AeronBench implements EgressListener {
@@ -59,6 +59,7 @@ public class AeronBench implements EgressListener {
                     "--add-opens", "java.base/java.util.zip=ALL-UNNAMED",
                     "-Xlog:gc:file=" + dataDir.resolve("gc" + i + ".log")));
             command.add("-Dbench.tuned=" + Boolean.getBoolean("bench.tuned"));
+            command.add("-Dbench.netemIps=" + AeronNode.NETEM_IPS);
             var extra = System.getProperty("bench.nodeArgs", "").trim();
             if (!extra.isEmpty()) {
                 command.addAll(List.of(extra.split("\\s+")));
@@ -118,11 +119,12 @@ public class AeronBench implements EgressListener {
             try {
                 return AeronCluster.connect(new AeronCluster.Context()
                         .egressListener(listener)
-                        .egressChannel("aeron:udp?endpoint=localhost:0")
+                        // client gửi và nhận từ 127.0.3.1 khi đo với netem, để không bị làm chậm như đường giữa các node
+                        .egressChannel("aeron:udp?endpoint=" + (AeronNode.NETEM_IPS ? "127.0.3.1" : "localhost") + ":0")
                         .aeronDirectoryName(driver.aeronDirectoryName())
-                        .ingressChannel("aeron:udp")
+                        .ingressChannel(AeronNode.NETEM_IPS ? "aeron:udp?interface=127.0.3.1" : "aeron:udp")
                         .ingressEndpoints(ClusterConfig.ingressEndpoints(
-                                AeronNode.HOSTS, AeronNode.PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET)));
+                                AeronNode.INGRESS_HOSTS, AeronNode.PORT_BASE, ClusterConfig.CLIENT_FACING_PORT_OFFSET)));
             } catch (RuntimeException e) {
                 if (System.nanoTime() > deadline) {
                     throw e;

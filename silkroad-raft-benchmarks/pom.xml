@@ -1,0 +1,38 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.namnv</groupId>
+        <artifactId>silkroad-raft-parent</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>silkroad-raft-benchmarks</artifactId>
+    <description>Đo hiệu năng: ClusterBenchmark, RaftBenchmark và cluster tham chiếu.</description>
+
+    <dependencies>
+        <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-cluster</artifactId></dependency>
+        <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-transport</artifactId></dependency>
+        <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-client</artifactId></dependency>
+        <dependency><groupId>com.namnv</groupId><artifactId>silkroad-raft-kv</artifactId></dependency>
+        <dependency><groupId>com.alipay.sofa</groupId><artifactId>jraft-core</artifactId></dependency>
+        <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-slf4j2-impl</artifactId></dependency>
+        <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId></dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
