@@ -1,5 +1,15 @@
-package com.namnv.ledger;
+package com.namnv.ledger.node;
 
+import com.namnv.ledger.client.LedgerClient;
+import com.namnv.ledger.event.EventPublisher;
+import com.namnv.ledger.event.JsonLinesEventSink;
+import com.namnv.ledger.event.LedgerEvent;
+import com.namnv.ledger.model.LedgerAccount;
+import com.namnv.ledger.model.LedgerBalance;
+import com.namnv.ledger.model.LedgerResult;
+import com.namnv.ledger.model.LedgerTotals;
+import com.namnv.ledger.model.LedgerTransfer;
+import com.namnv.ledger.state.Ledger;
 import com.namnv.core.NodeState;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -17,7 +27,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
-import static com.namnv.ledger.LedgerAccount.DEBITS_MUST_NOT_EXCEED_CREDITS;
+import static com.namnv.ledger.model.LedgerAccount.DEBITS_MUST_NOT_EXCEED_CREDITS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;

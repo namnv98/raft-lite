@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.model;
 
 /**
  * Kết quả của một lệnh tạo tài khoản hoặc chuyển tiền. Mọi node tính ra cùng một kết quả vì nó chỉ phụ thuộc vào
@@ -28,9 +28,9 @@ public enum LedgerResult {
 
     private static final LedgerResult[] BY_CODE = values();
 
-    final byte code;
+    private final byte code;
     // kết quả gửi về client: mảng dùng chung, không ai được sửa
-    final byte[] bytes;
+    private final byte[] bytes;
 
     LedgerResult(int code) {
         this.code = (byte) code;
@@ -42,7 +42,17 @@ public enum LedgerResult {
         return this == OK || this == EXISTS;
     }
 
-    static LedgerResult of(byte code) {
+    /** mã một byte của kết quả, như được gửi qua mạng */
+    public byte code() {
+        return code;
+    }
+
+    /** kết quả đã mã hoá ({@link #code()} trong một mảng một phần tử); mảng dùng chung, không được sửa */
+    public byte[] bytes() {
+        return bytes;
+    }
+
+    public static LedgerResult of(byte code) {
         if (code < 0 || code >= BY_CODE.length) {
             throw new IllegalArgumentException("unknown ledger result " + code);
         }

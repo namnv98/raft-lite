@@ -1,5 +1,6 @@
-package com.namnv.ledger;
+package com.namnv.ledger.bench;
 
+import com.namnv.ledger.node.LedgerNode;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.file.Files;

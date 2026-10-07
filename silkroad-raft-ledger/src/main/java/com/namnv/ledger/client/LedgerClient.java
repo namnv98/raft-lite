@@ -1,5 +1,11 @@
-package com.namnv.ledger;
+package com.namnv.ledger.client;
 
+import com.namnv.ledger.codec.LedgerCodec;
+import com.namnv.ledger.model.LedgerAccount;
+import com.namnv.ledger.model.LedgerBalance;
+import com.namnv.ledger.model.LedgerResult;
+import com.namnv.ledger.model.LedgerTotals;
+import com.namnv.ledger.model.LedgerTransfer;
 import com.namnv.client.RaftClient;
 import com.namnv.entity.CommandBatch;
 import com.namnv.rpc.MessageTransport;

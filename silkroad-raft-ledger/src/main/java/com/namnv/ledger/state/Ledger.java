@@ -1,5 +1,12 @@
-package com.namnv.ledger;
+package com.namnv.ledger.state;
 
+import com.namnv.ledger.codec.LedgerCodec;
+import com.namnv.ledger.event.EventPublisher;
+import com.namnv.ledger.event.LedgerEvent;
+import com.namnv.ledger.model.LedgerAccount;
+import com.namnv.ledger.model.LedgerBalance;
+import com.namnv.ledger.model.LedgerResult;
+import com.namnv.ledger.model.LedgerTotals;
 import com.namnv.core.Closure;
 import com.namnv.core.Status;
 import com.namnv.entity.LogEntry;
@@ -134,17 +141,17 @@ public class Ledger implements StateMachine, AutoCloseable {
         switch (command[0]) {
             case LedgerCodec.CREATE_ACCOUNT -> {
                 if (command.length != LedgerCodec.CREATE_ACCOUNT_BYTES) {
-                    return LedgerResult.MALFORMED.bytes;
+                    return LedgerResult.MALFORMED.bytes();
                 }
                 var in = ByteBuffer.wrap(command, 1, command.length - 1);
-                return createAccount(in.getLong(), in.getInt(), in.getInt()).bytes;
+                return createAccount(in.getLong(), in.getInt(), in.getInt()).bytes();
             }
             case LedgerCodec.TRANSFER -> {
                 if (command.length != LedgerCodec.TRANSFER_BYTES) {
-                    return LedgerResult.MALFORMED.bytes;
+                    return LedgerResult.MALFORMED.bytes();
                 }
                 var in = ByteBuffer.wrap(command, 1, command.length - 1);
-                return transfer(in.getLong(), in.getLong(), in.getLong(), in.getLong(), in.getInt()).bytes;
+                return transfer(in.getLong(), in.getLong(), in.getLong(), in.getLong(), in.getInt()).bytes();
             }
             default -> {
                 return null; // không phải lệnh của sổ cái: mọi node bỏ qua giống nhau

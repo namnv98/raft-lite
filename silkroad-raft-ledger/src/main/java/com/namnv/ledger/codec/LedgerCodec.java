@@ -1,5 +1,10 @@
-package com.namnv.ledger;
+package com.namnv.ledger.codec;
 
+import com.namnv.ledger.model.LedgerAccount;
+import com.namnv.ledger.model.LedgerBalance;
+import com.namnv.ledger.model.LedgerResult;
+import com.namnv.ledger.model.LedgerTotals;
+import com.namnv.ledger.model.LedgerTransfer;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,14 +21,15 @@ import java.util.List;
  * </pre>
  */
 public final class LedgerCodec {
-    static final byte CREATE_ACCOUNT = 1;
-    static final byte TRANSFER = 2;
-    static final byte LOOKUP_ACCOUNTS = 10;
-    static final byte LOOKUP_TRANSFERS = 11;
-    static final byte TOTALS = 12;
+    // mã lệnh và độ dài, dùng chung giữa client và state machine
+    public static final byte CREATE_ACCOUNT = 1;
+    public static final byte TRANSFER = 2;
+    public static final byte LOOKUP_ACCOUNTS = 10;
+    public static final byte LOOKUP_TRANSFERS = 11;
+    public static final byte TOTALS = 12;
 
-    static final int CREATE_ACCOUNT_BYTES = 1 + 8 + 4 + 4;
-    static final int TRANSFER_BYTES = 1 + 8 + 8 + 8 + 8 + 4;
+    public static final int CREATE_ACCOUNT_BYTES = 1 + 8 + 4 + 4;
+    public static final int TRANSFER_BYTES = 1 + 8 + 8 + 8 + 8 + 4;
     private static final int ACCOUNT_ROW_BYTES = 1 + 4 + 4 + 8 + 8;
     private static final int TRANSFER_ROW_BYTES = 1 + 8 + 8 + 8 + 4;
 
@@ -107,11 +113,11 @@ public final class LedgerCodec {
 
     // ---------- phía state machine ----------
 
-    static ByteBuffer accountRows(int count) {
+    public static ByteBuffer accountRows(int count) {
         return ByteBuffer.allocate(4 + count * ACCOUNT_ROW_BYTES).putInt(count);
     }
 
-    static ByteBuffer transferRows(int count) {
+    public static ByteBuffer transferRows(int count) {
         return ByteBuffer.allocate(4 + count * TRANSFER_ROW_BYTES).putInt(count);
     }
 }

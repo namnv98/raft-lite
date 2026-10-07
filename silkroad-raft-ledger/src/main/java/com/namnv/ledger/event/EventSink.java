@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.event;
 
 import java.io.IOException;
 import java.util.List;

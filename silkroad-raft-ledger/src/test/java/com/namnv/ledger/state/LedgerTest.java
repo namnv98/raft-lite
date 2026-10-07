@@ -1,5 +1,15 @@
-package com.namnv.ledger;
+package com.namnv.ledger.state;
 
+import com.namnv.ledger.codec.LedgerCodec;
+import com.namnv.ledger.event.EventPublisher;
+import com.namnv.ledger.event.EventSink;
+import com.namnv.ledger.event.JsonLinesEventSink;
+import com.namnv.ledger.event.LedgerEvent;
+import com.namnv.ledger.model.LedgerAccount;
+import com.namnv.ledger.model.LedgerBalance;
+import com.namnv.ledger.model.LedgerResult;
+import com.namnv.ledger.model.LedgerTotals;
+import com.namnv.ledger.model.LedgerTransfer;
 import com.namnv.core.Status;
 import com.namnv.entity.LogEntry;
 import com.namnv.statemachine.snapshot.SnapshotReader;
@@ -15,9 +25,9 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
-import static com.namnv.ledger.LedgerAccount.CREDITS_MUST_NOT_EXCEED_DEBITS;
-import static com.namnv.ledger.LedgerAccount.DEBITS_MUST_NOT_EXCEED_CREDITS;
-import static com.namnv.ledger.LedgerResult.*;
+import static com.namnv.ledger.model.LedgerAccount.CREDITS_MUST_NOT_EXCEED_DEBITS;
+import static com.namnv.ledger.model.LedgerAccount.DEBITS_MUST_NOT_EXCEED_CREDITS;
+import static com.namnv.ledger.model.LedgerResult.*;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;

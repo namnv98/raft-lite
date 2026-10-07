@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.model;
 
 /**
  * Tổng của cả sổ. Ghi sổ kép: mỗi giao dịch cộng cùng một số tiền vào tổng nợ và tổng có, nên hai tổng luôn bằng nhau.

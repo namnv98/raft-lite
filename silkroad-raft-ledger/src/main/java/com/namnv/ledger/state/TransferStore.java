@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.state;
 
 import lombok.extern.slf4j.Slf4j;
 import org.rocksdb.BlockBasedTableConfig;

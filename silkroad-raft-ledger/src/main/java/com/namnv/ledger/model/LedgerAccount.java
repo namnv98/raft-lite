@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.model;
 
 /**
  * Một tài khoản. {@code ledger} là sổ (thường là một đơn vị tiền): chỉ chuyển được tiền giữa hai tài khoản cùng sổ.

@@ -339,7 +339,7 @@ List<LedgerResult> results = client.transfers(List.of(new LedgerTransfer(100, 1,
 LedgerTotals totals = client.totals().get();          // totals.balanced() luôn đúng
 ```
 
-Một node: `java ... com.namnv.ledger.LedgerNode host:port host1:port1,host2:port2,host3:port3 thư-mục-dữ-liệu`.
+Một node: `java ... com.namnv.ledger.node.LedgerNode host:port host1:port1,host2:port2,host3:port3 thư-mục-dữ-liệu`.
 
 #### Learner và dòng sự kiện (CQRS)
 
@@ -360,7 +360,7 @@ Learner chậm hay chết không làm chậm việc ghi.
 
 ```bash
 # trên mọi node: -Dledger.learners=host4:9001 ; riêng learner thêm nơi phát sự kiện
-java -Dledger.learners=host4:9001 -Dledger.eventsFile=/data/events.jsonl ... com.namnv.ledger.LedgerNode \
+java -Dledger.learners=host4:9001 -Dledger.eventsFile=/data/events.jsonl ... com.namnv.ledger.node.LedgerNode \
      host4:9001 host1:9001,host2:9001,host3:9001 /data/ledger
 ```
 
@@ -395,7 +395,7 @@ GET  /accounts/{id}   GET /transfers/{id}   GET /totals   GET /stats
   khi kết quả về. Nhiều request liền trên một kết nối (HTTP pipelining) nhận trả lời đúng thứ tự; body tối đa 64 KB (413).
 
 ```bash
-java -Dgateway.maxBatch=1000 -Dgateway.maxInflight=4 ... com.namnv.ledger.LedgerGateway 8080 host1:9001,host2:9001,host3:9001
+java -Dgateway.maxBatch=1000 -Dgateway.maxInflight=4 ... com.namnv.ledger.gateway.LedgerGateway 8080 host1:9001,host2:9001,host3:9001
 # -Dgateway.batch=false: không gom, mỗi request một lệnh Raft
 ```
 
@@ -420,7 +420,7 @@ tăng theo; lịch sử trên đĩa khoảng 20 byte mỗi giao dịch nhờ né
 
 ```bash
 mvn -q compile dependency:build-classpath -pl silkroad-raft-ledger -am -Dmdep.includeScope=runtime -Dmdep.outputFile=target/ledger-cp.txt
-java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.LedgerBenchmark
+java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.bench.LedgerBenchmark
 ```
 
 Đo bằng [wrk](https://github.com/wg/wrk) (client C, gần như không tốn CPU so với cổng): `bench/wrk/run.sh` là một file
@@ -473,7 +473,7 @@ FSYNC=false DURATION=5 bench/wrk/run.sh 64 512 2048
 lô — với một client HTTP/1.1 tối giản trong Java, và in thêm CPU của client / cổng / node:
 
 ```bash
-java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.GatewayBenchmark
+java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.bench.GatewayBenchmark
 # -Dgateway.clients=1,64,512 -Dgateway.modes=binary,http,http-batch -Dledger.logSync=false
 ```
 
@@ -539,6 +539,16 @@ com.namnv
 │   └── nio                 NioRpcClient, NioRpcServer: transport chạy trên vòng của node
 ├── client                  (silkroad-raft-client) RaftClient
 ├── kv                      (silkroad-raft-kv) kho KV trên LMDB, RocksDB
+├── ledger                  (silkroad-raft-ledger) dịch vụ sổ cái kép
+│   ├── model               LedgerAccount, LedgerTransfer, LedgerBalance, LedgerTotals, LedgerResult
+│   ├── codec               LedgerCodec: lệnh và kết quả dạng nhị phân, dùng chung giữa client và state machine
+│   ├── state               Ledger (state machine) cùng phần nội bộ: TransferStore (lịch sử trên RocksDB),
+│   │                       TransferSegment, IdFilter (bloom filter của id), LongIndex
+│   ├── event               LedgerEvent, EventSink, EventPublisher, JsonLinesEventSink: dòng sự kiện ra ngoài
+│   ├── client              LedgerClient
+│   ├── node                LedgerNode: một node (Raft + Ledger + transport NIO), voter hoặc learner
+│   ├── gateway             LedgerGateway (cổng HTTP trên Netty), TransferBatcher
+│   └── bench               LedgerBenchmark, GatewayBenchmark, LocalCluster
 ├── util                    Utf8Cache
 ├── ListStateMachine        state machine mẫu: danh sách các lệnh đã apply
 └── samples                 (silkroad-raft-samples) AppRaftInMem, AppRaftSocket

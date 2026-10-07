@@ -1,5 +1,8 @@
-package com.namnv.ledger;
+package com.namnv.ledger.node;
 
+import com.namnv.ledger.event.EventPublisher;
+import com.namnv.ledger.event.JsonLinesEventSink;
+import com.namnv.ledger.state.Ledger;
 import com.namnv.config.NodeOptions;
 import com.namnv.config.RaftConfig;
 import com.namnv.core.RaftClientService;
@@ -15,7 +18,7 @@ import java.util.List;
 /**
  * Một node của dịch vụ sổ cái: đồng thuận Raft, state machine {@link Ledger}, transport NIO chạy trên thread của node.
  * <pre>
- * java ... com.namnv.ledger.LedgerNode host:port host1:port1,host2:port2,host3:port3 thư-mục-dữ-liệu
+ * java ... com.namnv.ledger.node.LedgerNode host:port host1:port1,host2:port2,host3:port3 thư-mục-dữ-liệu
  * </pre>
  * -Dledger.logSync=false: không fsync log. -Dledger.snapshotInterval=100000: số entry giữa hai lần snapshot.
  * -Dledger.bindLocal=true: kết nối tới node khác đi từ chính địa chỉ của node này (cho tc netem).

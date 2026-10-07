@@ -142,7 +142,7 @@ java -Xmx2g \
     -Dledger.logSync="$FSYNC" -Dledger.snapshotInterval="$SNAPSHOT_INTERVAL" \
     -Dledger.nodeHeap="${NODE_HEAP:-2g}" -Dledger.keep="$([ "${KEEP:-0}" = 1 ] && echo true || echo false)" \
     -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" \
-    com.namnv.ledger.GatewayBenchmark "$DATA_DIR" >"$WORK/cluster.log" 2>&1 &
+    com.namnv.ledger.bench.GatewayBenchmark "$DATA_DIR" >"$WORK/cluster.log" 2>&1 &
 BENCH_PID=$!
 
 until grep -q READY "$WORK/cluster.log" 2>/dev/null; do

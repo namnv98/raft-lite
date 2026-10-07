@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.event;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 

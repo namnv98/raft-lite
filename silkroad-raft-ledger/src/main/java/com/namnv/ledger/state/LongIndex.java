@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.state;
 
 import java.util.Arrays;
 

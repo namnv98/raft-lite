@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.model;
 
 /**
  * Chuyển {@code amount} từ tài khoản nợ sang tài khoản có: tổng nợ của tài khoản nợ và tổng có của tài khoản có cùng tăng

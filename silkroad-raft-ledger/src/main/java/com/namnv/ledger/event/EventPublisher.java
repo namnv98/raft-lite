@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.event;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -33,12 +33,12 @@ public final class EventPublisher implements AutoCloseable {
     }
 
     /** gọi trên thread của node, ngay sau khi lệnh được apply */
-    void publish(LedgerEvent event) {
+    public void publish(LedgerEvent event) {
         enqueue(event);
     }
 
     /** {@code then} chạy (trên thread của publisher) khi mọi sự kiện đã publish trước lời gọi này đã nằm trong sink */
-    void afterPublished(Runnable then) {
+    public void afterPublished(Runnable then) {
         enqueue(then);
     }
 
@@ -58,7 +58,7 @@ public final class EventPublisher implements AutoCloseable {
     }
 
     /** vị trí cuối cùng mà sink đã có lúc sổ cái được dựng lại; sự kiện từ đó trở về trước bị bỏ qua */
-    long sinkIndex() {
+    public long sinkIndex() {
         return sink.lastIndex();
     }
 

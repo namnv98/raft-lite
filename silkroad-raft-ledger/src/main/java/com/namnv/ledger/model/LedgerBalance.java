@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.model;
 
 /** Số liệu của một tài khoản: tổng nợ và tổng có đã ghi. */
 public record LedgerBalance(long id, int ledger, int flags, long debitsPosted, long creditsPosted) {

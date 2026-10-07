@@ -1,4 +1,6 @@
-package com.namnv.ledger;
+package com.namnv.ledger.event;
+
+import com.namnv.ledger.model.LedgerResult;
 
 /**
  * Một thay đổi đã được commit và apply vào sổ cái: tài khoản mới hoặc giao dịch đã ghi. Lệnh bị từ chối hay đã có từ
@@ -16,11 +18,11 @@ public record LedgerEvent(long index, int position, Type type, long id, long deb
         TRANSFER_POSTED
     }
 
-    static LedgerEvent accountCreated(long index, int position, long id, int ledger, int flags) {
+    public static LedgerEvent accountCreated(long index, int position, long id, int ledger, int flags) {
         return new LedgerEvent(index, position, Type.ACCOUNT_CREATED, id, 0, 0, 0, ledger, flags);
     }
 
-    static LedgerEvent transferPosted(long index, int position, long id, long debit, long credit, long amount, int ledger) {
+    public static LedgerEvent transferPosted(long index, int position, long id, long debit, long credit, long amount, int ledger) {
         return new LedgerEvent(index, position, Type.TRANSFER_POSTED, id, debit, credit, amount, ledger, 0);
     }
 

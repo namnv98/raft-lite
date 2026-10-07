@@ -1,5 +1,7 @@
-package com.namnv.ledger;
+package com.namnv.ledger.gateway;
 
+import com.namnv.ledger.client.LedgerClient;
+import com.namnv.ledger.node.LedgerNode;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;

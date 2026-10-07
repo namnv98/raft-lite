@@ -1,5 +1,9 @@
-package com.namnv.ledger;
+package com.namnv.ledger.gateway;
 
+import com.namnv.ledger.client.LedgerClient;
+import com.namnv.ledger.model.LedgerAccount;
+import com.namnv.ledger.model.LedgerResult;
+import com.namnv.ledger.model.LedgerTransfer;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -69,7 +73,7 @@ import java.util.concurrent.CompletionException;
  * kết quả về, cũng trên event loop của kết nối. Client gửi nhiều request liền trên một kết nối (HTTP pipelining) nhận trả
  * lời đúng thứ tự.
  * <pre>
- * java ... com.namnv.ledger.LedgerGateway cổng host1:port1,host2:port2,host3:port3
+ * java ... com.namnv.ledger.gateway.LedgerGateway cổng host1:port1,host2:port2,host3:port3
  * </pre>
  * -Dgateway.batch=false: gửi mỗi giao dịch một lệnh Raft, không gom. -Dgateway.maxBatch=1000 -Dgateway.maxInflight=4:
  * xem {@link TransferBatcher}. -Dgateway.eventLoops: số event loop (mặc định 1/4 số CPU).

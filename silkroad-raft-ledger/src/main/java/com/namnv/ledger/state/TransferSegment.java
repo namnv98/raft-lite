@@ -1,4 +1,4 @@
-package com.namnv.ledger;
+package com.namnv.ledger.state;
 
 /**
  * Một đoạn giao dịch trong bộ nhớ, dung lượng cố định và cấp phát một lần: các mảng số nguyên thuỷ cùng một
