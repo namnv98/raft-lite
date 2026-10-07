@@ -5,6 +5,7 @@ import com.namnv.ledger.model.LedgerBalance;
 import com.namnv.ledger.model.LedgerResult;
 import com.namnv.ledger.model.LedgerTotals;
 import com.namnv.ledger.model.LedgerTransfer;
+import com.namnv.ledger.model.PostedTransfer;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,7 +17,7 @@ import java.util.List;
  * chuyển tiền:     [2][id 8][tài khoản nợ 8][tài khoản có 8][số tiền 8][ledger 4]          37 byte
  * kết quả:         [mã 1]
  * tra tài khoản:   [10][số id 4][id 8]...   -> [số 4]([có 1][ledger 4][flags 4][nợ 8][có 8])...
- * tra giao dịch:   [11][số id 4][id 8]...   -> [số 4]([có 1][nợ 8][có 8][số tiền 8][ledger 4])...
+ * tra giao dịch:   [11][số id 4][id 8]...   -> [số 4]([có 1][nợ 8][có 8][số tiền 8][ledger 4][thời điểm 8])...
  * tổng:            [12]                     -> [số tài khoản 8][số giao dịch 8][tổng nợ 8][tổng có 8]
  * </pre>
  */
@@ -31,7 +32,7 @@ public final class LedgerCodec {
     public static final int CREATE_ACCOUNT_BYTES = 1 + 8 + 4 + 4;
     public static final int TRANSFER_BYTES = 1 + 8 + 8 + 8 + 8 + 4;
     private static final int ACCOUNT_ROW_BYTES = 1 + 4 + 4 + 8 + 8;
-    private static final int TRANSFER_ROW_BYTES = 1 + 8 + 8 + 8 + 4;
+    private static final int TRANSFER_ROW_BYTES = 1 + 8 + 8 + 8 + 4 + 8;
 
     private LedgerCodec() {
     }
@@ -91,17 +92,18 @@ public final class LedgerCodec {
     }
 
     /** kết quả của {@link #lookupTransfers}: null ở vị trí của id không có */
-    public static List<LedgerTransfer> transfers(List<Long> ids, byte[] answer) {
+    public static List<PostedTransfer> transfers(List<Long> ids, byte[] answer) {
         var in = ByteBuffer.wrap(answer);
         int count = in.getInt();
-        var result = new ArrayList<LedgerTransfer>(count);
+        var result = new ArrayList<PostedTransfer>(count);
         for (int i = 0; i < count; i++) {
             boolean found = in.get() != 0;
             long debit = in.getLong();
             long credit = in.getLong();
             long amount = in.getLong();
             int ledger = in.getInt();
-            result.add(found ? new LedgerTransfer(ids.get(i), debit, credit, amount, ledger) : null);
+            long timestamp = in.getLong();
+            result.add(found ? new PostedTransfer(ids.get(i), debit, credit, amount, ledger, timestamp) : null);
         }
         return result;
     }

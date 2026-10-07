@@ -54,7 +54,8 @@ final class TransferStore implements AutoCloseable {
     static final int MAX_UNWRITTEN_SEGMENTS = 4;
     private static final String PREFIX = "rocks-";
     private static final String FILTER_FILE = "transfer-ids.filter";
-    private static final int VALUE_BYTES = 8 + 8 + 8 + 4;
+    // nợ, có, số tiền, ledger, thời điểm ghi (epoch ms); bản ghi cũ không có thời điểm (28 byte)
+    private static final int VALUE_BYTES = 8 + 8 + 8 + 4 + 8;
 
     static {
         RocksDB.loadLibrary();
@@ -113,7 +114,7 @@ final class TransferStore implements AutoCloseable {
         this.count = count;
     }
 
-    /** true nếu có giao dịch id; khi đó out = {tài khoản nợ, tài khoản có, số tiền, ledger} */
+    /** true nếu có giao dịch id; khi đó out = {tài khoản nợ, tài khoản có, số tiền, ledger, thời điểm ghi} */
     boolean find(long id, long[] out) {
         if (copy(active, active.find(id), out)) {
             return true;
@@ -146,6 +147,7 @@ final class TransferStore implements AutoCloseable {
         out[1] = in.getLong();
         out[2] = in.getLong();
         out[3] = in.getInt();
+        out[4] = in.remaining() >= Long.BYTES ? in.getLong() : 0;
         return true;
     }
 
@@ -157,6 +159,7 @@ final class TransferStore implements AutoCloseable {
         out[1] = segment.credits[slot];
         out[2] = segment.amounts[slot];
         out[3] = segment.ledgers[slot];
+        out[4] = segment.timestamps[slot];
         return true;
     }
 
@@ -172,8 +175,8 @@ final class TransferStore implements AutoCloseable {
     }
 
     /** ghi nhận giao dịch; {@link #reserve()} phải được gọi ngay trước đó */
-    void add(long id, long debit, long credit, long amount, int ledger) {
-        active.add(id, debit, credit, amount, ledger);
+    void add(long id, long debit, long credit, long amount, int ledger, long timestamp) {
+        active.add(id, debit, credit, amount, ledger, timestamp);
         filter.add(id);
         count++;
     }
@@ -213,7 +216,8 @@ final class TransferStore implements AutoCloseable {
                     for (int i = 0; i < segment.count; i++) {
                         key.putLong(0, segment.ids[i]);
                         value.putLong(0, segment.debits[i]).putLong(8, segment.credits[i])
-                                .putLong(16, segment.amounts[i]).putInt(24, segment.ledgers[i]);
+                                .putLong(16, segment.amounts[i]).putInt(24, segment.ledgers[i])
+                                .putLong(28, segment.timestamps[i]);
                         batch.put(writeKey, writeValue);
                     }
                     db.write(writeOptions, batch);

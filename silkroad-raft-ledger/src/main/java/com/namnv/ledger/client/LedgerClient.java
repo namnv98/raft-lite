@@ -6,6 +6,7 @@ import com.namnv.ledger.model.LedgerBalance;
 import com.namnv.ledger.model.LedgerResult;
 import com.namnv.ledger.model.LedgerTotals;
 import com.namnv.ledger.model.LedgerTransfer;
+import com.namnv.ledger.model.PostedTransfer;
 import com.namnv.client.RaftClient;
 import com.namnv.entity.CommandBatch;
 import com.namnv.rpc.MessageTransport;
@@ -60,7 +61,8 @@ public class LedgerClient implements AutoCloseable {
         return client.read(LedgerCodec.lookupAccounts(ids)).thenApply(answer -> LedgerCodec.accounts(ids, answer));
     }
 
-    public CompletableFuture<List<LedgerTransfer>> lookupTransfers(List<Long> ids) {
+    /** giao dịch đã ghi (kèm thời điểm ghi), null ở vị trí của id không có */
+    public CompletableFuture<List<PostedTransfer>> lookupTransfers(List<Long> ids) {
         return client.read(LedgerCodec.lookupTransfers(ids)).thenApply(answer -> LedgerCodec.transfers(ids, answer));
     }
 

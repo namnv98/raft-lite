@@ -433,8 +433,22 @@ public class RaftNode implements RaftServerService {
         }
     }
 
+    /**
+     * Gắn thời điểm leader tạo entry: giờ thực của runtime, nhưng không bao giờ nhỏ hơn entry trước đó trong log (đồng hồ
+     * lùi, hoặc leader mới có đồng hồ chậm hơn leader cũ), nên thời gian không giảm dọc theo log.
+     */
+    private LogEntry stamped(LogEntry entry) {
+        long now = runtime.currentTimeMillis();
+        if (now > lastTimestamp) {
+            lastTimestamp = now;
+        }
+        entry.setTimestamp(lastTimestamp);
+        return entry;
+    }
+
     // leader ghi entry vào log; người gọi được báo khi entry được apply hoặc khi không rõ kết quả
     private void appendAndTrack(LogEntry entry, CompletableFuture<Boolean> applied, CompletableFuture<byte[]> result) {
+        stamped(entry);
         try {
             persistent.getLogStore().appendEntry(entry);
         } catch (Exception error) {
@@ -861,7 +875,7 @@ public class RaftNode implements RaftServerService {
     private void appendConfiguration(ConfigurationEntry newConf) {
         var logStore = persistent.getLogStore();
         var index = logStore.lastIndex() + 1;
-        logStore.appendEntry(LogEntry.newConfigurationEntry(index, persistent.getCurrentTerm(), newConf));
+        logStore.appendEntry(stamped(LogEntry.newConfigurationEntry(index, persistent.getCurrentTerm(), newConf)));
         refreshConf();
         for (var peer : peers()) {
             leaderState.addPeer(peer, index, runtime.nanoTime());
@@ -1103,6 +1117,7 @@ public class RaftNode implements RaftServerService {
             }
             var meta = new SnapshotMeta(snapshotIndex, termAt(snapshotIndex), confAt(snapshotIndex),
                     new ArrayList<>(), copySessions(sessions));
+            meta.setLastIncludedTimestamp(timestampAt(snapshotIndex));
             snapshotting = true;
             try {
                 // state machine ghi vào thư mục temp, chỉ khi commit() mới thay thế snapshot hiện tại
@@ -1290,6 +1305,7 @@ public class RaftNode implements RaftServerService {
         }
 
         var meta = new SnapshotMeta(index, req.getLastIncludedTerm(), req.getConf(), req.getFiles(), req.getSessions());
+        meta.setLastIncludedTimestamp(req.getLastIncludedTimestamp());
         var needLoad = beginSnapshotLoad(index);
         if (needLoad && !loadSnapshot(incoming.tempPath)) {
             // không kiểm chứng được state machine còn nguyên hay không, nên false cũng dừng như exception
@@ -1915,6 +1931,26 @@ public class RaftNode implements RaftServerService {
         }
     }
 
+    // thời điểm của entry gần nhất leader này tạo hoặc thấy trong log (xem stamped)
+    private long lastTimestamp;
+
+    // thời điểm của entry tại index: từ log, hoặc từ snapshot nếu entry đã bị compact vào đó; 0 nếu không biết
+    private long timestampAt(long index) {
+        var logStore = persistent.getLogStore();
+        if (index > logStore.getBaseIndex()) {
+            try {
+                LogEntry entry = logStore.get(index);
+                if (entry != null) {
+                    return entry.getTimestamp();
+                }
+            } catch (RuntimeException e) {
+                log.warn("Node {} could not read log entry {} for its timestamp", nodeId, index, e);
+            }
+        }
+        var meta = persistent.getSnapshotStore().getMeta();
+        return meta != null && meta.getLastIncludedIndex() >= index ? meta.getLastIncludedTimestamp() : 0;
+    }
+
     private void becomeLeader() {
         var logStore = persistent.getLogStore();
         state = NodeState.LEADER;
@@ -1922,9 +1958,12 @@ public class RaftNode implements RaftServerService {
         leaderState = new LeaderState(peers(), logStore.lastIndex() + 1, runtime.nanoTime());
         electionTimer.stop();
         restoreDepartingNodes();
+        // thời gian của entry mới không nhỏ hơn entry cuối trong log (kể cả entry do leader cũ tạo), hay của snapshot nếu
+        // log đã bị compact hết vào đó
+        lastTimestamp = Math.max(lastTimestamp, timestampAt(logStore.lastIndex()));
         // no-op của term mới: entry của term cũ chỉ được commit gián tiếp qua entry của term hiện tại
         try {
-            logStore.appendEntry(new LogEntry(logStore.lastIndex() + 1, persistent.getCurrentTerm(), null));
+            logStore.appendEntry(stamped(new LogEntry(logStore.lastIndex() + 1, persistent.getCurrentTerm(), null)));
         } catch (Exception e) {
             // leader không ghi được log thì không làm leader được: nhường để node khác bầu lại
             log.error("Leader {} failed to append its no-op entry, step down", nodeId, e);
@@ -2258,6 +2297,7 @@ public class RaftNode implements RaftServerService {
                 var done = fileName == null || (lastChunkOfFile && fileIndex == files.size() - 1);
                 var req = new InstallSnapshotRequest(term, nodeId, meta.getLastIncludedIndex(), meta.getLastIncludedTerm(),
                         meta.getConf(), meta.getSessions(), files, fileName, offset, data, done);
+                req.setLastIncludedTimestamp(meta.getLastIncludedTimestamp());
                 rpcProcessor.installSnapshot(peer, req).whenComplete((resp, error) ->
                         onNode(() -> onInstallSnapshotResponse(ls, peer, req, resp, transfer, lastChunkOfFile, generation)));
             } catch (Exception e) {
@@ -2451,8 +2491,9 @@ public class RaftNode implements RaftServerService {
             var results = new ArrayList<byte[]>();
             var anyResult = new boolean[1];
             CommandBatch.forEach(entry.getCommand(), command -> {
-                byte[] one = stateMachine.onApplyWithResult(nodeId,
-                        new LogEntry(entry.getIndex(), entry.getTerm(), command, entry.getClientId(), entry.getSequence()));
+                var single = new LogEntry(entry.getIndex(), entry.getTerm(), command, entry.getClientId(), entry.getSequence());
+                single.setTimestamp(entry.getTimestamp());
+                byte[] one = stateMachine.onApplyWithResult(nodeId, single);
                 anyResult[0] |= one != null;
                 results.add(one == null ? NO_RESULT : one);
             });

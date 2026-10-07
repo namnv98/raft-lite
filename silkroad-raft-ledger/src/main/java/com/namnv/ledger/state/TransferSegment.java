@@ -12,6 +12,7 @@ final class TransferSegment {
     final long[] credits;
     final long[] amounts;
     final int[] ledgers;
+    final long[] timestamps;
     private final LongIndex index;
     int count;
 
@@ -22,6 +23,7 @@ final class TransferSegment {
         credits = new long[capacity];
         amounts = new long[capacity];
         ledgers = new int[capacity];
+        timestamps = new long[capacity];
         index = new LongIndex(capacity);
         index.reserve(capacity);
     }
@@ -30,13 +32,14 @@ final class TransferSegment {
         return count == capacity;
     }
 
-    void add(long id, long debit, long credit, long amount, int ledger) {
+    void add(long id, long debit, long credit, long amount, int ledger, long timestamp) {
         int slot = count++;
         ids[slot] = id;
         debits[slot] = debit;
         credits[slot] = credit;
         amounts[slot] = amount;
         ledgers[slot] = ledger;
+        timestamps[slot] = timestamp;
         index.put(id, slot);
     }
 

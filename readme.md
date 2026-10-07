@@ -341,27 +341,71 @@ LedgerTotals totals = client.totals().get();          // totals.balanced() luôn
 
 Một node: `java ... com.namnv.ledger.node.LedgerNode host:port host1:port1,host2:port2,host3:port3 thư-mục-dữ-liệu`.
 
-#### Learner và dòng sự kiện (CQRS)
+#### Thời điểm ghi
 
-Hệ thống khác (app, báo cáo, thông báo, đối soát, chống gian lận) không đọc thẳng từ sổ cái: chúng nghe một dòng sự kiện
-và tự dựng mô hình truy vấn của riêng mình. Ở đây dòng đó được phát từ một **learner**: một node nhận log từ leader như
-mọi follower nhưng không nằm trong cấu hình, nên không bỏ phiếu, không được tính vào quorum và không bao giờ thành leader.
-Learner chậm hay chết không làm chậm việc ghi.
+Mỗi entry của Raft log mang thời điểm leader tạo ra nó (`LogEntry.timestamp`, epoch ms). Mọi node apply cùng một giá trị,
+nên state machine dùng được làm thời gian của các thay đổi mà vẫn tất định. Thời gian không giảm dọc theo log, kể cả khi
+đồng hồ lùi hay leader mới có đồng hồ chậm hơn: leader không bao giờ gắn thời điểm nhỏ hơn entry cuối trong log của nó,
+hoặc của snapshot nếu log đã bị compact hết (`SnapshotMeta.lastIncludedTimestamp`, gửi kèm InstallSnapshot). Mô phỏng tất
+định kiểm tra điều này với đồng hồ lệch giữa các node, đổi leader, snapshot và node chết.
+
+Sổ cái lưu thời điểm ghi cùng mỗi giao dịch (cả trong RocksDB): tra giao dịch trả về `PostedTransfer` có `timestamp`.
+
+#### Learner và phía truy vấn (CQRS)
+
+Như "view domain" của Binance Ledger: hệ thống khác (app, báo cáo, thông báo, đối soát, chống gian lận) không đọc thẳng từ
+cụm Raft mà từ một cơ sở dữ liệu quan hệ được dựng từ dòng sự kiện của sổ cái. Dòng đó được phát từ một **learner**: một node
+nhận log từ leader như mọi follower nhưng không nằm trong cấu hình, nên không bỏ phiếu, không được tính vào quorum và
+không bao giờ thành leader. Learner chậm hay chết không làm chậm việc ghi.
+
+```
+client ──HTTP──▶ LedgerGateway ──▶ leader ──▶ 2 follower           (phía ghi: Raft + RocksDB)
+                      │                └────▶ learner ──▶ JdbcEventSink ──▶ PostgreSQL
+                      └── sao kê, số dư ◀── LedgerView ◀────────────────────────┘   (phía truy vấn)
+```
 
 - `RaftConfig.learners`: danh sách learner cố định, khai báo giống nhau trên mọi node.
-- Mỗi tài khoản mới hoặc giao dịch đã ghi sinh một `LedgerEvent` có vị trí `(index, position)`: index của entry trong Raft
-  log và thứ tự của lệnh trong lô. Vị trí này giống nhau trên mọi node. Lệnh bị từ chối và `EXISTS` không sinh sự kiện.
+- Mỗi tài khoản mới hoặc giao dịch đã ghi sinh một `LedgerEvent` có vị trí `(index, position)` (index của entry trong Raft
+  log và thứ tự của lệnh trong lô, giống nhau trên mọi node) và thời điểm ghi. Sự kiện giao dịch mang thêm tổng nợ / tổng
+  có của cả hai tài khoản ngay sau giao dịch: đó là hai bút toán (bên nợ, bên có) kèm số dư sau mỗi bút toán. Lệnh bị từ
+  chối và `EXISTS` không sinh sự kiện.
 - `EventPublisher` đưa sự kiện từ thread của node sang thread riêng theo lô, qua một hàng đợi có giới hạn (sink chậm thì
-  node chờ, không phình bộ nhớ). `EventSink` là nơi nhận, ví dụ Kafka hay một bảng; `JsonLinesEventSink` là bản mẫu ghi
-  file JSON lines, fsync mỗi lô.
+  node chờ, không phình bộ nhớ). `EventSink` là nơi nhận:
+  - `JdbcEventSink`: ghi vào cơ sở dữ liệu quan hệ (`ledger_accounts`, `ledger_transfers`, `ledger_entries` — hai bút
+    toán mỗi giao dịch kèm số dư sau đó —, `ledger_feed`; xem `ViewSchema`). Mỗi lô là một transaction, cùng với vị trí
+    của sự kiện cuối. Cơ sở dữ liệu lỗi thì rollback, kết nối lại và thử lại, không bỏ sự kiện.
+  - `JsonLinesEventSink`: file JSON lines, fsync mỗi lô (đóng vai một topic Kafka).
 - **Đúng một lần:** khởi động lại, node dựng lại sổ cái từ snapshot và log rồi sinh lại các sự kiện sau snapshot với đúng
-  vị trí cũ. Sink bỏ qua những gì nó đã có (so vị trí với sự kiện cuối cùng của nó), và dòng ghi dở bị cắt khi mở lại.
-  Snapshot chỉ được chụp khi mọi sự kiện trước nó đã nằm trong sink, nên không bao giờ có lỗ hổng.
+  vị trí cũ. Sink bỏ qua những gì nó đã có (so với vị trí đã commit cùng dữ liệu). Snapshot chỉ được chụp khi mọi sự kiện
+  trước nó đã nằm trong sink, nên không bao giờ có lỗ hổng.
+- `LedgerView` đọc phía truy vấn (số dư, giao dịch, sao kê có phân trang) trên các thread riêng, mỗi thread một kết nối.
+  Dữ liệu đi sau cụm một chút; `position()` cho biết đã tới sự kiện nào. Cổng HTTP dùng nó cho
+  `GET /accounts/{id}/entries`.
 
 ```bash
 # trên mọi node: -Dledger.learners=host4:9001 ; riêng learner thêm nơi phát sự kiện
-java -Dledger.learners=host4:9001 -Dledger.eventsFile=/data/events.jsonl ... com.namnv.ledger.node.LedgerNode \
-     host4:9001 host1:9001,host2:9001,host3:9001 /data/ledger
+java -Dledger.learners=host4:9001 \
+     -Dledger.eventsJdbcUrl='jdbc:postgresql://db:5432/ledger?reWriteBatchedInserts=true' \
+     -Dledger.eventsJdbcUser=ledger -Dledger.eventsJdbcPassword=... \
+     ... com.namnv.ledger.node.LedgerNode host4:9001 host1:9001,host2:9001,host3:9001 /data/ledger
+# (hoặc -Dledger.eventsFile=/data/events.jsonl)
+```
+
+`ViewBenchmark` đo phía truy vấn trên PostgreSQL 18 cùng máy (fsync bật, `synchronous_commit` mặc định):
+
+| | |
+|---|---|
+| ghi dòng sự kiện (lô 10.000 sự kiện) | ~81.000 giao dịch/s (mỗi giao dịch: 1 dòng giao dịch, 2 bút toán, cập nhật số dư) |
+| đọc số dư, 8 thread | ~154.000 truy vấn/s, p50 0,15 ms, p99 0,32 ms |
+| đọc sao kê 50 dòng, 8 thread | ~63.000 truy vấn/s, p50 0,40 ms, p99 1,6 ms |
+
+Phía truy vấn ghi chậm hơn cụm Raft (hơn 1 triệu giao dịch/s theo lô): ở tải đỉnh kéo dài nó đi sau một đoạn rồi bắt kịp
+khi tải giảm, và nếu hàng đợi của learner đầy thì learner chờ — các voter không bị ảnh hưởng. Muốn nhanh hơn: `COPY` thay
+cho INSERT theo lô, hoặc chia sink theo tài khoản.
+
+```bash
+java -cp "silkroad-raft-ledger/target/classes:$(cat target/ledger-cp.txt)" com.namnv.ledger.bench.ViewBenchmark \
+     'jdbc:postgresql://localhost:5432/ledger?reWriteBatchedInserts=true' user password
 ```
 
 #### Cổng HTTP (`LedgerGateway`)
@@ -373,6 +417,8 @@ request lẻ, đổi thành lệnh nhị phân gửi tới leader, và trả mã
 POST /transfers   {"debitAccountId":2,"creditAccountId":3,"amount":100,"ledger":840}   Idempotency-Key: order-8812
 POST /accounts    {"id":2,"ledger":840,"flags":1}
 GET  /accounts/{id}   GET /transfers/{id}   GET /totals   GET /stats
+GET  /accounts/{id}/entries?limit=50&before=<index.position>     sao kê, từ phía truy vấn (-Dgateway.viewJdbcUrl)
+GET  /view/position                                              phía truy vấn đã tới sự kiện nào
 ```
 
 | Mã | Ý nghĩa |
@@ -540,15 +586,16 @@ com.namnv
 ├── client                  (silkroad-raft-client) RaftClient
 ├── kv                      (silkroad-raft-kv) kho KV trên LMDB, RocksDB
 ├── ledger                  (silkroad-raft-ledger) dịch vụ sổ cái kép
-│   ├── model               LedgerAccount, LedgerTransfer, LedgerBalance, LedgerTotals, LedgerResult
+│   ├── model               LedgerAccount, LedgerTransfer, PostedTransfer, LedgerBalance, LedgerTotals, LedgerResult
 │   ├── codec               LedgerCodec: lệnh và kết quả dạng nhị phân, dùng chung giữa client và state machine
 │   ├── state               Ledger (state machine) cùng phần nội bộ: TransferStore (lịch sử trên RocksDB),
 │   │                       TransferSegment, IdFilter (bloom filter của id), LongIndex
 │   ├── event               LedgerEvent, EventSink, EventPublisher, JsonLinesEventSink: dòng sự kiện ra ngoài
 │   ├── client              LedgerClient
 │   ├── node                LedgerNode: một node (Raft + Ledger + transport NIO), voter hoặc learner
+│   ├── view                JdbcEventSink, LedgerView, ViewSchema: phía truy vấn (CQRS) trên cơ sở dữ liệu quan hệ
 │   ├── gateway             LedgerGateway (cổng HTTP trên Netty), TransferBatcher
-│   └── bench               LedgerBenchmark, GatewayBenchmark, LocalCluster
+│   └── bench               LedgerBenchmark, GatewayBenchmark, ViewBenchmark, LocalCluster
 ├── util                    Utf8Cache
 ├── ListStateMachine        state machine mẫu: danh sách các lệnh đã apply
 └── samples                 (silkroad-raft-samples) AppRaftInMem, AppRaftSocket

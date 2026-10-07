@@ -196,6 +196,7 @@ public final class RpcCodec {
             out.writeLong(m.getOffset());
             writeBytes(out, m.getData());
             out.writeBoolean(m.isDone());
+            out.writeLong(m.getLastIncludedTimestamp());
             return INSTALL_SNAPSHOT_REQUEST;
         }
         if (message instanceof InstallSnapshotResponse m) {
@@ -310,9 +311,13 @@ public final class RpcCodec {
                 case REQUEST_VOTE_RESPONSE -> new RequestVoteResponse(in.readLong(), in.readBoolean());
                 case APPEND_ENTRIES_REQUEST -> readAppendEntries(in);
                 case APPEND_ENTRIES_RESPONSE -> new AppendEntriesResponse(in.readLong(), in.readBoolean(), in.readLong());
-                case INSTALL_SNAPSHOT_REQUEST -> new InstallSnapshotRequest(in.readLong(), in.readString(), in.readLong(),
-                        in.readLong(), in.readConfiguration(), in.readSessions(), in.readStrings(), in.readString(),
-                        in.readLong(), in.readBytes(), in.readBoolean());
+                case INSTALL_SNAPSHOT_REQUEST -> {
+                    var request = new InstallSnapshotRequest(in.readLong(), in.readString(), in.readLong(),
+                            in.readLong(), in.readConfiguration(), in.readSessions(), in.readStrings(), in.readString(),
+                            in.readLong(), in.readBytes(), in.readBoolean());
+                    request.setLastIncludedTimestamp(in.readLong());
+                    yield request;
+                }
                 case INSTALL_SNAPSHOT_RESPONSE -> new InstallSnapshotResponse(in.readLong(), in.readBoolean(), in.readBoolean());
                 case TIMEOUT_NOW_REQUEST -> new TimeoutNowRequest(in.readLong(), in.readString());
                 case TIMEOUT_NOW_RESPONSE -> new TimeoutNowResponse(in.readLong(), in.readBoolean());

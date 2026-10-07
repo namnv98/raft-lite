@@ -174,6 +174,12 @@ class RaftSimulationTest {
             return (long) (sim.nowNanos * clockRate);
         }
 
+        // giờ thực ảo, lệch giữa các node theo clockRate như đồng hồ thật
+        @Override
+        public long currentTimeMillis() {
+            return 1_700_000_000_000L + nanoTime() / 1_000_000;
+        }
+
         @Override
         public ScheduledTask schedule(Runnable task, long delayMs) {
             var cancelled = new boolean[1];
@@ -756,6 +762,7 @@ class RaftSimulationTest {
                 logs.put(id, nodes.get(id).getPersistent().getLogStore().readFrom(1));
             }
             RaftInvariants.checkLogMatching(logs, violations);
+            RaftInvariants.checkTimestamps(logs, violations);
         }
 
         private List<String> distinctViolations() {

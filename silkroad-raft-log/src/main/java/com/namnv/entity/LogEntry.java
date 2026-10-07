@@ -24,6 +24,9 @@ public class LogEntry implements Serializable {
     private boolean sessionClose;
     // true: command là một lô nhiều lệnh (CommandBatch), được apply và chống ghi trùng cùng nhau
     private boolean batch;
+    // thời điểm (epoch ms) leader tạo entry, giống nhau trên mọi node; 0 nếu không có (entry cũ). Không giảm dọc theo log,
+    // kể cả qua các lần đổi leader, nên state machine dùng được làm thời gian của các thay đổi một cách tất định
+    private long timestamp;
     // Khung nhị phân của entry (xem EntryFrame) khi entry vừa được giải mã từ khung đó, như các entry follower nhận trong
     // AppendEntries: log ghi thẳng khung này thay vì mã hoá lại. Không thuộc về giá trị của entry.
     @lombok.EqualsAndHashCode.Exclude

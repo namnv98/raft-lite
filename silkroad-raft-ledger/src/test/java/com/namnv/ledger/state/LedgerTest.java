@@ -10,6 +10,7 @@ import com.namnv.ledger.model.LedgerBalance;
 import com.namnv.ledger.model.LedgerResult;
 import com.namnv.ledger.model.LedgerTotals;
 import com.namnv.ledger.model.LedgerTransfer;
+import com.namnv.ledger.model.PostedTransfer;
 import com.namnv.core.Status;
 import com.namnv.entity.LogEntry;
 import com.namnv.statemachine.snapshot.SnapshotReader;
@@ -56,8 +57,19 @@ class LedgerTest {
         opened.forEach(Ledger::close);
     }
 
+    // thời điểm leader gắn vào entry thứ index trong các test này
+    private static final long TIME0 = 1_700_000_000_000L;
+
+    private static LogEntry timed(long index, long timestamp, byte[] command) {
+        var entry = new LogEntry(index, 1, command);
+        entry.setTimestamp(timestamp);
+        return entry;
+    }
+
     private LedgerResult apply(Ledger ledger, byte[] command) {
-        return LedgerCodec.result(ledger.onApplyWithResult("n", new LogEntry(++index, 1, command)));
+        var entry = new LogEntry(++index, 1, command);
+        entry.setTimestamp(TIME0 + index);
+        return LedgerCodec.result(ledger.onApplyWithResult("n", entry));
     }
 
     private LedgerResult account(Ledger ledger, long id, int currency, int flags) {
@@ -177,7 +189,8 @@ class LedgerTest {
         assertEquals(500, balances.get(2).debitsPosted());
         var transfers = LedgerCodec.transfers(List.of(100L, 101L),
                 ledger.query(LedgerCodec.lookupTransfers(List.of(100L, 101L))));
-        assertEquals(new LedgerTransfer(100, 1, 2, 500, USD), transfers.get(0));
+        // thời điểm ghi là thời điểm của entry chứa giao dịch
+        assertEquals(new PostedTransfer(100, 1, 2, 500, USD, TIME0 + index), transfers.get(0));
         assertNull(transfers.get(1));
         assertEquals(ledger.totals(), LedgerCodec.totals(ledger.query(LedgerCodec.totals())));
     }
@@ -185,6 +198,7 @@ class LedgerTest {
     @Test
     void historyMovesToRocksDbButStaysExactAndMemoryStaysBounded() throws Exception {
         var ledger = bankWithTwoCustomers();
+        long first = TIME0 + index + 1; // thời điểm của giao dịch đầu tiên trong vòng lặp
         for (int i = 0; i < 20_000; i++) {
             assertEquals(OK, transfer(ledger, 1_000_000 + i, 1, 2 + (i % 2), 1 + i % 7, USD));
             // không bao giờ quá vài đoạn trong bộ nhớ, dù đã ghi hàng nghìn đoạn
@@ -196,9 +210,10 @@ class LedgerTest {
         assertEquals(EXISTS, transfer(ledger, 1_019_999, 1, 3, 1 + 19_999 % 7, USD));
         var ids = List.of(1_000_000L, 1_010_001L, 1_019_999L, 5L);
         var found = LedgerCodec.transfers(ids, ledger.query(LedgerCodec.lookupTransfers(ids)));
-        assertEquals(new LedgerTransfer(1_000_000, 1, 2, 1, USD), found.get(0));
-        assertEquals(new LedgerTransfer(1_010_001, 1, 3, 1 + 10_001 % 7, USD), found.get(1));
-        assertEquals(new LedgerTransfer(1_019_999, 1, 3, 1 + 19_999 % 7, USD), found.get(2));
+        // thời điểm ghi đi cùng giao dịch xuống RocksDB
+        assertEquals(new PostedTransfer(1_000_000, 1, 2, 1, USD, first), found.get(0));
+        assertEquals(new PostedTransfer(1_010_001, 1, 3, 1 + 10_001 % 7, USD, first + 10_001), found.get(1));
+        assertEquals(new PostedTransfer(1_019_999, 1, 3, 1 + 19_999 % 7, USD, first + 19_999), found.get(2));
         assertNull(found.get(3));
         assertEquals(20_000, ledger.totals().transfers());
         assertTrue(ledger.totals().balanced());
@@ -245,19 +260,20 @@ class LedgerTest {
         var ledger = newLedger();
         ledger.publishTo(publisher);
         // một lô ở index 5: tạo hai tài khoản, một giao dịch bị từ chối, một giao dịch thành công
-        ledger.onApplyWithResult("n", new LogEntry(5, 1, LedgerCodec.createAccount(new LedgerAccount(1, USD, 0))));
-        ledger.onApplyWithResult("n", new LogEntry(5, 1, LedgerCodec.createAccount(new LedgerAccount(2, USD, DEBITS_MUST_NOT_EXCEED_CREDITS))));
-        ledger.onApplyWithResult("n", new LogEntry(5, 1, LedgerCodec.transfer(new LedgerTransfer(10, 2, 1, 5, USD))));
-        ledger.onApplyWithResult("n", new LogEntry(5, 1, LedgerCodec.transfer(new LedgerTransfer(11, 1, 2, 7, USD))));
+        ledger.onApplyWithResult("n", timed(5, 5_000, LedgerCodec.createAccount(new LedgerAccount(1, USD, 0))));
+        ledger.onApplyWithResult("n", timed(5, 5_000, LedgerCodec.createAccount(new LedgerAccount(2, USD, DEBITS_MUST_NOT_EXCEED_CREDITS))));
+        ledger.onApplyWithResult("n", timed(5, 5_000, LedgerCodec.transfer(new LedgerTransfer(10, 2, 1, 5, USD))));
+        ledger.onApplyWithResult("n", timed(5, 5_000, LedgerCodec.transfer(new LedgerTransfer(11, 1, 2, 7, USD))));
         // gửi lại ở entry sau: EXISTS không sinh sự kiện
-        ledger.onApplyWithResult("n", new LogEntry(6, 1, LedgerCodec.transfer(new LedgerTransfer(11, 1, 2, 7, USD))));
+        ledger.onApplyWithResult("n", timed(6, 6_000, LedgerCodec.transfer(new LedgerTransfer(11, 1, 2, 7, USD))));
         var done = new CompletableFuture<Void>();
         publisher.afterPublished(() -> done.complete(null));
         done.get(5, TimeUnit.SECONDS);
         assertEquals(List.of(
-                LedgerEvent.accountCreated(5, 0, 1, USD, 0),
-                LedgerEvent.accountCreated(5, 1, 2, USD, DEBITS_MUST_NOT_EXCEED_CREDITS),
-                LedgerEvent.transferPosted(5, 3, 11, 1, 2, 7, USD)), sink.events);
+                LedgerEvent.accountCreated(5, 0, 5_000, 1, USD, 0),
+                LedgerEvent.accountCreated(5, 1, 5_000, 2, USD, DEBITS_MUST_NOT_EXCEED_CREDITS),
+                // hai bút toán: tài khoản 1 nợ 7 (nợ 7, có 0), tài khoản 2 có 7 (nợ 0, có 7)
+                LedgerEvent.transferPosted(5, 3, 5_000, 11, 1, 2, 7, USD, 7, 0, 0, 7)), sink.events);
         publisher.close();
     }
 
@@ -265,7 +281,7 @@ class LedgerTest {
     void jsonLinesSinkSkipsReplayedEventsAndDropsATornLine() throws Exception {
         Path file = dir.resolve("events.jsonl");
         try (var sink = new JsonLinesEventSink(file)) {
-            sink.write(List.of(LedgerEvent.accountCreated(3, 0, 1, USD, 0), LedgerEvent.transferPosted(4, 0, 9, 1, 2, 5, USD)));
+            sink.write(List.of(LedgerEvent.accountCreated(3, 0, 3_000, 1, USD, 0), LedgerEvent.transferPosted(4, 0, 4_000, 9, 1, 2, 5, USD, 5, 0, 0, 5)));
         }
         // mất điện giữa lúc ghi dòng kế tiếp
         Files.writeString(file, "{\"index\":5,\"posi", java.nio.file.StandardOpenOption.APPEND);
@@ -273,8 +289,8 @@ class LedgerTest {
             assertEquals(4, sink.lastIndex());
             assertEquals(0, sink.lastPosition());
             // node khởi động lại phát lại từ index 3: chỉ sự kiện mới được ghi
-            sink.write(List.of(LedgerEvent.accountCreated(3, 0, 1, USD, 0), LedgerEvent.transferPosted(4, 0, 9, 1, 2, 5, USD),
-                    LedgerEvent.transferPosted(5, 0, 10, 1, 2, 6, USD)));
+            sink.write(List.of(LedgerEvent.accountCreated(3, 0, 3_000, 1, USD, 0), LedgerEvent.transferPosted(4, 0, 4_000, 9, 1, 2, 5, USD, 5, 0, 0, 5),
+                    LedgerEvent.transferPosted(5, 0, 5_000, 10, 1, 2, 6, USD, 11, 0, 0, 11)));
         }
         var lines = Files.readAllLines(file);
         assertEquals(3, lines.size());

@@ -1,6 +1,7 @@
 package com.namnv.ledger.gateway;
 
 import com.namnv.ledger.client.LedgerClient;
+import com.namnv.ledger.view.LedgerView;
 import com.namnv.ledger.model.LedgerAccount;
 import com.namnv.ledger.model.LedgerResult;
 import com.namnv.ledger.model.LedgerTransfer;
@@ -37,6 +38,7 @@ import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.codec.http.HttpServerKeepAliveHandler;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.QueryStringDecoder;
 import io.netty.util.AsciiString;
 import lombok.extern.slf4j.Slf4j;
 
@@ -59,6 +61,8 @@ import java.util.concurrent.CompletionException;
  * POST /transfers   {"debitAccountId":2,"creditAccountId":3,"amount":100,"ledger":840}   header Idempotency-Key: ...
  * POST /accounts    {"id":2,"ledger":840,"flags":1}
  * GET  /accounts/{id}   GET /transfers/{id}   GET /totals   GET /stats (số lô và số giao dịch đã gom)
+ * GET  /accounts/{id}/entries?limit=50&amp;before=index.position    sao kê, từ phía truy vấn (cần {@link LedgerView})
+ * GET  /view/position   sự kiện cuối cùng phía truy vấn đã có
  * </pre>
  * Chống trùng: id của giao dịch là id trong body, hoặc nếu không có thì được suy ra (SHA-256) từ header
  * {@code Idempotency-Key}. Gửi lại cùng một key sau khi mất kết nối hay nhận 503 không bao giờ ghi hai lần: lần sau nhận 200
@@ -97,6 +101,8 @@ public final class LedgerGateway implements AutoCloseable {
     private Channel serverChannel;
     private final LedgerClient client;
     private final TransferBatcher batcher;
+    // phía truy vấn (CQRS) cho sao kê, hoặc null
+    private final LedgerView view;
 
     /** lỗi của request, trả về với mã {@code status} */
     private static final class HttpError extends Exception {
@@ -112,7 +118,9 @@ public final class LedgerGateway implements AutoCloseable {
     private record Reply(HttpResponseStatus status, byte[] body) {
     }
 
-    private LedgerGateway(EventLoopGroup boss, EventLoopGroup workers, LedgerClient client, TransferBatcher batcher) {
+    private LedgerGateway(EventLoopGroup boss, EventLoopGroup workers, LedgerClient client, TransferBatcher batcher,
+                          LedgerView view) {
+        this.view = view;
         this.boss = boss;
         this.workers = workers;
         this.client = client;
@@ -124,17 +132,23 @@ public final class LedgerGateway implements AutoCloseable {
      * @param batcher gom giao dịch thành lô, hoặc null để gửi từng giao dịch một
      */
     public static LedgerGateway start(int port, LedgerClient client, TransferBatcher batcher) throws InterruptedException {
-        return start(port, client, batcher,
+        return start(port, client, batcher, null);
+    }
+
+    /** @param view phía truy vấn cho sao kê ({@code /accounts/{id}/entries}), hoặc null */
+    public static LedgerGateway start(int port, LedgerClient client, TransferBatcher batcher, LedgerView view)
+            throws InterruptedException {
+        return start(port, client, batcher, view,
                 Integer.getInteger("gateway.eventLoops", Math.max(1, Runtime.getRuntime().availableProcessors() / 4)));
     }
 
-    public static LedgerGateway start(int port, LedgerClient client, TransferBatcher batcher, int eventLoops)
-            throws InterruptedException {
+    public static LedgerGateway start(int port, LedgerClient client, TransferBatcher batcher, LedgerView view,
+                                      int eventLoops) throws InterruptedException {
         boolean epoll = Epoll.isAvailable();
         EventLoopGroup boss = epoll ? new EpollEventLoopGroup(1) : new NioEventLoopGroup(1);
         EventLoopGroup workers = epoll ? new EpollEventLoopGroup(eventLoops) : new NioEventLoopGroup(eventLoops);
         Class<? extends ServerChannel> channelType = epoll ? EpollServerSocketChannel.class : NioServerSocketChannel.class;
-        var gateway = new LedgerGateway(boss, workers, client, batcher);
+        var gateway = new LedgerGateway(boss, workers, client, batcher, view);
         try {
             gateway.serverChannel = new ServerBootstrap()
                     .group(boss, workers)
@@ -257,6 +271,15 @@ public final class LedgerGateway implements AutoCloseable {
                 var account = new LedgerAccount(id, (int) fields[1], (int) fields[2]);
                 return client.createAccounts(List.of(account)).thenApply(results -> answer(id, results.getFirst()));
             }
+            if (path.startsWith("/accounts/") && path.endsWith("/entries")) {
+                requireMethod(method, HttpMethod.GET);
+                long id = pathId(path.substring(0, path.length() - "/entries".length()), "/accounts/");
+                return statement(id, new QueryStringDecoder(uri).parameters());
+            }
+            if (path.equals("/view/position")) {
+                requireMethod(method, HttpMethod.GET);
+                return requireView().position().thenApply(p -> json(HttpResponseStatus.OK, Map.of("position", p.toString())));
+            }
             if (path.startsWith("/accounts/")) {
                 requireMethod(method, HttpMethod.GET);
                 long id = pathId(path, "/accounts/");
@@ -274,6 +297,35 @@ public final class LedgerGateway implements AutoCloseable {
                         Map.of("batching", batcher != null, "batches", counters[0], "transfers", counters[1])));
             }
             throw new HttpError(HttpResponseStatus.NOT_FOUND, "no such resource: " + path);
+        }
+
+        // sao kê từ phía truy vấn: các bút toán mới nhất của tài khoản, kèm vị trí để lấy trang kế tiếp
+        private CompletableFuture<Reply> statement(long id, Map<String, List<String>> parameters) throws HttpError {
+            LedgerView source = requireView();
+            int limit;
+            LedgerView.Position before = null;
+            try {
+                limit = parameters.containsKey("limit") ? Integer.parseInt(parameters.get("limit").getFirst()) : 50;
+                if (parameters.containsKey("before")) {
+                    before = LedgerView.Position.parse(parameters.get("before").getFirst());
+                }
+            } catch (IllegalArgumentException e) {
+                throw new HttpError(HttpResponseStatus.BAD_REQUEST, "bad limit or before: " + e.getMessage());
+            }
+            if (limit < 1 || limit > 1000) {
+                throw new HttpError(HttpResponseStatus.BAD_REQUEST, "limit must be between 1 and 1000");
+            }
+            int pageSize = limit;
+            // vị trí của phía truy vấn đọc trước: các bút toán trả về chắc chắn không mới hơn nó
+            return source.position().thenCombine(source.entries(id, pageSize, before), (position, entries) -> {
+                var body = new java.util.LinkedHashMap<String, Object>();
+                body.put("accountId", id);
+                body.put("viewPosition", position.toString());
+                body.put("entries", entries);
+                body.put("next", entries.size() == pageSize
+                        ? new LedgerView.Position(entries.getLast().logIndex(), entries.getLast().logPosition()).toString() : null);
+                return json(HttpResponseStatus.OK, body);
+            });
         }
 
         // đường nóng: không dựng object trung gian cho body, trả lời được ghi tay
@@ -371,6 +423,13 @@ public final class LedgerGateway implements AutoCloseable {
         return new Reply(status, body.getBytes(StandardCharsets.US_ASCII));
     }
 
+    private LedgerView requireView() throws HttpError {
+        if (view == null) {
+            throw new HttpError(HttpResponseStatus.NOT_IMPLEMENTED, "no ledger view configured (-Dgateway.viewJdbcUrl)");
+        }
+        return view;
+    }
+
     private static Reply notFound(long id) {
         return json(HttpResponseStatus.NOT_FOUND, Map.of("id", id, "error", "not found"));
     }
@@ -447,7 +506,11 @@ public final class LedgerGateway implements AutoCloseable {
                 ? new TransferBatcher(client, Integer.getInteger("gateway.maxBatch", 1000),
                 Integer.getInteger("gateway.maxInflight", 4), Integer.getInteger("gateway.maxQueued", 100_000))
                 : null;
-        var gateway = start(Integer.parseInt(args[0]), client, batcher);
+        // -Dgateway.viewJdbcUrl=jdbc:postgresql://...: sao kê đọc từ phía truy vấn mà learner ghi (JdbcEventSink)
+        String viewUrl = System.getProperty("gateway.viewJdbcUrl");
+        LedgerView view = viewUrl == null ? null : new LedgerView(viewUrl, System.getProperty("gateway.viewUser"),
+                System.getProperty("gateway.viewPassword"), Integer.getInteger("gateway.viewThreads", 4));
+        var gateway = start(Integer.parseInt(args[0]), client, batcher, view);
         Runtime.getRuntime().addShutdownHook(new Thread(gateway::close));
         Thread.currentThread().join();
     }

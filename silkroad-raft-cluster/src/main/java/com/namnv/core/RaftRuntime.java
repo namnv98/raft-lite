@@ -13,6 +13,14 @@ public interface RaftRuntime {
 
     long nanoTime();
 
+    /**
+     * Giờ thực (epoch ms) mà leader gắn vào entry nó tạo ({@link com.namnv.entity.LogEntry#getTimestamp()}). Runtime mô
+     * phỏng trả về thời gian ảo để cả cluster vẫn tất định.
+     */
+    default long currentTimeMillis() {
+        return System.currentTimeMillis();
+    }
+
     ScheduledTask schedule(Runnable task, long delayMs);
 
     // các task chạy lần lượt theo thứ tự gửi vào, ngoài lock của node

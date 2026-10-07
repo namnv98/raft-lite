@@ -1,7 +1,9 @@
 package com.namnv.ledger.node;
 
 import com.namnv.ledger.event.EventPublisher;
+import com.namnv.ledger.event.EventSink;
 import com.namnv.ledger.event.JsonLinesEventSink;
+import com.namnv.ledger.view.JdbcEventSink;
 import com.namnv.ledger.state.Ledger;
 import com.namnv.config.NodeOptions;
 import com.namnv.config.RaftConfig;
@@ -23,7 +25,9 @@ import java.util.List;
  * -Dledger.logSync=false: không fsync log. -Dledger.snapshotInterval=100000: số entry giữa hai lần snapshot.
  * -Dledger.bindLocal=true: kết nối tới node khác đi từ chính địa chỉ của node này (cho tc netem).
  * -Dledger.learners=host:port,...: learner cố định (khai báo giống nhau trên mọi node). -Dledger.eventsFile=đường-dẫn:
- * phát mọi thay đổi đã commit vào file JSON lines đó (thường chỉ bật trên learner).
+ * phát mọi thay đổi đã commit vào file JSON lines đó (thường chỉ bật trên learner). -Dledger.eventsJdbcUrl=jdbc:postgresql://...
+ * (cùng -Dledger.eventsJdbcUser/-Dledger.eventsJdbcPassword): phát vào phía truy vấn trong cơ sở dữ liệu quan hệ
+ * ({@link JdbcEventSink}): số dư, giao dịch và sao kê cho hệ thống khác truy vấn.
  * -Dledger.expectedAccounts: số tài khoản cấp phát sẵn. -Dledger.expectedTransfers: kích thước mỗi đoạn bloom filter của
  * id giao dịch. -Dledger.segmentTransfers: số giao dịch mới giữ trong bộ nhớ trước khi ghi xuống RocksDB.
  */
@@ -106,8 +110,13 @@ public final class LedgerNode implements AutoCloseable {
     public static void main(String[] args) throws Exception {
         var learners = System.getProperty("ledger.learners", "").isBlank() ? List.<String>of()
                 : List.of(System.getProperty("ledger.learners").split(","));
+        // nơi phát sự kiện (thường chỉ trên learner): phía truy vấn trong cơ sở dữ liệu quan hệ, hoặc một file JSON lines
+        var eventsJdbcUrl = System.getProperty("ledger.eventsJdbcUrl", "");
         var eventsFile = System.getProperty("ledger.eventsFile", "");
-        var events = eventsFile.isBlank() ? null : new EventPublisher(new JsonLinesEventSink(Path.of(eventsFile)), 100_000);
+        EventSink sink = !eventsJdbcUrl.isBlank()
+                ? new JdbcEventSink(eventsJdbcUrl, System.getProperty("ledger.eventsJdbcUser"), System.getProperty("ledger.eventsJdbcPassword"))
+                : !eventsFile.isBlank() ? new JsonLinesEventSink(Path.of(eventsFile)) : null;
+        var events = sink == null ? null : new EventPublisher(sink, 100_000);
         start(args[0], List.of(args[1].split(",")), learners, args[2],
                 !"false".equals(System.getProperty("ledger.logSync")),
                 Long.getLong("ledger.snapshotInterval", 100_000),

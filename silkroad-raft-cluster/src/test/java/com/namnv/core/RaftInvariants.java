@@ -103,6 +103,28 @@ final class RaftInvariants {
 
     // Log Matching: hai log có entry cùng index và cùng term thì giống hệt nhau từ đó trở về trước.
     // Mỗi cặp (index, term) xác định duy nhất phần log đứng trước nó, nên so sánh hai log đọc ở hai thời điểm khác nhau vẫn đúng.
+    /**
+     * Mọi entry đều mang thời điểm leader tạo ra nó, và thời gian không giảm dọc theo mỗi log: log của follower luôn là
+     * tiền tố của log của một leader, và mỗi leader không gắn thời điểm nhỏ hơn entry cuối trong log của nó.
+     */
+    static void checkTimestamps(Map<String, List<LogEntry>> logs, Collection<String> violations) {
+        for (var log : logs.entrySet()) {
+            long previous = 0;
+            for (LogEntry entry : log.getValue()) {
+                if (entry.getTimestamp() == 0) {
+                    violations.add("entry " + entry.getIndex() + " on " + log.getKey() + " has no timestamp");
+                    break;
+                }
+                if (entry.getTimestamp() < previous) {
+                    violations.add("timestamps go backwards at index " + entry.getIndex() + " on " + log.getKey() + ": "
+                            + previous + " then " + entry.getTimestamp());
+                    break;
+                }
+                previous = entry.getTimestamp();
+            }
+        }
+    }
+
     static void checkLogMatching(Map<String, List<LogEntry>> logs, Collection<String> violations) {
         var byIndex = new HashMap<String, Map<Long, LogEntry>>();
         for (var log : logs.entrySet()) {
@@ -126,7 +148,8 @@ final class RaftInvariants {
                     var y = second.get(index);
                     var sameTerm = x.getTerm() == y.getTerm();
                     var same = sameTerm && Arrays.equals(x.getCommand(), y.getCommand())
-                            && x.isConfigurationEntry() == y.isConfigurationEntry();
+                            && x.isConfigurationEntry() == y.isConfigurationEntry()
+                            && x.getTimestamp() == y.getTimestamp();
                     if (sameTerm && !same) {
                         violations.add("same index and term but different entries on " + a + " and " + b + ": " + x + " vs " + y);
                         break;

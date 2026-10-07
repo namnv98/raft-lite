@@ -22,6 +22,9 @@
         <!-- cổng HTTP (LedgerGateway); epoll native trên Linux, các nơi khác dùng NIO -->
         <dependency><groupId>io.netty</groupId><artifactId>netty-codec-http</artifactId></dependency>
         <dependency><groupId>io.netty</groupId><artifactId>netty-transport-native-epoll</artifactId><classifier>linux-x86_64</classifier></dependency>
+        <!-- phía truy vấn (CQRS): sự kiện ghi vào cơ sở dữ liệu quan hệ qua JDBC; PostgreSQL khi chạy, H2 (chế độ PostgreSQL) trong test -->
+        <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
+        <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>test</scope></dependency>
         <!-- node và benchmark chạy thành tiến trình riêng: cần một backend log lúc chạy -->
         <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-slf4j2-impl</artifactId><scope>runtime</scope></dependency>
         <dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId><scope>runtime</scope></dependency>

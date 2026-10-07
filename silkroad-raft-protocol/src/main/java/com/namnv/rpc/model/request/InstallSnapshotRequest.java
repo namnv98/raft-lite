@@ -2,7 +2,6 @@ package com.namnv.rpc.model.request;
 
 import com.namnv.entity.ClientSession;
 import com.namnv.entity.ConfigurationEntry;
-import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
@@ -16,7 +15,6 @@ import java.util.Map;
  */
 @Data
 @NoArgsConstructor
-@AllArgsConstructor
 public class InstallSnapshotRequest implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
@@ -31,4 +29,21 @@ public class InstallSnapshotRequest implements Serializable {
     private long offset;              // vị trí của mẩu trong file
     private byte[] data;
     private boolean done;             // mẩu cuối cùng của file cuối cùng
+    private long lastIncludedTimestamp; // thời điểm của entry tại lastIncludedIndex (SnapshotMeta)
+
+    public InstallSnapshotRequest(long term, String leaderId, long lastIncludedIndex, long lastIncludedTerm,
+                                  ConfigurationEntry conf, Map<String, ClientSession> sessions, List<String> files,
+                                  String fileName, long offset, byte[] data, boolean done) {
+        this.term = term;
+        this.leaderId = leaderId;
+        this.lastIncludedIndex = lastIncludedIndex;
+        this.lastIncludedTerm = lastIncludedTerm;
+        this.conf = conf;
+        this.sessions = sessions;
+        this.files = files;
+        this.fileName = fileName;
+        this.offset = offset;
+        this.data = data;
+        this.done = done;
+    }
 }

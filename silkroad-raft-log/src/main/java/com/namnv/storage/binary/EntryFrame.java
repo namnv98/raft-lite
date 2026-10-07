@@ -23,7 +23,8 @@ import java.util.zip.CRC32;
  *  8  long index
  * 16  long term
  * 24  long sequence
- * 32  byte cờ, rồi clientId, cấu hình (nếu có) và cuối cùng là lệnh: nguyên các byte client gửi, không mã hoá lại
+ * 32  byte cờ, rồi thời điểm leader tạo entry (8 byte, nếu có), clientId, cấu hình (nếu có) và cuối cùng là lệnh:
+ *      nguyên các byte client gửi, không mã hoá lại
  * </pre>
  * Độ dài được ghi sau cùng: khung chưa ghi xong thì độ dài vẫn là 0 và coi như chưa tồn tại.
  * <p>
@@ -46,6 +47,7 @@ public final class EntryFrame {
     private static final int HAS_CLIENT_ID = 8;
     private static final int HAS_CONFIGURATION = 16;
     private static final int BATCH = 32;
+    private static final int HAS_TIMESTAMP = 64;
 
     private EntryFrame() {
     }
@@ -68,10 +70,15 @@ public final class EntryFrame {
                 | (entry.getCommand() != null ? HAS_COMMAND : 0)
                 | (clientId != null ? HAS_CLIENT_ID : 0)
                 | (configuration != null ? HAS_CONFIGURATION : 0)
-                | (entry.isBatch() ? BATCH : 0);
-        var meta = ByteBuffer.allocate(1 + (clientId == null ? 0 : Integer.BYTES + clientId.length)
+                | (entry.isBatch() ? BATCH : 0)
+                | (entry.getTimestamp() != 0 ? HAS_TIMESTAMP : 0);
+        var meta = ByteBuffer.allocate(1 + (entry.getTimestamp() != 0 ? Long.BYTES : 0)
+                + (clientId == null ? 0 : Integer.BYTES + clientId.length)
                 + (configuration == null ? 0 : configuration.length)).order(ByteOrder.LITTLE_ENDIAN);
         meta.put((byte) flags);
+        if (entry.getTimestamp() != 0) {
+            meta.putLong(entry.getTimestamp());
+        }
         if (clientId != null) {
             meta.putInt(clientId.length).put(clientId);
         }
@@ -106,7 +113,8 @@ public final class EntryFrame {
         byte[] clientId = entry.getClientId() == null ? null : Utf8Cache.encode(entry.getClientId());
         byte[] configuration = entry.getConfiguration() == null ? null : encode(entry.getConfiguration());
         byte[] command = entry.getCommand();
-        int length = HEADER_LENGTH + 1 + (clientId == null ? 0 : Integer.BYTES + clientId.length)
+        long timestamp = entry.getTimestamp();
+        int length = HEADER_LENGTH + 1 + (timestamp != 0 ? Long.BYTES : 0) + (clientId == null ? 0 : Integer.BYTES + clientId.length)
                 + (configuration == null ? 0 : configuration.length) + (command == null ? 0 : command.length);
         byte[] frame = new byte[align(length)];
         LONG.set(frame, INDEX_OFFSET, entry.getIndex());
@@ -118,7 +126,12 @@ public final class EntryFrame {
                 | (command != null ? HAS_COMMAND : 0)
                 | (clientId != null ? HAS_CLIENT_ID : 0)
                 | (configuration != null ? HAS_CONFIGURATION : 0)
-                | (entry.isBatch() ? BATCH : 0));
+                | (entry.isBatch() ? BATCH : 0)
+                | (timestamp != 0 ? HAS_TIMESTAMP : 0));
+        if (timestamp != 0) {
+            LONG.set(frame, position, timestamp);
+            position += Long.BYTES;
+        }
         if (clientId != null) {
             INT.set(frame, position, clientId.length);
             position += Integer.BYTES;
@@ -186,6 +199,10 @@ public final class EntryFrame {
             entry.setConfigurationEntry((flags & CONFIGURATION_ENTRY) != 0);
             entry.setSessionClose((flags & SESSION_CLOSE) != 0);
             entry.setBatch((flags & BATCH) != 0);
+            if ((flags & HAS_TIMESTAMP) != 0) {
+                entry.setTimestamp(buffer.getLong(position));
+                position += Long.BYTES;
+            }
             if ((flags & HAS_CLIENT_ID) != 0) {
                 int idLength = buffer.getInt(position);
                 position += Integer.BYTES;

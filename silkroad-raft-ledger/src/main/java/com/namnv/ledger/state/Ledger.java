@@ -61,8 +61,8 @@ public class Ledger implements StateMachine, AutoCloseable {
     private int accountCount;
 
     private final TransferStore transfers;
-    // chỗ đọc một giao dịch: {nợ, có, số tiền, ledger}
-    private final long[] found = new long[4];
+    // chỗ đọc một giao dịch: {nợ, có, số tiền, ledger, thời điểm}
+    private final long[] found = new long[5];
 
     private long totalDebits;
     private long totalCredits;
@@ -72,6 +72,8 @@ public class Ledger implements StateMachine, AutoCloseable {
     private boolean loading;
     private long applyingIndex = -1;
     private int applyingPosition;
+    // thời điểm leader tạo entry đang apply: thời gian của mọi thay đổi trong entry đó
+    private long applyingTimestamp;
     private long lastEventIndex;
     private int lastEventPosition = -1;
 
@@ -138,6 +140,7 @@ public class Ledger implements StateMachine, AutoCloseable {
         } else {
             applyingPosition++;
         }
+        applyingTimestamp = entry.getTimestamp();
         switch (command[0]) {
             case LedgerCodec.CREATE_ACCOUNT -> {
                 if (command.length != LedgerCodec.CREATE_ACCOUNT_BYTES) {
@@ -193,7 +196,7 @@ public class Ledger implements StateMachine, AutoCloseable {
         debitsPosted[slot] = 0;
         creditsPosted[slot] = 0;
         accountIndex.put(id, slot);
-        emit(LedgerEvent.accountCreated(applyingIndex, applyingPosition, id, ledger, flags));
+        emit(LedgerEvent.accountCreated(applyingIndex, applyingPosition, applyingTimestamp, id, ledger, flags));
         return LedgerResult.OK;
     }
 
@@ -242,8 +245,9 @@ public class Ledger implements StateMachine, AutoCloseable {
         creditsPosted[credit] = newCredits;
         totalDebits += amount;
         totalCredits += amount;
-        transfers.add(id, debitId, creditId, amount, ledger);
-        emit(LedgerEvent.transferPosted(applyingIndex, applyingPosition, id, debitId, creditId, amount, ledger));
+        transfers.add(id, debitId, creditId, amount, ledger, applyingTimestamp);
+        emit(LedgerEvent.transferPosted(applyingIndex, applyingPosition, applyingTimestamp, id, debitId, creditId, amount,
+                ledger, debitsPosted[debit], creditsPosted[debit], debitsPosted[credit], creditsPosted[credit]));
         return LedgerResult.OK;
     }
 
@@ -276,9 +280,10 @@ public class Ledger implements StateMachine, AutoCloseable {
                 var out = LedgerCodec.transferRows(count);
                 for (int i = 0; i < count; i++) {
                     if (transfers.find(in.getLong(), found)) {
-                        out.put((byte) 1).putLong(found[0]).putLong(found[1]).putLong(found[2]).putInt((int) found[3]);
+                        out.put((byte) 1).putLong(found[0]).putLong(found[1]).putLong(found[2]).putInt((int) found[3])
+                                .putLong(found[4]);
                     } else {
-                        out.put((byte) 0).putLong(0).putLong(0).putLong(0).putInt(0);
+                        out.put((byte) 0).putLong(0).putLong(0).putLong(0).putInt(0).putLong(0);
                     }
                 }
                 return out.array();
