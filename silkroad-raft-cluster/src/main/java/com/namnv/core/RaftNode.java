@@ -1996,7 +1996,20 @@ public class RaftNode implements RaftServerService {
             if (logStore.durableIndex() < logStore.lastIndex()) {
                 requestLogSync(); // lần fsync trước thất bại, hoặc chưa kịp chạy
             }
+            var now = runtime.nanoTime();
+            var stuck = TimeUnit.MILLISECONDS.toNanos(2L * nodeOptions.getElectionTimeoutMaxMs());
             for (String peer : replicationTargets()) {
+                var progress = leaderState.progress(peer);
+                if (progress.inflight > 0 && now - progress.lastActivityNanos > stuck) {
+                    // Request đang bay mà lâu không có câu trả lời nào: có thể nó đã mất mà transport không báo (máy của
+                    // peer mất điện thì kết nối không bị reset, transport không có timeout...). Không có lối thoát này thì
+                    // cửa sổ của peer đầy mãi và leader không bao giờ gửi gì cho nó nữa. Dò lại từ phần đã khớp; câu trả
+                    // lời muộn của lần cũ (nếu có) bị bỏ qua nhờ generation.
+                    log.warn("Leader {} got no answer from {} for {} ms with {} request(s) in flight, probing again", nodeId,
+                            peer, TimeUnit.NANOSECONDS.toMillis(now - progress.lastActivityNanos), progress.inflight);
+                    restartProbe(leaderState, peer, leaderState.getMatchIndex().getOrDefault(peer, 0L) + 1);
+                    continue;
+                }
                 replicateTo(peer, true);
             }
         } finally {
@@ -2094,6 +2107,7 @@ public class RaftNode implements RaftServerService {
             if (nextIdx <= logStore.getBaseIndex()) {
                 // phần follower cần đã bị compact vào snapshot; snapshot đi từng mẩu một
                 if (progress.inflight == 0) {
+                    progress.lastActivityNanos = runtime.nanoTime();
                     progress.inflight++;
                     sendSnapshot(ls, peer, progress.generation);
                 }
@@ -2101,6 +2115,9 @@ public class RaftNode implements RaftServerService {
             }
             if (nextIdx > lastIndex && !force) {
                 return; // không có gì mới; các request đang bay đã mang mọi entry
+            }
+            if (progress.inflight == 0) {
+                progress.lastActivityNanos = runtime.nanoTime();
             }
             progress.inflight++;
             sendEntries(ls, peer, nextIdx, progress);
@@ -2197,6 +2214,7 @@ public class RaftNode implements RaftServerService {
         boolean current = progress.generation == generation;
         if (current) {
             progress.inflight = Math.max(0, progress.inflight - 1);
+            progress.lastActivityNanos = runtime.nanoTime();
         }
         if (resp == null) {
             // request bị mất hoặc hết hạn: các request pipeline sau nó sẽ không khớp, nên dò lại từ phần đã chắc chắn
@@ -2319,6 +2337,7 @@ public class RaftNode implements RaftServerService {
         var progress = ls.progress(peer);
         if (progress.generation == generation) {
             progress.inflight = Math.max(0, progress.inflight - 1);
+            progress.lastActivityNanos = runtime.nanoTime();
         }
         if (resp == null || !isCurrentLeader(ls, resp.getTerm())) {
             return; // không rõ mẩu đã tới chưa: nhịp sau gửi lại đúng mẩu này

@@ -244,6 +244,10 @@ class RaftSimulationTest {
         private final Set<String> invoked = new HashSet<>();
         private final Map<Long, String> leaderByTerm = new HashMap<>();
         private final List<String> violations = new ArrayList<>();
+        private final Map<Long, String> outstanding = new java.util.TreeMap<>();
+        // node đã mất điện: từ lúc đó không gửi được gì nữa, kể cả câu trả lời cho request nó đã nhận
+        private final Set<RaftServerService> powerLost = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        private long calls;
 
         private boolean faults = true;
         private boolean actorsRunning = true;
@@ -345,8 +349,36 @@ class RaftSimulationTest {
         private void require(boolean reached, String what) {
             if (!reached) {
                 fail("seed " + seed + ": " + what + " within 60s after all faults were healed; violations so far: "
-                        + distinctViolations());
+                        + distinctViolations() + "; nodes: " + describeNodes());
             }
+        }
+
+        // trạng thái từng node, để chẩn đoán một lượt không hội tụ
+        private String describeNodes() {
+            var out = new StringBuilder();
+            for (String id : ids) {
+                var node = nodes.get(id);
+                var m = node.metrics();
+                var store = machines.get(id).getStore();
+                out.append(String.format("%n  instance %d", System.identityHashCode(registry.get(id))));
+                out.append(String.format("%n  %s%s %s term=%d leader=%s commit=%d applied=%d log=[%d..%d] pending=%d "
+                                + "conf=%s store=%d last=%s", id, down.contains(id) ? " (down)" : "", m.state(), m.term(),
+                        m.leaderId(), m.commitIndex(), m.lastApplied(), m.firstLogIndex(), m.lastLogIndex(),
+                        m.pendingCommands(), node.getConf(), store.size(), store.isEmpty() ? "-" : store.getLast()));
+                var ls = node.getLeaderState();
+                if (m.state() == NodeState.LEADER && ls != null) {
+                    for (String peer : ids) {
+                        if (!peer.equals(id)) {
+                            var progress = ls.progress(peer);
+                            out.append(String.format("%n    -> %s next=%d match=%d inflight=%d pipelining=%s generation=%d",
+                                    peer, ls.getNextIndex().get(peer), ls.getMatchIndex().get(peer), progress.inflight,
+                                    progress.pipelining, progress.generation));
+                        }
+                    }
+                }
+            }
+            outstanding.values().forEach(call -> out.append("\n  pending ").append(call));
+            return out.toString();
         }
 
         // ---------- cluster ----------
@@ -406,6 +438,9 @@ class RaftSimulationTest {
         private void powerLoss(String id) {
             retire(id);
             down.add(id);
+            // RaftInvariants.powerLoss tắt node bằng shutdown(): việc đó flush log và trả lời các request đang chờ fsync,
+            // còn mất điện thì không. Những câu trả lời đó không được rời khỏi node, vì phần log chúng xác nhận sẽ bị bỏ
+            powerLost.add(nodes.get(id));
             registry.remove(id);
             try {
                 RaftInvariants.powerLoss(nodes.get(id), dataDir.resolve(id));
@@ -480,6 +515,10 @@ class RaftSimulationTest {
         private <T> CompletableFuture<T> callAsync(String from, String to,
                                                    Function<RaftServerService, CompletableFuture<T>> invoke) {
             var result = new CompletableFuture<T>();
+            // RPC chưa hoàn tất và đang ở chặng nào, để chẩn đoán một lượt không hội tụ
+            long call = ++calls;
+            outstanding.put(call, from + "->" + to + " sent at " + sim.nowMs() + "ms: in flight");
+            result.whenComplete((r, e) -> outstanding.remove(call));
             var dropRequest = faults && random.nextDouble() < dropRate;
             sim.schedule(delay(), () -> {
                 var handler = registry.get(to);
@@ -492,6 +531,8 @@ class RaftSimulationTest {
                     sim.schedule(random.nextInt(maxDuplicateDelayMs), () -> deliverDuplicate(to, invoke));
                 }
                 CompletableFuture<T> answer;
+                outstanding.computeIfPresent(call, (k, v) -> v.replace("in flight", "delivered at " + sim.nowMs()
+                        + "ms to instance " + System.identityHashCode(handler) + ", waiting for the handler"));
                 try {
                     answer = invoke.apply(handler);
                 } catch (RuntimeException e) {
@@ -499,6 +540,11 @@ class RaftSimulationTest {
                     return;
                 }
                 answer.whenComplete((response, error) -> {
+                    if (powerLost.contains(handler)) {
+                        // mất điện thật thì không dòng code nào của node chạy nữa: không có câu trả lời, kết nối cũng
+                        // không bị reset; người gửi chỉ có thể tự nhận ra là request đã mất
+                        return;
+                    }
                     if (error != null || (faults && random.nextDouble() < dropRate)) {
                         // handler đã chạy xong nhưng người gửi không bao giờ biết
                         sim.schedule(delay(), () -> result.completeExceptionally(new IOException("response dropped")));

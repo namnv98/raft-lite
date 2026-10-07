@@ -87,12 +87,18 @@ class RaftClusterTest {
         volatile String dropAppendsTarget;
         final AtomicInteger appendsToDrop = new AtomicInteger();
         final AtomicInteger appendsDropped = new AtomicInteger();
+        // số AppendEntries tới dropAppendsTarget (sau các request bị làm mất ở trên) biến mất không dấu vết: không tới
+        // nơi và cũng không bao giờ báo lỗi, như khi máy của peer mất điện và transport không có timeout
+        final AtomicInteger appendsToSwallow = new AtomicInteger();
 
         @Override
         public CompletableFuture<AppendEntriesResponse> appendEntries(String target, AppendEntriesRequest req) {
             if (target.equals(dropAppendsTarget) && appendsToDrop.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                 appendsDropped.incrementAndGet();
                 return CompletableFuture.failedFuture(new java.io.IOException("dropped"));
+            }
+            if (target.equals(dropAppendsTarget) && appendsToSwallow.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                return new CompletableFuture<>();
             }
             var response = super.appendEntries(target, req);
             var gate = heldResponses;
@@ -1452,6 +1458,31 @@ class RaftClusterTest {
         awaitStore(follower, expected);
         await("leader to know the follower has everything",
                 () -> matchIndex(leader, follower) == leader.getPersistent().getLogStore().lastIndex());
+    }
+
+    @Test
+    void requestThatVanishesWithoutAnErrorDoesNotStallTheFollowerForever() throws Exception {
+        startCluster("A", "B", "C");
+        var leader = awaitLeader();
+        var follower = others(leader.getNodeId()).get(0);
+        write(leader, "0");
+        awaitStore(follower, List.of("0"));
+
+        // một request bị mất (có báo lỗi) đưa follower về chế độ dò, rồi chính request dò bị nuốt: cửa sổ dò (1 request)
+        // đầy mà không bao giờ có câu trả lời hay lỗi nào
+        rpc.dropAppendsTarget = follower;
+        rpc.appendsToSwallow.set(1);
+        rpc.appendsToDrop.set(1);
+        var expected = new ArrayList<String>(List.of("0"));
+        for (int i = 1; i <= 20; i++) {
+            expected.add(String.valueOf(i));
+            // follower kia vẫn đủ quorum: mọi lệnh được commit
+            write(leader, String.valueOf(i));
+        }
+        assertEquals(1, rpc.appendsDropped.get());
+        assertEquals(0, rpc.appendsToSwallow.get());
+        // leader nhận ra request đang bay đã mất và dò lại: follower vẫn nhận đủ
+        awaitStore(follower, expected);
     }
 
     @Test

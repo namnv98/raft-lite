@@ -722,6 +722,12 @@ Không có quyền root thì có thể giả lập độ trễ trong Java bằng
 thấp hơn chừng 5-10% vì leader gửi nhiều request nhỏ hơn; khi các node cùng một máy hoặc một rack thì có thể đặt
 `maxInflightAppends = 1`.
 
+**Request mất không dấu vết.** Leader không chỉ trông vào timeout của transport để biết một request đã mất: khi máy của
+peer mất điện, kết nối không bị reset, và một `MessageTransport` có thể không có timeout. Nếu một peer có request đang bay
+mà quá `2 × electionTimeoutMaxMs` không có câu trả lời nào, nhịp heartbeat kế tiếp quay về dò từ phần đã khớp (câu trả lời
+muộn của lần cũ bị bỏ qua nhờ số `generation`). Không có lối thoát này thì ở chế độ dò (cửa sổ một request) follower đó
+không bao giờ nhận được gì nữa — mô phỏng tất định đã tìm ra đúng trường hợp đó.
+
 ### Các quy tắc về độ bền
 
 Mọi thứ một node hứa với node khác phải nằm trên đĩa trước khi lời hứa được gửi đi:

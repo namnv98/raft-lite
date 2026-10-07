@@ -72,6 +72,9 @@ public class LeaderState {
         public int inflight;
         // tăng mỗi lần quay về dò; request mang số cũ là của lần trước
         public long generation;
+        // lần cuối peer cho thấy nó còn trả lời (response của lần dò hiện tại), hoặc lúc bắt đầu chờ một request: request
+        // đang bay mà quá lâu không có gì thì coi như đã mất (xem RaftNode#onHeartbeatTick)
+        public long lastActivityNanos;
 
         public void restartProbe() {
             pipelining = false;
