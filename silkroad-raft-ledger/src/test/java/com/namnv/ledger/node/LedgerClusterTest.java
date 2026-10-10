@@ -10,7 +10,7 @@ import com.namnv.ledger.model.LedgerResult;
 import com.namnv.ledger.model.LedgerTotals;
 import com.namnv.ledger.model.LedgerTransfer;
 import com.namnv.ledger.state.Ledger;
-import com.namnv.core.NodeState;
+import com.namnv.raft.NodeState;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;

@@ -18,9 +18,9 @@ import static java.util.Objects.isNull;
 public class ConfigurationEntry implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
-    private List<String> oldNodes = new ArrayList<>();  // cấu hình cũ
-    private List<String> newNodes = new ArrayList<>();  // cấu hình mới
-    private boolean isJoint = false;                   // joint config hay final
+    private List<String> oldNodes = new ArrayList<>(); 
+    private List<String> newNodes = new ArrayList<>(); 
+    private boolean isJoint = false;                  
 
     public ConfigurationEntry() {
     }

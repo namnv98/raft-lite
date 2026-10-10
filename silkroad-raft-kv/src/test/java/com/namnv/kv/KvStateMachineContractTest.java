@@ -1,18 +1,17 @@
 package com.namnv.kv;
 
-import com.namnv.config.NodeOptions;
-import com.namnv.config.RaftConfig;
-import com.namnv.core.NodeState;
-import com.namnv.core.RaftClientService;
-import com.namnv.core.RaftNode;
-import com.namnv.core.Status;
-import com.namnv.core.ThreadedRuntime;
-import com.namnv.entity.LogEntry;
 import com.namnv.client.RaftClient;
+import com.namnv.entity.LogEntry;
+import com.namnv.raft.NodeState;
+import com.namnv.raft.RaftClientService;
+import com.namnv.raft.RaftNode;
+import com.namnv.raft.config.NodeOptions;
+import com.namnv.raft.config.RaftConfig;
+import com.namnv.raft.runtime.ThreadedRuntime;
+import com.namnv.storage.snapshot.SnapshotReader;
+import com.namnv.storage.snapshot.SnapshotWriter;
 import com.namnv.transport.nio.NioRpcClient;
 import com.namnv.transport.nio.NioRpcServer;
-import com.namnv.statemachine.snapshot.SnapshotReader;
-import com.namnv.statemachine.snapshot.SnapshotWriter;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -132,13 +131,12 @@ abstract class KvStateMachineContractTest {
 
         Path snapshotDir = Files.createDirectories(dir.resolve("snapshot"));
         var writer = new SnapshotWriter(snapshotDir.toString(), new ArrayList<>());
-        var saved = new CompletableFuture<Status>();
-        source.onSnapshotSave(writer, saved::complete);
+        var saved = source.onSnapshotSave(writer);
         // lệnh apply sau lúc chụp không được lọt vào snapshot, dù đã vào LMDB trước khi file được ghi xong
         apply(source, KvCommands.put(bytes("key3"), bytes("after")));
         apply(source, KvCommands.put(bytes("late"), bytes("after")));
         source.flushNow();
-        assertTrue(saved.get(10, TimeUnit.SECONDS).isOk());
+        saved.get(10, TimeUnit.SECONDS); // ném lỗi nếu không ghi được
         assertTrue(!writer.getFile().isEmpty(), "snapshot must register its files");
 
         var target = machine("dst");

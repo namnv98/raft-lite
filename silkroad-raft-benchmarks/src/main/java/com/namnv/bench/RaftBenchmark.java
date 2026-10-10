@@ -1,22 +1,20 @@
 package com.namnv.bench;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.namnv.config.NodeOptions;
-import com.namnv.config.RaftConfig;
-import com.namnv.core.Closure;
-import com.namnv.core.NodeState;
-import com.namnv.core.RaftNode;
-import com.namnv.core.Status;
 import com.namnv.entity.LogEntry;
+import com.namnv.raft.NodeState;
+import com.namnv.raft.RaftNode;
+import com.namnv.raft.StateMachine;
+import com.namnv.raft.config.NodeOptions;
+import com.namnv.raft.config.RaftConfig;
 import com.namnv.rpc.RpcCodec;
-import com.namnv.transport.InMemoryRpcClient;
 import com.namnv.rpc.RpcProcessor;
-import com.namnv.transport.SocketRpcClient;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
+import com.namnv.storage.snapshot.SnapshotReader;
+import com.namnv.storage.snapshot.SnapshotWriter;
+import com.namnv.transport.InMemoryRpcClient;
+import com.namnv.transport.SocketRpcClient;
 import com.namnv.transport.SocketRpcServer;
-import com.namnv.statemachine.StateMachine;
-import com.namnv.statemachine.snapshot.SnapshotReader;
-import com.namnv.statemachine.snapshot.SnapshotWriter;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -34,6 +32,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -67,14 +66,16 @@ public class RaftBenchmark {
         }
 
         @Override
-        public void onSnapshotSave(SnapshotWriter writer, Closure done) {
+        public CompletableFuture<Void> onSnapshotSave(SnapshotWriter writer) {
+            var done = new CompletableFuture<Void>();
             try {
                 Files.writeString(Path.of(writer.getPath(), "count"), Long.toString(applied.get()));
                 writer.addFile("count");
-                done.run(Status.OK());
+                done.complete(null);
             } catch (IOException e) {
-                done.run(Status.ERROR(e.getMessage()));
+                done.completeExceptionally(e);
             }
+            return done;
         }
 
         @Override

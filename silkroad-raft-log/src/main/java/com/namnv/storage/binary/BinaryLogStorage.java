@@ -487,7 +487,7 @@ public class BinaryLogStorage implements LogStorage {
 
     @Override
     public synchronized long lastTerm() {
-        if (offsets.size() == 0) return baseTerm; // nếu empty thì term = baseTerm
+        if (offsets.size() == 0) return baseTerm;
         return get(lastIndex()).getTerm();
     }
 

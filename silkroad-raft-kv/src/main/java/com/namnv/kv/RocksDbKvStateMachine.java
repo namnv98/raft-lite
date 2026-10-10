@@ -1,9 +1,7 @@
 package com.namnv.kv;
 
-import com.namnv.core.Closure;
-import com.namnv.core.Status;
-import com.namnv.statemachine.snapshot.SnapshotReader;
-import com.namnv.statemachine.snapshot.SnapshotWriter;
+import com.namnv.storage.snapshot.SnapshotReader;
+import com.namnv.storage.snapshot.SnapshotWriter;
 import lombok.extern.slf4j.Slf4j;
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.BloomFilter;
@@ -21,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Stream;
 
@@ -111,7 +110,8 @@ public class RocksDbKvStateMachine extends BufferedKvStateMachine {
     }
 
     @Override
-    public void onSnapshotSave(SnapshotWriter writer, Closure done) {
+    public CompletableFuture<Void> onSnapshotSave(SnapshotWriter writer) {
+        var done = new CompletableFuture<Void>();
         whenWrittenUpToNow(() -> {
             Path snapshotDir = Path.of(writer.getPath());
             Path checkpointDir = snapshotDir.resolve("rocks-checkpoint");
@@ -128,14 +128,15 @@ public class RocksDbKvStateMachine extends BufferedKvStateMachine {
                 }
                 Files.delete(checkpointDir);
                 log.info("RocksDB snapshot saved, files={}", writer.getFile().size());
-                done.run(Status.OK());
+                done.complete(null);
             } catch (RocksDBException | IOException | RuntimeException e) {
                 log.error("RocksDB snapshot save failed", e);
-                done.run(Status.ERROR(e.getMessage()));
+                done.completeExceptionally(e);
             } finally {
                 dbLock.readLock().unlock();
             }
         });
+        return done;
     }
 
     @Override

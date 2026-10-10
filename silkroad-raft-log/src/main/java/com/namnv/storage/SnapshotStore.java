@@ -2,7 +2,7 @@ package com.namnv.storage;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
-import com.namnv.statemachine.snapshot.SnapshotMeta;
+import com.namnv.storage.snapshot.SnapshotMeta;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;

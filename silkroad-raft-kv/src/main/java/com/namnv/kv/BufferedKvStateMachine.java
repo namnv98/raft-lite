@@ -1,8 +1,8 @@
 package com.namnv.kv;
 
 import com.namnv.entity.LogEntry;
-import com.namnv.statemachine.StateMachine;
-import com.namnv.statemachine.snapshot.SnapshotReader;
+import com.namnv.raft.StateMachine;
+import com.namnv.storage.snapshot.SnapshotReader;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;

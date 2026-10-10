@@ -11,7 +11,6 @@ import com.alipay.sofa.jraft.entity.Task;
 import com.alipay.sofa.jraft.option.NodeOptions;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotReader;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotWriter;
-import org.apache.commons.io.FileUtils;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -20,7 +19,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class SimpleRaftCluster {
-//        com.alipay.sofa.jraft.core.NodeImpl;
 
     // StateMachine in ra lệnh được apply
     public static class MyStateMachine extends StateMachineAdapter {
@@ -40,7 +38,6 @@ public class SimpleRaftCluster {
         }
 
 
-        // Lưu snapshot
         @Override
         public void onSnapshotSave(SnapshotWriter writer, Closure done) {
             try {
@@ -51,8 +48,7 @@ public class SimpleRaftCluster {
                     fos.write(snapshotData.getBytes());
                 }
 
-                // add file vào writer
-                writer.addFile("snapshot.data");
+                    writer.addFile("snapshot.data");
                 System.out.println("Node " + nodeId + " saved snapshot");
             } catch (Exception e) {
                 e.printStackTrace();
@@ -77,22 +73,6 @@ public class SimpleRaftCluster {
     }
 
     public static void main(String[] args) throws Exception {
-
-//        FileUtils.deleteDirectory(new File("node/node8081/log"));
-//        FileUtils.deleteDirectory(new File("node/node8082/log"));
-//        FileUtils.deleteDirectory(new File("node/node8083/log"));
-//        FileUtils.deleteDirectory(new File("node/node8084/log"));
-//
-//        FileUtils.deleteDirectory(new File("node/node8081/meta"));
-//        FileUtils.deleteDirectory(new File("node/node8082/meta"));
-//        FileUtils.deleteDirectory(new File("node/node8083/meta"));
-//        FileUtils.deleteDirectory(new File("node/node8084/meta"));
-//
-//        FileUtils.deleteDirectory(new File("node/node8081/snapshot"));
-//        FileUtils.deleteDirectory(new File("node/node8082/snapshot"));
-//        FileUtils.deleteDirectory(new File("node/node8083/snapshot"));
-//        FileUtils.deleteDirectory(new File("node/node8084/snapshot"));
-
         int[] ports = {8081, 8082, 8083};
         RaftGroupService[] services = new RaftGroupService[ports.length];
         Node[] nodes = new Node[ports.length];
@@ -147,7 +127,7 @@ public class SimpleRaftCluster {
 
         TimeUnit.SECONDS.sleep(20);
 
-// 4️⃣ Thêm node4
+        // 4️⃣ Thêm node4
         PeerId node4Id = new PeerId("localhost", 8084);
         NodeOptions node4Options = new NodeOptions();
         node4Options.setElectionTimeoutMs(1000);

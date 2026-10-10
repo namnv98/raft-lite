@@ -2,7 +2,7 @@ package com.namnv.storage;
 
 import com.namnv.entity.ClientSession;
 import com.namnv.entity.ConfigurationEntry;
-import com.namnv.statemachine.snapshot.SnapshotMeta;
+import com.namnv.storage.snapshot.SnapshotMeta;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 

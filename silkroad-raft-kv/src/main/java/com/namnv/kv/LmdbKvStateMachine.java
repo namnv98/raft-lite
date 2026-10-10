@@ -1,9 +1,7 @@
 package com.namnv.kv;
 
-import com.namnv.core.Closure;
-import com.namnv.core.Status;
-import com.namnv.statemachine.snapshot.SnapshotReader;
-import com.namnv.statemachine.snapshot.SnapshotWriter;
+import com.namnv.storage.snapshot.SnapshotReader;
+import com.namnv.storage.snapshot.SnapshotWriter;
 import lombok.extern.slf4j.Slf4j;
 import org.lmdbjava.CursorIterable;
 import org.lmdbjava.Dbi;
@@ -24,6 +22,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 import static org.lmdbjava.ByteArrayProxy.PROXY_BA;
 
@@ -82,7 +81,8 @@ public class LmdbKvStateMachine extends BufferedKvStateMachine {
     }
 
     @Override
-    public void onSnapshotSave(SnapshotWriter writer, Closure done) {
+    public CompletableFuture<Void> onSnapshotSave(SnapshotWriter writer) {
+        var done = new CompletableFuture<Void>();
         // Chụp danh sách lô trước, mở transaction đọc sau: lô nào được commit giữa hai bước thì có ở cả hai nơi,
         // và ghi đè lên chính nó bằng cùng giá trị thì không sao.
         var unwritten = captureUnwritten();
@@ -116,12 +116,13 @@ public class LmdbKvStateMachine extends BufferedKvStateMachine {
                 }
                 writer.addFile(SNAPSHOT_FILE);
                 log.info("LMDB snapshot saved, keys={}", count);
-                done.run(Status.OK());
+                done.complete(null);
             } catch (Exception e) {
                 log.error("LMDB snapshot save failed", e);
-                done.run(Status.ERROR(e.getMessage()));
+                done.completeExceptionally(e);
             }
         });
+        return done;
     }
 
     private static void write(DataOutputStream out, byte[] key, byte[] value) throws IOException {

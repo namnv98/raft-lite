@@ -1,14 +1,13 @@
 package com.namnv.samples;
 
-import com.namnv.ListStateMachine;
-
-import com.namnv.config.NodeOptions;
-import com.namnv.config.RaftConfig;
-import com.namnv.core.NodeState;
-import com.namnv.core.RaftNode;
+import com.namnv.raft.NodeState;
+import com.namnv.raft.RaftNode;
+import com.namnv.raft.config.NodeOptions;
+import com.namnv.raft.config.RaftConfig;
+import com.namnv.raft.example.ListStateMachine;
+import com.namnv.rpc.RpcProcessor;
 import com.namnv.transport.SocketRpcClient;
 import com.namnv.transport.SocketRpcServer;
-import com.namnv.rpc.RpcProcessor;
 import org.apache.commons.io.FileUtils;
 
 import java.io.File;

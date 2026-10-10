@@ -1,5 +1,6 @@
 package com.namnv.ledger.state;
 
+import com.namnv.entity.LogEntry;
 import com.namnv.ledger.codec.LedgerCodec;
 import com.namnv.ledger.event.EventPublisher;
 import com.namnv.ledger.event.EventSink;
@@ -11,10 +12,8 @@ import com.namnv.ledger.model.LedgerResult;
 import com.namnv.ledger.model.LedgerTotals;
 import com.namnv.ledger.model.LedgerTransfer;
 import com.namnv.ledger.model.PostedTransfer;
-import com.namnv.core.Status;
-import com.namnv.entity.LogEntry;
-import com.namnv.statemachine.snapshot.SnapshotReader;
-import com.namnv.statemachine.snapshot.SnapshotWriter;
+import com.namnv.storage.snapshot.SnapshotReader;
+import com.namnv.storage.snapshot.SnapshotWriter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -326,11 +325,10 @@ class LedgerTest {
         }
         Path snapshot = Files.createDirectories(dir.resolve("snapshot"));
         var writer = new SnapshotWriter(snapshot.toString(), new ArrayList<>());
-        var saved = new CompletableFuture<Status>();
-        ledger.onSnapshotSave(writer, saved::complete);
+        var saved = ledger.onSnapshotSave(writer);
         // ghi tiếp sau lúc chụp: không được lọt vào snapshot
         assertEquals(OK, transfer(ledger, 99_999, 1, 2, 7, USD));
-        assertTrue(saved.get(10, TimeUnit.SECONDS).isOk());
+        saved.get(10, TimeUnit.SECONDS); // ném lỗi nếu không ghi được
 
         var restored = newLedger();
         assertEquals(OK, account(restored, 77, USD, 0)); // state cũ phải bị thay hoàn toàn

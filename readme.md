@@ -247,8 +247,8 @@ Cài đặt interface `StateMachine` (xem Javadoc trong mã nguồn; `ListStateM
 
 - **`onApply(node, entry)`** áp dụng một lệnh đã commit. Được gọi theo đúng thứ tự index khi node đang giữ lock, nên cần nhanh.
   Lệnh gửi lại bị trùng không bao giờ tới đây.
-- **`onSnapshotSave(writer, done)`** lưu state vào thư mục `writer.getPath()`, đăng ký từng file bằng `writer.addFile(name)`,
-  rồi gọi `done`. Hàm này được gọi khi node đang giữ lock: hãy chụp một bản sao của state ngay trong lời gọi,
+- **`onSnapshotSave(writer)`** lưu state vào thư mục `writer.getPath()`, đăng ký từng file bằng `writer.addFile(name)`,
+  và trả về một `CompletableFuture<Void>` hoàn tất khi ghi xong (thất bại nếu không ghi được). Hàm này được gọi khi node đang giữ lock: hãy chụp một bản sao của state ngay trong lời gọi,
   còn việc ghi file thì làm ở thread khác. Ghi đồng bộ vẫn đúng nhưng chặn node trong lúc ghi.
 - **`onSnapshotLoad(reader)`** thay toàn bộ state bằng snapshot trong `reader.getPath()`.
   Trả về `false` hoặc ném exception đều được coi là state có thể đã hỏng: node dừng hẳn để lần khởi động sau dựng lại từ đĩa.
@@ -538,7 +538,7 @@ cần `silkroad-raft-cluster` cùng một transport.
 | `silkroad-raft-protocol` | request/response, `RpcCodec`, các interface `RaftServerService`, `ClientService`, `RpcProcessor`, `MessageTransport` | log |
 | `silkroad-raft-transport` | `SocketRpcClient`/`SocketRpcServer`, `NioRpcClient`/`NioRpcServer`, `InMemoryRpcClient`, TLS | protocol, agent |
 | `silkroad-raft-client` | `RaftClient` | transport |
-| `silkroad-raft-cluster` | đồng thuận: `RaftNode`, `RaftRuntime`, `NodeOptions`, state bền vững, timer, `StateMachine` | protocol, log, agent |
+| `silkroad-raft-cluster` | đồng thuận: `RaftNode` và các thành phần của nó, `RaftRuntime`, `NodeOptions`, `StateMachine` | protocol, log, agent |
 | `silkroad-raft-kv` | `LmdbKvStateMachine`, `RocksDbKvStateMachine` | cluster |
 | `silkroad-raft-ledger` | dịch vụ sổ cái kép: `Ledger` (state machine), `LedgerClient`, `LedgerNode`, cổng HTTP `LedgerGateway`, dòng sự kiện `EventPublisher`, `LedgerBenchmark`, `GatewayBenchmark` | cluster, transport, client |
 | `silkroad-raft-samples` | `AppRaftInMem`, `AppRaftSocket` | cluster, transport |
@@ -553,29 +553,34 @@ Thư viện chỉ phụ thuộc `slf4j-api`; ứng dụng tự chọn backend lo
 com.namnv
 ├── agent
 │   └── AgentLoop           vòng làm việc kiểu agent của Aeron: poll socket, chạy việc của node, ghi theo đợt, idle strategy
-├── core
-│   ├── RaftNode            toàn bộ logic Raft của một node
-│   ├── RaftRuntime         đồng hồ, timer, thread ghi đĩa, nguồn ngẫu nhiên (tiêm được)
-│   ├── ThreadedRuntime     runtime mặc định: thread và đồng hồ thật
-│   ├── RaftMetrics         ảnh chụp trạng thái và bộ đếm
-│   ├── NodeState           LEADER / CANDIDATE / FOLLOWER
-│   └── NotLeaderException
-├── config                  NodeOptions, RaftConfig
+├── raft                    (silkroad-raft-cluster)
+│   ├── RaftNode            một node: state dùng chung, vòng sự kiện một thread, API công khai
+│   ├── StateMachine        interface ứng dụng cài đặt
+│   ├── RaftClientService   nối yêu cầu của client bên ngoài vào node
+│   ├── RaftMetrics, NodeState, NotLeaderException, UnknownOutcomeException
+│   ├── (nội bộ) Election           pre-vote, bỏ phiếu, chuyển vai trò
+│   ├── (nội bộ) Replicator         phía leader: heartbeat, check quorum, gửi log/snapshot, pipelining, commit
+│   ├── (nội bộ) FollowerLog        phía follower: ghi log, gom fsync rồi mới trả lời
+│   ├── (nội bộ) ClientCommands     nhận lệnh của client, theo dõi tới khi apply hoặc hết hạn
+│   ├── (nội bộ) Applier            apply vào state machine, chống trùng theo phiên client
+│   ├── (nội bộ) LinearizableReads  đọc nhất quán theo ReadIndex
+│   ├── (nội bộ) Membership         cấu hình, joint consensus, learner, trao quyền leader
+│   ├── (nội bộ) Snapshots          tạo, nhận, khôi phục snapshot
+│   ├── state               PersistentState (term, phiếu bầu, commit index; sở hữu log và snapshot store),
+│   │                       LeaderState (nextIndex/matchIndex và tiến độ gửi cho từng peer)
+│   ├── config              NodeOptions, RaftConfig
+│   ├── runtime             RaftRuntime (đồng hồ, timer, thread ghi đĩa; tiêm được), ThreadedRuntime, ElectionTimer, HeartbeatTimer
+│   └── example             ListStateMachine: state machine mẫu, danh sách các lệnh đã apply
 ├── entity
 │   ├── LogEntry            lệnh, no-op, thay đổi cấu hình hoặc kết thúc phiên client
 │   ├── ConfigurationEntry  cấu hình thành viên và phép tính quorum
 │   └── ClientSession       các sequence của một client đã được apply
-├── state
-│   ├── PersistentState     term, phiếu bầu, commit index; sở hữu log và snapshot store
-│   ├── VolatileState       commitIndex, lastApplied
-│   └── LeaderState         nextIndex/matchIndex và các sổ theo dõi khác của leader
 ├── storage
 │   ├── binary              BinaryLogStorage, LogOptions: log nhị phân, ghi theo khối (kiểu Aeron Archive)
+│   ├── snapshot            SnapshotReader, SnapshotWriter, SnapshotMeta
 │   ├── SnapshotStore       thư mục snapshot, lưu atomic
 │   ├── Checksum, FileUtil  CRC32, ghi file atomic, fsync thư mục
 │   └── DiskFaultInjector   điểm chèn lỗi đĩa cho test
-├── statemachine            interface StateMachine, SnapshotReader/Writer/Meta
-├── timer                   ElectionTimer, HeartbeatTimer
 ├── rpc                     (silkroad-raft-protocol)
 │   ├── RaftServerService   các RPC một node phải xử lý; ClientService cho client bên ngoài
 │   ├── RpcProcessor        phía gửi RPC của node; MessageTransport cho client
@@ -597,7 +602,6 @@ com.namnv
 │   ├── gateway             LedgerGateway (cổng HTTP trên Netty), TransferBatcher
 │   └── bench               LedgerBenchmark, GatewayBenchmark, ViewBenchmark, LocalCluster
 ├── util                    Utf8Cache
-├── ListStateMachine        state machine mẫu: danh sách các lệnh đã apply
 └── samples                 (silkroad-raft-samples) AppRaftInMem, AppRaftSocket
 ```
 
@@ -970,7 +974,7 @@ mvn test $ONE -Dtest=RaftChaosTest -Dchaos.runs=10 -Dchaos.seconds=15
 |---|---|
 | `RaftSimulationTest` | Cả cluster, mạng, đĩa, client và nemesis chạy trên một thread với thời gian ảo. AppendEntries đi qua mã hoá nhị phân như trên mạng thật. Một seed luôn cho đúng một lịch sử, nên lỗi tìm ra thì chạy lại được y hệt. Có lượt 5 node, 7 node và một lượt dài nửa giờ ảo |
 | `RaftChaosTest` | Cùng kịch bản nhưng với thread và đồng hồ thật, để bắt lỗi tranh chấp giữa các thread. Seed ở đây không tái hiện chắc chắn |
-| `RaftClusterTest` | Test tất định cho từng hành vi và từng quy tắc an toàn, trên cluster in-memory |
+| `ElectionTest`, `ReplicationTest`, `DurabilityTest`, `MembershipTest`, `SnapshotTest`, `ClientCommandTest`, `ReadTest` | Test tất định cho từng hành vi và từng quy tắc an toàn, trên cluster in-memory (hạ tầng chung trong `ClusterTestSupport`) |
 | `LmdbKvStateMachineTest`, `RocksDbKvStateMachineTest` | Cùng một bộ test cho mỗi kho KV: đọc thấy lệnh chưa vào LMDB, xoá, snapshot đúng thời điểm khi còn lô chưa ghi, nạp snapshot thay state cũ; cluster 3 node qua mạng, một follower tắt lâu rồi bật lại và nhận snapshot từ leader |
 | `RaftClientTest`, `NioRaftClientTest` | Client đi qua TCP tới cluster 3 node với từng loại transport: ghi/đọc, nhiều client, lệnh 300 KB, leader chết giữa chừng |
 | `SocketRpcTest` | Transport TCP: từng loại RPC, lời gọi đồng thời và lời gọi chậm trên cùng kết nối, nối lại, timeout, khung không hợp lệ, TLS, cluster qua socket thật |

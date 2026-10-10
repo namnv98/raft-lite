@@ -18,10 +18,10 @@ import java.util.Map;
 public class InstallSnapshotRequest implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
-    private long term;                // leader term
-    private String leaderId;          // leader nodeId
-    private long lastIncludedIndex;   // snapshot lastIncludedIndex
-    private long lastIncludedTerm;    // snapshot lastIncludedTerm
+    private long term;               
+    private String leaderId;         
+    private long lastIncludedIndex;  
+    private long lastIncludedTerm;   
     private ConfigurationEntry conf;  // cluster config tại lastIncludedIndex
     private Map<String, ClientSession> sessions; // clientId -> các sequence đã apply tại lastIncludedIndex
     private List<String> files;       // tên mọi file của snapshot, theo thứ tự gửi

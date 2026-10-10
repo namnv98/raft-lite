@@ -3,7 +3,7 @@ package com.namnv.ledger.gateway;
 import com.namnv.ledger.client.LedgerClient;
 import com.namnv.ledger.model.LedgerResult;
 import com.namnv.ledger.model.LedgerTransfer;
-import com.namnv.core.UnknownOutcomeException;
+import com.namnv.raft.UnknownOutcomeException;
 
 import java.util.ArrayList;
 import java.util.List;

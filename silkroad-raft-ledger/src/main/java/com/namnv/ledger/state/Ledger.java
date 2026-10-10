@@ -1,5 +1,6 @@
 package com.namnv.ledger.state;
 
+import com.namnv.entity.LogEntry;
 import com.namnv.ledger.codec.LedgerCodec;
 import com.namnv.ledger.event.EventPublisher;
 import com.namnv.ledger.event.LedgerEvent;
@@ -7,12 +8,9 @@ import com.namnv.ledger.model.LedgerAccount;
 import com.namnv.ledger.model.LedgerBalance;
 import com.namnv.ledger.model.LedgerResult;
 import com.namnv.ledger.model.LedgerTotals;
-import com.namnv.core.Closure;
-import com.namnv.core.Status;
-import com.namnv.entity.LogEntry;
-import com.namnv.statemachine.StateMachine;
-import com.namnv.statemachine.snapshot.SnapshotReader;
-import com.namnv.statemachine.snapshot.SnapshotWriter;
+import com.namnv.raft.StateMachine;
+import com.namnv.storage.snapshot.SnapshotReader;
+import com.namnv.storage.snapshot.SnapshotWriter;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.BufferedInputStream;
@@ -27,6 +25,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Sổ cái kép (double-entry) làm state machine của Raft, theo cách của Binance Ledger và TigerBeetle:
@@ -331,7 +330,8 @@ public class Ledger implements StateMachine, AutoCloseable {
     }
 
     @Override
-    public synchronized void onSnapshotSave(SnapshotWriter writer, Closure done) {
+    public synchronized CompletableFuture<Void> onSnapshotSave(SnapshotWriter writer) {
+        var done = new CompletableFuture<Void>();
         // Trong lock của node: chép các mảng tài khoản (nhỏ so với lịch sử giao dịch) và để kho giao dịch tạo checkpoint
         // RocksDB đúng lúc mọi giao dịch tới thời điểm này đã xuống đĩa. Việc ghi file diễn ra ở thread nền.
         int a = accountCount;
@@ -340,7 +340,7 @@ public class Ledger implements StateMachine, AutoCloseable {
                 lastEventIndex, lastEventPosition);
         // snapshot chỉ xong khi mọi sự kiện tới thời điểm này đã nằm trong sink: sau khi khởi động lại từ snapshot này,
         // không sự kiện nào trước nó cần được phát lại
-        var eventsWritten = new java.util.concurrent.CompletableFuture<Void>();
+        var eventsWritten = new CompletableFuture<Void>();
         if (events != null) {
             events.afterPublished(() -> eventsWritten.complete(null));
         } else {
@@ -352,13 +352,14 @@ public class Ledger implements StateMachine, AutoCloseable {
         }, (files, error) -> {
             if (error != null) {
                 log.error("Ledger snapshot save failed", error);
-                done.run(Status.ERROR(error.getMessage()));
+                done.completeExceptionally(error);
                 return;
             }
             files.forEach(writer::addFile);
             log.info("Ledger snapshot saved: {} accounts, {} transfers", image.ids().length, image.transferCount());
-            done.run(Status.OK());
+            done.complete(null);
         });
+        return done;
     }
 
     private static String writeAccounts(Path dir, Accounts image) throws IOException {

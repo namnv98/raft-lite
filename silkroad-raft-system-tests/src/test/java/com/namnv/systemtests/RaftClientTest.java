@@ -1,17 +1,17 @@
 package com.namnv.systemtests;
 
-import com.namnv.ListStateMachine;
-import com.namnv.config.NodeOptions;
-import com.namnv.config.RaftConfig;
-import com.namnv.core.NodeState;
-import com.namnv.core.RaftClientService;
-import com.namnv.core.RaftNode;
 import com.namnv.client.RaftClient;
-import com.namnv.core.ThreadedRuntime;
+import com.namnv.raft.NodeState;
+import com.namnv.raft.RaftClientService;
+import com.namnv.raft.RaftNode;
+import com.namnv.raft.config.NodeOptions;
+import com.namnv.raft.config.RaftConfig;
+import com.namnv.raft.example.ListStateMachine;
+import com.namnv.raft.runtime.ThreadedRuntime;
 import com.namnv.transport.SocketRpcClient;
+import com.namnv.transport.SocketRpcServer;
 import com.namnv.transport.nio.NioRpcClient;
 import com.namnv.transport.nio.NioRpcServer;
-import com.namnv.transport.SocketRpcServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;

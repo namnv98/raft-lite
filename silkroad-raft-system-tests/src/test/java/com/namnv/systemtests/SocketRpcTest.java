@@ -1,18 +1,15 @@
 package com.namnv.systemtests;
 
-import com.namnv.rpc.RaftServerService;
-import com.namnv.rpc.RpcCodec;
-import com.namnv.transport.TlsContexts;
-
-import com.namnv.ListStateMachine;
-import com.namnv.config.NodeOptions;
-import com.namnv.config.RaftConfig;
-import com.namnv.core.NodeState;
-import com.namnv.core.RaftNode;
 import com.namnv.entity.ClientSession;
 import com.namnv.entity.ConfigurationEntry;
 import com.namnv.entity.LogEntry;
-import com.namnv.transport.SocketRpcClient;
+import com.namnv.raft.NodeState;
+import com.namnv.raft.RaftNode;
+import com.namnv.raft.config.NodeOptions;
+import com.namnv.raft.config.RaftConfig;
+import com.namnv.raft.example.ListStateMachine;
+import com.namnv.rpc.RaftServerService;
+import com.namnv.rpc.RpcCodec;
 import com.namnv.rpc.model.request.AppendEntriesRequest;
 import com.namnv.rpc.model.request.InstallSnapshotRequest;
 import com.namnv.rpc.model.request.PreVoteRequest;
@@ -25,9 +22,9 @@ import com.namnv.rpc.model.response.PreVoteResponse;
 import com.namnv.rpc.model.response.ReadIndexResponse;
 import com.namnv.rpc.model.response.RequestVoteResponse;
 import com.namnv.rpc.model.response.TimeoutNowResponse;
+import com.namnv.transport.SocketRpcClient;
 import com.namnv.transport.SocketRpcServer;
-import javax.net.ssl.SSLContext;
-
+import com.namnv.transport.TlsContexts;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -52,6 +49,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import javax.net.ssl.SSLContext;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;

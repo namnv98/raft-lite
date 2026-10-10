@@ -14,9 +14,9 @@ public class LogEntry implements Serializable {
     private static final long serialVersionUID = 1L;
     private long index;
     private long term;
-    private byte[] command; // opaque command
-    private boolean isConfigurationEntry; // true nếu là config log
-    private ConfigurationEntry configuration; // dữ liệu config nếu isConfiguration=true
+    private byte[] command;
+    private boolean isConfigurationEntry;
+    private ConfigurationEntry configuration;
     // định danh của lệnh từ phía client, null nếu client không cần chống ghi trùng
     private String clientId;
     private long sequence;
@@ -59,7 +59,6 @@ public class LogEntry implements Serializable {
         return e;
     }
 
-    // log cấu hình
     public static LogEntry newConfigurationEntry(long index, long term, ConfigurationEntry config) {
         LogEntry e = new LogEntry();
         e.index = index;
